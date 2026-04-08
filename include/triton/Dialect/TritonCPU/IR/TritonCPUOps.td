@@ -191,6 +191,52 @@ def TTC_DotOp : TTC_Op<"dot", [Pure,
     }];
 }
 
+//
+// DMA operations for SPM (Scratchpad Memory)
+//
+def TTC_DmaEnqueue2DOp : TTC_Op<"dma_enqueue_2d", [
+  MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>,
+]> {
+  let summary = "Enqueue a 2D strided async DMA transfer";
+
+  let description = [{
+    Enqueue an asynchronous 2D strided DMA transfer from DRAM to SPM (or
+    vice versa).  The transfer copies `height` rows, each `width` bytes wide,
+    with independent source and destination strides.  The operation is
+    non-blocking; use `dma_wait` to synchronize.
+  }];
+
+  let arguments = (ins
+    I64:$dst,           // destination address (SPM or DRAM)
+    I64:$src,           // source address (DRAM or SPM)
+    I64:$width,         // bytes per row
+    I64:$height,        // number of rows
+    I64:$src_stride,    // source row stride in bytes
+    I64:$dst_stride     // destination row stride in bytes
+  );
+
+  let assemblyFormat = [{
+    `(` $dst `,` $src `,` $width `,` $height `,` $src_stride `,` $dst_stride `)`
+    attr-dict
+  }];
+}
+
+def TTC_DmaWaitOp : TTC_Op<"dma_wait", [
+  MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>,
+]> {
+  let summary = "Block until all pending DMA transfers complete";
+
+  let description = [{
+    Block execution until the DMA engine has completed all previously enqueued
+    transfers.  Lowered to a load from the DMA STATUS register (MMIO path) or
+    an `spm.dma.w` instruction (Xspm path).
+  }];
+
+  let arguments = (ins);
+
+  let assemblyFormat = "attr-dict";
+}
+
 def TTC_BrgemmCreate : TTC_Op<"brgemm_create", [NoMemoryEffect]> {
   let summary = "Crete ukernels handles";
 

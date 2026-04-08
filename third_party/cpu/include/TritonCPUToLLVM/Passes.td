@@ -66,6 +66,19 @@ def DebugOpsToLLVM : Pass<"triton-cpu-debug-ops-to-llvm", "mlir::ModuleOp"> {
                              "mlir::triton::TritonDialect"];
 }
 
+def DmaOpsToLLVM : Pass<"triton-cpu-dma-ops-to-llvm", "mlir::ModuleOp"> {
+    let summary = "Convert Triton DMA operations (dma_enqueue_2d, dma_wait) to LLVM MMIO.";
+    let description = [{
+      Lowers TritonCPU DMA operations to volatile LLVM stores/loads targeting
+      the DMA engine's MMIO registers.  Used for SPM data transfers on RISC-V.
+    }];
+    let constructor = "mlir::triton::cpu::createDmaOpsToLLVMPass()";
+
+    let dependentDialects = ["mlir::LLVM::LLVMDialect",
+                             "mlir::triton::cpu::TritonCPUDialect",
+                             "mlir::triton::TritonDialect"];
+}
+
 def UkernelOpsToOneDNNLLVM : Pass<"triton-cpu-ukernels-to-onednn-llvm", "mlir::ModuleOp"> {
     let summary = "Convert ukernel operations to OneDNN LLVM runtime calls.";
     let description = [{}];

@@ -168,6 +168,9 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_debug_ops_to_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createDebugOpsToLLVMPass());
   });
+  m.def("add_dma_ops_to_llvmir", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::cpu::createDmaOpsToLLVMPass());
+  });
   m.def("add_ukernels_to_onednn_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createUkernelOpsToOneDNNLLVMPass());
   });

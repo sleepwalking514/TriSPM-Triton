@@ -297,6 +297,9 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_atomic_ops_to_llvmir(pm)
         cpu.passes.ttcpuir.add_debug_ops_to_llvmir(pm)
 
+        if _AOT_MODE:
+            cpu.passes.ttcpuir.add_dma_ops_to_llvmir(pm)
+
         if not _AOT_MODE:
             vec_lib_requirements = {
                 VecLib.libsleef: {"neon", "sse", "avx"},
