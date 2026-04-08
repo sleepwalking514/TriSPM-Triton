@@ -15,6 +15,8 @@ from triton.backends.compiler import GPUTarget
 from pathlib import Path
 from triton._C.libtriton import llvm
 
+_AOT_MODE = os.getenv("TRITON_CPU_AOT", "0") != "0"
+
 _dirname = os.getenv("TRITON_SYS_PATH", default="/usr/local")
 # for locating libTritonCPURuntime
 try:
@@ -381,6 +383,75 @@ PyMODINIT_FUNC PyInit___triton_cpu_launcher(void) {{
     return src
 
 
+def make_aot_launcher(constants, signature, ids, kernel_name):
+    """Generate a standalone C launcher (header + source) for AOT cross-compilation.
+
+    Instead of a Python C extension, this produces plain C files that can be
+    compiled with any C toolchain (including RISC-V cross-compilers) and linked
+    with a test harness.
+
+    The launcher calls the Triton-generated kernel symbol directly (no function
+    pointer) and dispatches over a sequential 3-D grid — suitable for
+    single-threaded gem5 SE mode.
+    """
+    # Flatten and filter signature
+    def _serialize_signature(sig):
+        if isinstance(sig, tuple):
+            return ','.join(map(_serialize_signature, sig))
+        return sig
+
+    signature_str = ','.join(map(_serialize_signature, signature.values()))
+    signature_list = list(filter(bool, signature_str.split(',')))
+    signature_flat = {i: s for i, s in enumerate(signature_list)}
+
+    kernel_fn_args = [i for i, ty in signature_flat.items() if i not in constants and ty != "constexpr"]
+    arg_decls = ', '.join(f"{ty_to_cpp(signature_flat[i])} arg{i}" for i in kernel_fn_args)
+    kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_fn_args)
+
+    # Extern declaration for the Triton-generated kernel symbol.
+    # Triton's LLVM lowering appends 6 i32 args: pid_x/y/z, gridX/Y/Z.
+    extern_arg_types = ', '.join(
+        [ty_to_cpp(signature_flat[i]) for i in kernel_fn_args] + ["int32_t"] * 6
+    )
+
+    guard = f"{kernel_name.upper()}_LAUNCHER_H"
+
+    # --- Header (C-compatible) ---
+    header = f"""\
+#ifndef {guard}
+#define {guard}
+
+#include <stdint.h>
+
+/* Launch the Triton kernel over a 3-D grid (sequential, for gem5 SE mode). */
+void {kernel_name}_launch(
+    int32_t gridX, int32_t gridY, int32_t gridZ
+    {(', ' + arg_decls) if arg_decls else ''});
+
+#endif /* {guard} */
+"""
+
+    # --- Source (C-compatible) ---
+    source = f"""\
+#include "{kernel_name}_launcher.h"
+
+/* Triton-generated kernel symbol (from the cross-compiled .s file). */
+extern void {kernel_name}({extern_arg_types});
+
+void {kernel_name}_launch(
+    int32_t gridX, int32_t gridY, int32_t gridZ
+    {(', ' + arg_decls) if arg_decls else ''})
+{{
+    for (int32_t z = 0; z < gridZ; ++z)
+        for (int32_t y = 0; y < gridY; ++y)
+            for (int32_t x = 0; x < gridX; ++x)
+                {kernel_name}({kernel_fn_args_list + ', ' if kernel_fn_args_list else ''}x, y, z, gridX, gridY, gridZ);
+}}
+"""
+
+    return header, source
+
+
 class CPULauncher(object):
 
     def __init__(self, src, metadata):
@@ -389,9 +460,26 @@ class CPULauncher(object):
         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
         constants = {cst_key(key): value for key, value in constants.items()}
         signature = {cst_key(key): value for key, value in src.signature.items()}
-        src = make_launcher(constants, signature, ids)
-        mod = compile_module_from_src(src, "__triton_cpu_launcher")
-        self.launch = mod.launch
+
+        if _AOT_MODE:
+            kernel_name = metadata.name if hasattr(metadata, 'name') else metadata.get("name", "kernel")
+            header, source = make_aot_launcher(constants, signature, ids, kernel_name)
+            launcher_dir = os.getenv("KERNEL_AUX_FILE_DIR",
+                                     os.getenv("KERNEL_LAUNCHER_DIR", "."))
+            os.makedirs(launcher_dir, exist_ok=True)
+            header_path = os.path.join(launcher_dir, f"{kernel_name}_launcher.h")
+            source_path = os.path.join(launcher_dir, f"{kernel_name}_launcher.c")
+            with open(header_path, "w") as f:
+                f.write(header)
+            with open(source_path, "w") as f:
+                f.write(source)
+            print(f"[AOT] Wrote {header_path}")
+            print(f"[AOT] Wrote {source_path}")
+            self.launch = lambda *args, **kwargs: None  # no-op in AOT mode
+        else:
+            src_code = make_launcher(constants, signature, ids)
+            mod = compile_module_from_src(src_code, "__triton_cpu_launcher")
+            self.launch = mod.launch
 
     def __call__(self, *args, **kwargs):
         self.launch(*args, **kwargs)

@@ -428,7 +428,20 @@ class CompiledKernel:
             for file in asm_files
         })
         self.metadata_group = metadata_group
-        self.kernel = self.asm[binary_ext]
+
+        # In AOT mode (pipeline stops at llir), skip loading a binary that
+        # the host CPU cannot execute.  The .llir text is kept in self.asm
+        # for later saving to disk.
+        _aot_mode = os.getenv("TRITON_CPU_AOT", "0") != "0"
+        if _aot_mode:
+            self.kernel = self.asm.get(binary_ext, b"")
+            # Eagerly create the launcher: _init_handles() is never called
+            # in AOT mode (execution is skipped), but the launcher writes
+            # the generated .c/.h files to disk as a side-effect.
+            self._run = driver.active.launcher_cls(self.src, self.metadata)
+        else:
+            self.kernel = self.asm[binary_ext]
+
         # binaries are lazily initialized
         # because it involves doing runtime things
         # (e.g., checking amount of shared memory on current device)

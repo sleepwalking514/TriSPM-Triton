@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import itertools
 import threading
+import os
 import re
 import textwrap
 from collections import defaultdict
@@ -748,6 +749,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if kernel is None:
                 return None
 
+            # In AOT mode, skip execution — the compiled artifacts have been
+            # saved to disk.  TRITON_CPU_AOT is the master switch; it is
+            # checked (instead of KERNEL_AUX_FILE_DIR) so that a single env
+            # var controls the entire AOT flow.
+            if os.environ.get("TRITON_CPU_AOT", "0") != "0":
+                return kernel
+
         # Check that used global values have not changed.
         not_present = object()
         for (name, _), (val, globals_dict) in self.used_global_vals.items():
@@ -893,6 +901,21 @@ class JITFunction(JITCallable, KernelInterface[T]):
             kernel_cache[key] = kernel
             self._call_hook(knobs.runtime.jit_post_compile_hook, key, signature, target, device, constexprs, options,
                             [attrs], warmup)
+
+        # --- AOT: save LLVM IR to disk ---
+        # Gated on the master AOT switch.  KERNEL_AUX_FILE_DIR controls the
+        # output directory; it defaults to a temp location so AOT always
+        # produces an artifact even if the caller forgot to set the path.
+        if os.environ.get("TRITON_CPU_AOT", "0") != "0" \
+                and kernel is not None and hasattr(kernel, 'asm') and 'llir' in kernel.asm:
+            aux_dir = os.environ.get("KERNEL_AUX_FILE_DIR", "/tmp/triton_aot_out")
+            os.makedirs(aux_dir, exist_ok=True)
+            kernel_name = kernel.name if hasattr(kernel, 'name') else "kernel"
+            llir_path = os.path.join(aux_dir, f"{kernel_name}.llir")
+            with open(llir_path, "wb") as f:
+                f.write(kernel.asm['llir'])
+            print(f"[AOT] Wrote {llir_path}")
+
         return kernel
 
     def __call__(self, *args, **kwargs):

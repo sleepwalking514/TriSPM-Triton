@@ -13,6 +13,12 @@ from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.runtime.build import _build
 import triton.backends.cpu.driver as cpu_driver
 
+# When TRITON_CPU_AOT is set, the pipeline stops at LLVM IR and skips
+# host-specific assembly/shared-object generation.  This enables cross-
+# compilation for targets like RISC-V where the bundled LLVM lacks the
+# backend.
+_AOT_MODE = os.getenv("TRITON_CPU_AOT", "0") != "0"
+
 
 def min_dot_size(target: GPUTarget):
     # Other architectures will only support 16,16,16
@@ -116,11 +122,11 @@ class CPUBackend(BaseBackend):
 
     def __init__(self, target: tuple) -> None:
         super().__init__(target)
-        self.binary_ext = "so"
+        self.binary_ext = "llir" if _AOT_MODE else "so"
         self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
         self.cpu_name = llvm.get_cpu_name()
         self.cpu_features = llvm.get_cpu_features()
-        if 'amx-tile' in self.cpu_features:
+        if not _AOT_MODE and 'amx-tile' in self.cpu_features:
             if not cpu.enable_amx():
                 import warnings
                 warnings.warn("Warning! Couldn't enable AMX for the process. AMX optimizations are disabled.")
@@ -198,37 +204,66 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_triton_cpu_canonicalizer(pm)
         cpu.passes.ttcpuir.add_optimize_masks(pm)
         passes.common.add_canonicalizer(pm)
-        if (ukernels := opt.get_ukernels()):
-            # For further analysis simplification
-            cpu.passes.ttcpuir.add_loop_invariant_code_motion(pm)
-            cpu.passes.ttcpuir.add_convert_dot_to_ukernels(pm, ukernels)
-            passes.common.add_canonicalizer(pm)
-            passes.common.add_cse(pm)
-        convert_bf16_dot_product = ((self.cpu_arch == "aarch64" or self.cpu_arch == "armv8")
-                                    and 'fp-armv8' in self.cpu_features and 'neon' in self.cpu_features)
-        if convert_bf16_dot_product:
-            use_horizontal_sum = os.getenv("TRITON_CPU_DOT_PROD_HORIZ_SUM", "1") == "1"
-            cpu.passes.ttcpuir.add_convert_dot_product(pm, use_horizontal_sum)
-        if 'amx-tile' in self.cpu_features:
-            amx_int8 = 'amx-int8' in self.cpu_features
-            # amx_fp16 = 'amx-fp16' in self.cpu_features
-            # FP16 support is not in AMX dialect yet
-            amx_fp16 = False
-            amx_bf16 = 'amx-bf16' in self.cpu_features
-            cpu.passes.ttcpuir.add_convert_dot_to_amx(pm, amx_int8, amx_fp16, amx_bf16)
-        if 'avx512f' in self.cpu_features:
-            cpu.passes.ttcpuir.add_convert_dot_to_fma(pm)
-        cpu.passes.ttcpuir.add_convert_dot_generic(pm)
-        promote_bf16_to_fp32 = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
-        # We don't have any lowering for mixed precision matmuls, so always use casts for now
-        convert_mixed_precision_matmul = True
-        # We don't have math lib functions for FP8, FP16, BF16. Promote such operations to FP32.
-        promote_lib_math_to_fp32 = True
-        cpu.passes.ttcpuir.add_convert_unsupported_ops(pm, promote_bf16_to_fp32, convert_mixed_precision_matmul,
-                                                       promote_lib_math_to_fp32)
-        decompose_bf16_conv = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
-        decompose_fp8_conv = True
-        cpu.passes.ttcpuir.add_decompose_fp_conversions(pm, decompose_bf16_conv, decompose_fp8_conv)
+
+        if _AOT_MODE:
+            # In AOT mode we skip all host-specific passes (AMX, AVX512,
+            # NEON dot product) because they are irrelevant for the cross-
+            # compilation target.  add_convert_dot_generic lowers tt.dot
+            # to vector.contract, which LLVM's RISC-V backend maps well
+            # to RVV instructions (vfmacc.vv etc.).
+            cpu.passes.ttcpuir.add_convert_dot_generic(pm)
+
+            # Type promotion decisions based on cross-compilation target
+            # features.  Read from TRITON_CPU_AOT_FEATURES env var, e.g.
+            # "+m,+a,+f,+d,+v" for standard RISC-V with RVV.
+            aot_features = os.getenv("TRITON_CPU_AOT_FEATURES", "")
+            # bf16 hardware support requires Zfbfmin (not in gem5 yet)
+            has_bf16_hw = "+zfbfmin" in aot_features
+            promote_bf16_to_fp32 = not has_bf16_hw
+            # Mixed precision matmul always needs conversion (no hw support)
+            convert_mixed_precision_matmul = True
+            # Math lib functions (sin/cos/exp) always promoted — no RVV
+            # bf16/fp8 math library exists
+            promote_lib_math_to_fp32 = True
+            cpu.passes.ttcpuir.add_convert_unsupported_ops(
+                pm, promote_bf16_to_fp32, convert_mixed_precision_matmul,
+                promote_lib_math_to_fp32)
+            # FP8 decomposition always needed; bf16 only if no hw
+            cpu.passes.ttcpuir.add_decompose_fp_conversions(
+                pm, promote_bf16_to_fp32, True)
+        else:
+            if (ukernels := opt.get_ukernels()):
+                # For further analysis simplification
+                cpu.passes.ttcpuir.add_loop_invariant_code_motion(pm)
+                cpu.passes.ttcpuir.add_convert_dot_to_ukernels(pm, ukernels)
+                passes.common.add_canonicalizer(pm)
+                passes.common.add_cse(pm)
+            convert_bf16_dot_product = ((self.cpu_arch == "aarch64" or self.cpu_arch == "armv8")
+                                        and 'fp-armv8' in self.cpu_features and 'neon' in self.cpu_features)
+            if convert_bf16_dot_product:
+                use_horizontal_sum = os.getenv("TRITON_CPU_DOT_PROD_HORIZ_SUM", "1") == "1"
+                cpu.passes.ttcpuir.add_convert_dot_product(pm, use_horizontal_sum)
+            if 'amx-tile' in self.cpu_features:
+                amx_int8 = 'amx-int8' in self.cpu_features
+                # amx_fp16 = 'amx-fp16' in self.cpu_features
+                # FP16 support is not in AMX dialect yet
+                amx_fp16 = False
+                amx_bf16 = 'amx-bf16' in self.cpu_features
+                cpu.passes.ttcpuir.add_convert_dot_to_amx(pm, amx_int8, amx_fp16, amx_bf16)
+            if 'avx512f' in self.cpu_features:
+                cpu.passes.ttcpuir.add_convert_dot_to_fma(pm)
+            cpu.passes.ttcpuir.add_convert_dot_generic(pm)
+            promote_bf16_to_fp32 = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
+            # We don't have any lowering for mixed precision matmuls, so always use casts for now
+            convert_mixed_precision_matmul = True
+            # We don't have math lib functions for FP8, FP16, BF16. Promote such operations to FP32.
+            promote_lib_math_to_fp32 = True
+            cpu.passes.ttcpuir.add_convert_unsupported_ops(pm, promote_bf16_to_fp32, convert_mixed_precision_matmul,
+                                                           promote_lib_math_to_fp32)
+            decompose_bf16_conv = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
+            decompose_fp8_conv = True
+            cpu.passes.ttcpuir.add_decompose_fp_conversions(pm, decompose_bf16_conv, decompose_fp8_conv)
+
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.common.add_canonicalizer(pm)
@@ -245,10 +280,11 @@ class CPUBackend(BaseBackend):
         # TritonCPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        if options.get_ukernels() == Ukernels.OneDNN:
-            cpu.passes.ttcpuir.add_ukernels_to_onednn_llvmir(pm)
-        if options.get_ukernels() == Ukernels.XSMM:
-            cpu.passes.ttcpuir.add_ukernels_to_xsmm_llvmir(pm)
+        if not _AOT_MODE:
+            if options.get_ukernels() == Ukernels.OneDNN:
+                cpu.passes.ttcpuir.add_ukernels_to_onednn_llvmir(pm)
+            if options.get_ukernels() == Ukernels.XSMM:
+                cpu.passes.ttcpuir.add_ukernels_to_xsmm_llvmir(pm)
         cpu.passes.ttcpuir.add_lower_vector_multi_dim(pm)
         cpu.passes.ttcpuir.add_expand_strided_metadata(pm)
         cpu.passes.ttcpuir.add_vector_to_scf(pm, True, 1, False)
@@ -261,12 +297,13 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_atomic_ops_to_llvmir(pm)
         cpu.passes.ttcpuir.add_debug_ops_to_llvmir(pm)
 
-        vec_lib_requirements = {
-            VecLib.libsleef: {"neon", "sse", "avx"},
-            VecLib.libmvec: {"avx512f"},
-        }
-        if (vec_lib := options.get_vec_lib()) and vec_lib_requirements[vec_lib] & self.cpu_features:
-            cpu.passes.ttcpuir.add_math_to_vec_lib(pm, vec_lib, self.cpu_features)
+        if not _AOT_MODE:
+            vec_lib_requirements = {
+                VecLib.libsleef: {"neon", "sse", "avx"},
+                VecLib.libmvec: {"avx512f"},
+            }
+            if (vec_lib := options.get_vec_lib()) and vec_lib_requirements[vec_lib] & self.cpu_features:
+                cpu.passes.ttcpuir.add_math_to_vec_lib(pm, vec_lib, self.cpu_features)
 
         passes.convert.add_math_to_llvmir(pm)
         cpu.passes.ttcpuir.add_math_to_libm(pm)
@@ -294,7 +331,8 @@ class CPUBackend(BaseBackend):
         llvm_mod = llvm.to_module(mod, context)
         if llvm_mod is None:
             raise RuntimeError("Failed to convert to LLVM IR")
-        llvm.set_host_target(llvm_mod)
+        if not _AOT_MODE:
+            llvm.set_host_target(llvm_mod)
         #if options.extern_libs:
         #    paths = [path for (name, path) in options.extern_libs]
         #   llvm.link_extern_libs(llvm_mod, paths)
@@ -329,8 +367,9 @@ class CPUBackend(BaseBackend):
         stages["ttcir"] = lambda src, metadata: self.make_ttcir(src, metadata, options)
         stages["tttcir"] = lambda src, metadata: self.make_tttcir(src, metadata, options)
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
-        stages["asm"] = lambda src, metadata: self.make_asm(src, metadata, options)
-        stages["so"] = lambda src, metadata: self.make_so(src, metadata, options)
+        if not _AOT_MODE:
+            stages["asm"] = lambda src, metadata: self.make_asm(src, metadata, options)
+            stages["so"] = lambda src, metadata: self.make_so(src, metadata, options)
 
     @functools.lru_cache()
     def hash(self):
