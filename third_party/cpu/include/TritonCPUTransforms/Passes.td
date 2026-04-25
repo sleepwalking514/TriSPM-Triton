@@ -187,4 +187,39 @@ def Canonicalize : Pass<"triton-cpu-canonicalize", "mlir::ModuleOp"> {
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 
+def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleOp"> {
+    let summary = "Convert tiled DRAM loads to DMA-based SPM transfers.";
+    let description = [{
+        This pass analyzes memory access patterns in tiled loops and converts
+        eligible DRAM loads into DMA transfers to scratchpad memory (SPM).
+
+        For GEMM-like patterns (K-loop with two tiled loads feeding a dot product),
+        the pass inserts double-buffered DMA transfers: while the current tiles are
+        being computed, the next tiles are prefetched asynchronously.
+
+        For reduction patterns (single loop accumulating over a dimension), the pass
+        inserts single-buffer DMA prefetch for the next chunk.
+
+        Loads that don't match SPM-eligible patterns (scalar loads, irregular access,
+        low-reuse elementwise ops) are left unchanged to use the cache hierarchy.
+    }];
+
+    let options = [
+        Option<"spmBase", "spm-base",
+               "int64_t", /*default*/"0x40000000",
+               "Base address of the scratchpad memory region.">,
+        Option<"spmSize", "spm-size",
+               "int64_t", /*default*/"262144",
+               "Size of the scratchpad memory in bytes.">,
+    ];
+
+    let constructor = "mlir::triton::cpu::createConvertMemoryToSPM()";
+
+    let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::scf::SCFDialect",
+                             "mlir::vector::VectorDialect",
+                             "mlir::triton::TritonDialect",
+                             "mlir::triton::cpu::TritonCPUDialect"];
+}
+
 #endif

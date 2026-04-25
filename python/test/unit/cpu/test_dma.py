@@ -152,8 +152,11 @@ class TestDmaOpsToLLVM:
         assert "triton_cpu.dma_enqueue_2d" not in output
         # Should have volatile stores (5 config + 1 trigger = 6 total)
         assert output.count("llvm.store volatile") == 6
-        # Should have exactly 2 fences (pre-trigger + post-trigger)
-        assert output.count("llvm.fence seq_cst") == 2
+        # Should have exactly 2 `fence iorw, iorw` (pre-trigger + post-trigger),
+        # emitted as inline asm with has_side_effects so the optimizer cannot
+        # weaken or eliminate them.
+        assert output.count('"fence iorw, iorw"') == 2
+        assert output.count("llvm.inline_asm has_side_effects") == 2
 
     def test_enqueue_mmio_addresses(self):
         """Check that the correct MMIO addresses are used."""
@@ -193,8 +196,10 @@ class TestDmaOpsToLLVM:
         assert "llvm.load volatile" in output
         # STATUS address = 0xF0000018
         assert str(DMA_MMIO_BASE + DMA_REG_STATUS) in output
-        # Should have 2 fences (pre-load + post-load)
-        assert output.count("llvm.fence seq_cst") == 2
+        # Should have 2 `fence iorw, iorw` (pre-load + post-load), emitted as
+        # inline asm with has_side_effects to prevent weakening/elimination.
+        assert output.count('"fence iorw, iorw"') == 2
+        assert output.count("llvm.inline_asm has_side_effects") == 2
 
     def test_enqueue_fence_ordering(self):
         """The trigger (LEN write) must be after the fence, not before config stores."""
@@ -211,8 +216,9 @@ class TestDmaOpsToLLVM:
         output = self._lower(mlir)
         lines = output.split('\n')
 
-        # Find positions of key operations
-        fence_positions = [i for i, l in enumerate(lines) if "llvm.fence" in l]
+        # Find positions of key operations.  Fences are emitted as inline asm
+        # `fence iorw, iorw` with has_side_effects.
+        fence_positions = [i for i, l in enumerate(lines) if '"fence iorw, iorw"' in l]
         store_positions = [i for i, l in enumerate(lines) if "llvm.store volatile" in l]
 
         # Must have at least 2 fences
@@ -255,8 +261,9 @@ class TestDmaOpsToLLVM:
         # 6 stores (enqueue) + 1 load (wait)
         assert output.count("llvm.store volatile") == 6
         assert output.count("llvm.load volatile") == 1
-        # 4 fences: 2 from enqueue + 2 from wait
-        assert output.count("llvm.fence seq_cst") == 4
+        # 4 `fence iorw, iorw` inline-asm fences: 2 from enqueue + 2 from wait
+        assert output.count('"fence iorw, iorw"') == 4
+        assert output.count("llvm.inline_asm has_side_effects") == 4
 
     def test_double_buffer_two_enqueues(self):
         """Two enqueues + one wait (double-buffer pattern)."""
@@ -276,8 +283,9 @@ class TestDmaOpsToLLVM:
         # 12 stores (2 × 6) + 1 load (wait)
         assert output.count("llvm.store volatile") == 12
         assert output.count("llvm.load volatile") == 1
-        # 6 fences: 2×2 from enqueues + 2 from wait
-        assert output.count("llvm.fence seq_cst") == 6
+        # 6 `fence iorw, iorw` inline-asm fences: 2×2 from enqueues + 2 from wait
+        assert output.count('"fence iorw, iorw"') == 6
+        assert output.count("llvm.inline_asm has_side_effects") == 6
 
 
 # ===----------------------------------------------------------------------=== #

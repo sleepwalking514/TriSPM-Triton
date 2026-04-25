@@ -45,6 +45,10 @@ std::unique_ptr<OperationPass<ModuleOp>> createConvertDotToFMA();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotGeneric();
 std::unique_ptr<OperationPass<ModuleOp>> createCanonicalize();
 
+std::unique_ptr<OperationPass<ModuleOp>> createConvertMemoryToSPM();
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize);
+
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotOpToUkernelOps(
     Ukernels ukernels = mlir::triton::cpu::Ukernels::OneDNN);
 

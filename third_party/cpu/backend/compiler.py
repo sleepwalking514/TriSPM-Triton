@@ -213,13 +213,15 @@ class CPUBackend(BaseBackend):
             # to RVV instructions (vfmacc.vv etc.).
             cpu.passes.ttcpuir.add_convert_dot_generic(pm)
 
-            # Type promotion decisions based on cross-compilation target
-            # features.  Read from TRITON_CPU_AOT_FEATURES env var, e.g.
-            # "+m,+a,+f,+d,+v" for standard RISC-V with RVV.
-            aot_features = os.getenv("TRITON_CPU_AOT_FEATURES", "")
+            # SPM transformation: convert tiled DRAM loads to DMA+SPM
+            # transfers.  Must run after dot lowering (to detect
+            # vector.contract consumers) and before type promotion.
+            spm_base = int(os.getenv("TRITON_SPM_BASE", "0x40000000"), 0)
+            spm_size = int(os.getenv("TRITON_SPM_SIZE", "65536"), 0)
+            cpu.passes.ttcpuir.add_convert_memory_to_spm(pm, spm_base, spm_size)
+
             # bf16 hardware support requires Zfbfmin (not in gem5 yet)
-            has_bf16_hw = "+zfbfmin" in aot_features
-            promote_bf16_to_fp32 = not has_bf16_hw
+            promote_bf16_to_fp32 = True
             # Mixed precision matmul always needs conversion (no hw support)
             convert_mixed_precision_matmul = True
             # Math lib functions (sin/cos/exp) always promoted — no RVV

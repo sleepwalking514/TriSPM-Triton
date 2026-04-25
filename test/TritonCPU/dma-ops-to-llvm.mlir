@@ -20,11 +20,11 @@
 // CHECK:       %[[HEIGHT_ADDR:.+]] = llvm.mlir.constant(4026531888 : i64) : i64
 // CHECK-NEXT:  %[[HEIGHT_PTR:.+]] = llvm.inttoptr %[[HEIGHT_ADDR]] : i64 to !llvm.ptr
 // CHECK-NEXT:  llvm.store volatile %arg3, %[[HEIGHT_PTR]] : i64, !llvm.ptr
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // CHECK:       %[[LEN_ADDR:.+]] = llvm.mlir.constant(4026531856 : i64) : i64
 // CHECK-NEXT:  %[[LEN_PTR:.+]] = llvm.inttoptr %[[LEN_ADDR]] : i64 to !llvm.ptr
 // CHECK-NEXT:  llvm.store volatile %arg2, %[[LEN_PTR]] : i64, !llvm.ptr
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 
 module {
   tt.func public @dma_enqueue_2d_basic(
@@ -42,11 +42,11 @@ module {
 // ============================================================================
 
 // CHECK-LABEL: @dma_wait_basic
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // CHECK:       %[[STATUS_ADDR:.+]] = llvm.mlir.constant(4026531864 : i64) : i64
 // CHECK-NEXT:  %[[STATUS_PTR:.+]] = llvm.inttoptr %[[STATUS_ADDR]] : i64 to !llvm.ptr
 // CHECK-NEXT:  %{{.+}} = llvm.load volatile %[[STATUS_PTR]] : !llvm.ptr -> i64
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 
 module {
   tt.func public @dma_wait_basic() {
@@ -68,13 +68,13 @@ module {
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // Wait: fence + load + fence
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // CHECK:       llvm.load volatile
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 
 module {
   tt.func public @dma_enqueue_then_wait(
@@ -99,22 +99,22 @@ module {
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // Second enqueue
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // Wait
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // CHECK:       llvm.load volatile
-// CHECK:       llvm.fence seq_cst
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 
 module {
   tt.func public @dma_double_buffer(

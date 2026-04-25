@@ -51,6 +51,8 @@ public:
       : ConversionTarget(ctx) {
     addLegalDialect<LLVM::LLVMDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
+    addIllegalOp<triton::cpu::DmaEnqueue2DOp>();
+    addIllegalOp<triton::cpu::DmaWaitOp>();
   }
 };
 
@@ -94,15 +96,34 @@ static Value emitVolatileLoad(ConversionPatternRewriter &rewriter, Location loc,
 }
 
 // ---------------------------------------------------------------------------
-// Helper: emit a RISC-V fence (fence iorw, iorw).
+// Helper: emit a RISC-V `fence iorw, iorw` via inline assembly.
 //
-// In LLVM IR this is `fence seq_cst` which the RISC-V backend lowers to
-// `fence iorw, iorw`.  We use seq_cst because we need full ordering of
-// MMIO writes — the DMA engine samples registers on the LEN write, so all
-// preceding register writes must be globally visible.
+// We deliberately do NOT use `LLVM::FenceOp(seq_cst)` here.  The mapping
+// `seq_cst -> fence iorw, iorw` was true on older LLVM versions, but modern
+// LLVM (≥17) lowers `seq_cst` on RISC-V to the lighter `fence rw, rw`,
+// which only orders ordinary memory accesses.  For MMIO peripherals such
+// as the DMA engine we need to order I/O accesses too — otherwise an
+// implementation that distinguishes I/O from memory (or a future LLVM
+// change) could re-order register writes around the LEN trigger.
+//
+// Emitting the fence as raw inline assembly with `has_side_effects = true`
+// pins the exact instruction we want and prevents the optimizer from
+// touching it.
 // ---------------------------------------------------------------------------
 static void emitFence(ConversionPatternRewriter &rewriter, Location loc) {
-  LLVM::FenceOp::create(rewriter, loc, LLVM::AtomicOrdering::seq_cst);
+  auto *ctx = rewriter.getContext();
+  LLVM::InlineAsmOp::create(
+      rewriter, loc,
+      /*resultTypes=*/TypeRange(),
+      /*operands=*/ValueRange(),
+      /*asm_string=*/"fence iorw, iorw",
+      /*constraints=*/"",
+      /*has_side_effects=*/true,
+      /*is_align_stack=*/false,
+      /*tail_call_kind=*/LLVM::TailCallKind::None,
+      /*asm_dialect=*/
+      LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
+      /*operand_attrs=*/ArrayAttr());
 }
 
 // ===----------------------------------------------------------------------===
