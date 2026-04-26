@@ -10,6 +10,8 @@ add_triton_library(TritonCPUTransforms
     ConvertUnsupportedOps.cpp
     DecomposeFpConversions.cpp
     OptimizeMasks.cpp
+    SPMSpaceManager.cpp
+    SPMTensorPlacement.cpp
 
     DEPENDS
     TritonCPUTransformsPassIncGen

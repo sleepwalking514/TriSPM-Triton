@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "cpu/include/TritonCPUTransforms/Passes.h"
+#include "cpu/include/TritonCPUTransforms/SPMSpaceManager.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -236,10 +237,8 @@ static void emitDmaEnqueue(OpBuilder &b, Location loc,
 static Value emitSpmRead(OpBuilder &b, Location loc,
                          Value spmAddr, VectorType vecTy) {
   auto shape = vecTy.getShape();
-  int64_t rows = (shape.size() >= 2) ? shape[0] : 1;
   int64_t cols = (shape.size() >= 2) ? shape[1] : shape[0];
   auto elemTy = vecTy.getElementType();
-  unsigned elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
 
   // Build the target SPM memref type: packed layout, address space 3.
   SmallVector<int64_t> memShape(shape.begin(), shape.end());
@@ -380,11 +379,6 @@ static bool transformGemmLoop(scf::ForOp forOp,
   int64_t tileA = loadA.tileBytes;
   int64_t tileB = loadB.tileBytes;
 
-  // Validate: 2*(tileA + tileB) must fit in SPM.
-  int64_t totalSpm = 2 * (tileA + tileB);
-  if (totalSpm > spmSize)
-    return false;
-
   // Loop boundary guard: trip count must be a known multiple of the step.
   // If not provable at compile time, bail out to the cache path.
   auto lbCst = getConstantIntValue(forOp.getLowerBound());
@@ -393,15 +387,22 @@ static bool transformGemmLoop(scf::ForOp forOp,
   if (!lbCst || !ubCst || !stepCst || (*ubCst - *lbCst) % *stepCst != 0)
     return false;
 
-  // SPM buffer layout (compile-time constants):
-  //   spm_a0 = spmBase + 0
-  //   spm_a1 = spmBase + tileA
-  //   spm_b0 = spmBase + 2*tileA
-  //   spm_b1 = spmBase + 2*tileA + tileB
-  int64_t addrA0 = spmBase;
-  int64_t addrA1 = spmBase + tileA;
-  int64_t addrB0 = spmBase + 2 * tileA;
-  int64_t addrB1 = spmBase + 2 * tileA + tileB;
+  SPMSpaceManager spmLayout(spmBase, spmSize);
+  auto allocA0 = spmLayout.alloc(tileA, /*alignment=*/1,
+                                 SPMSpaceManager::Lifetime::Loop);
+  auto allocA1 = spmLayout.alloc(tileA, /*alignment=*/1,
+                                 SPMSpaceManager::Lifetime::Loop);
+  auto allocB0 = spmLayout.alloc(tileB, /*alignment=*/1,
+                                 SPMSpaceManager::Lifetime::Loop);
+  auto allocB1 = spmLayout.alloc(tileB, /*alignment=*/1,
+                                 SPMSpaceManager::Lifetime::Loop);
+  if (!allocA0 || !allocA1 || !allocB0 || !allocB1)
+    return false;
+
+  int64_t addrA0 = allocA0->address;
+  int64_t addrA1 = allocA1->address;
+  int64_t addrB0 = allocB0->address;
+  int64_t addrB1 = allocB1->address;
 
   Location loc = forOp.getLoc();
   OpBuilder b(forOp);
@@ -464,6 +465,18 @@ static bool transformGemmLoop(scf::ForOp forOp,
   // Remove the auto-generated yield in the new loop (if present).
   if (!newBody->empty() && newBody->mightHaveTerminator())
     newBody->getTerminator()->erase();
+
+  // DMA wait at TOP of body — wait for the prefetch that filled CURRENT buffer
+  // (issued in the previous iteration, or in the prologue for iter 0).
+  //
+  // Why at top, not at end: the wait lowers to a volatile-poll spin loop,
+  // i.e. its own basic block.  Placed at the end, LLVM schedules it between
+  // the SPM loads and the contract-derived fmuladds — which splits load+
+  // shufflevector(splat) across BBs and defeats the RISC-V backend's
+  // load+splat -> vfmacc.vf folding (the cache path's main matmul codegen).
+  // At the top, the prefetch scf.if joins back into a single block that
+  // contains loads -> FMAs -> yield, which the backend folds correctly.
+  triton::cpu::DmaWaitOp::create(b, loc);
 
   // Build buffer selection BEFORE cloning the body so these ops dominate
   // the SPM reads that will replace the cloned transfer_reads.
@@ -559,9 +572,8 @@ static bool transformGemmLoop(scf::ForOp forOp,
   clonedReadB.replaceAllUsesWith(spmValB);
   clonedReadB->erase();
 
-  // DMA wait AFTER compute — blocks until prefetch for next iteration is done.
+  // (DMA wait is at TOP of body, not here — see comment above.)
   b.setInsertionPointToEnd(newBody);
-  triton::cpu::DmaWaitOp::create(b, loc);
 
   // --- Yield with flipped buf_idx ---
   Value flipped = arith::SubIOp::create(b, loc, one, bufIdx);
@@ -613,7 +625,10 @@ static bool transformGemmLoop(scf::ForOp forOp,
 static bool transformReductionLoop(scf::ForOp forOp,
                                    const TiledLoadInfo &load,
                                    int64_t spmBase, int64_t spmSize) {
-  if (load.tileBytes > spmSize)
+  SPMSpaceManager spmLayout(spmBase, spmSize);
+  auto allocBuf = spmLayout.alloc(load.tileBytes, /*alignment=*/1,
+                                  SPMSpaceManager::Lifetime::Loop);
+  if (!allocBuf)
     return false;
 
   auto lbCst = getConstantIntValue(forOp.getLowerBound());
@@ -622,7 +637,7 @@ static bool transformReductionLoop(scf::ForOp forOp,
   if (!lbCst || !ubCst || !stepCst || (*ubCst - *lbCst) % *stepCst != 0)
     return false;
 
-  int64_t addrBuf = spmBase;
+  int64_t addrBuf = allocBuf->address;
   Location loc = forOp.getLoc();
   OpBuilder b(forOp);
 

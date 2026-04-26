@@ -106,6 +106,9 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_optimize_masks", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createOptimizeMasks());
   });
+  m.def("add_spm_tensor_placement", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::cpu::createSPMTensorPlacement());
+  });
   m.def("add_convert_memory_to_spm",
         [](mlir::PassManager &pm, int64_t spmBase, int64_t spmSize) {
           pm.addPass(

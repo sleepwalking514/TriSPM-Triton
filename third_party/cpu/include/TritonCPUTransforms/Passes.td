@@ -187,6 +187,27 @@ def Canonicalize : Pass<"triton-cpu-canonicalize", "mlir::ModuleOp"> {
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 
+def SPMTensorPlacement : Pass<"triton-cpu-spm-tensor-placement", "mlir::ModuleOp"> {
+    let summary = "Analyze tensor placement tiers for SPM-aware lowering.";
+    let description = [{
+        This pass is the analysis hook for the three-tier data placement pipeline.
+        It runs before ConvertMemoryToSPM and will annotate eligible kernel
+        arguments with the selected SPM placement tier.
+
+        M3 intentionally leaves the pass as a no-op skeleton; later milestones add
+        scalar-reuse analysis, tier attributes, and sidecar export.
+    }];
+
+    let constructor = "mlir::triton::cpu::createSPMTensorPlacement()";
+
+    let dependentDialects = ["mlir::func::FuncDialect",
+                             "mlir::memref::MemRefDialect",
+                             "mlir::scf::SCFDialect",
+                             "mlir::vector::VectorDialect",
+                             "mlir::triton::TritonDialect",
+                             "mlir::triton::cpu::TritonCPUDialect"];
+}
+
 def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleOp"> {
     let summary = "Convert tiled DRAM loads to DMA-based SPM transfers.";
     let description = [{

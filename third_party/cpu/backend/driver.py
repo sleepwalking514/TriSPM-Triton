@@ -2,6 +2,7 @@ import os
 import hashlib
 import importlib
 import importlib.resources
+import json
 import tempfile
 import time
 
@@ -383,6 +384,17 @@ PyMODINIT_FUNC PyInit___triton_cpu_launcher(void) {{
     return src
 
 
+def _read_tier_sidecar(kernel_name):
+    launcher_dir = os.getenv("KERNEL_AUX_FILE_DIR",
+                             os.getenv("KERNEL_LAUNCHER_DIR", "."))
+    path = os.path.join(launcher_dir, f"{kernel_name}_tiers.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    return {int(index): int(tier) for index, tier in data.items()}
+
+
 def make_aot_launcher(constants, signature, ids, kernel_name):
     """Generate a standalone C launcher (header + source) for AOT cross-compilation.
 
@@ -407,6 +419,29 @@ def make_aot_launcher(constants, signature, ids, kernel_name):
     kernel_fn_args = [i for i, ty in signature_flat.items() if i not in constants and ty != "constexpr"]
     arg_decls = ', '.join(f"{ty_to_cpp(signature_flat[i])} arg{i}" for i in kernel_fn_args)
     kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_fn_args)
+    tiers = _read_tier_sidecar(kernel_name)
+
+    def _alloc_case(arg_index, tier):
+        if tier == 1:
+            expr = "spm_malloc(nbytes)"
+        elif tier == 3:
+            expr = "dma_buf_malloc(nbytes)"
+        else:
+            expr = f"{kernel_name}_record_malloc(malloc(nbytes))"
+        return f"    case {arg_index}: return {expr};"
+
+    alloc_cases = "\n".join(
+        _alloc_case(i, tiers.get(i, 2))
+        for i in kernel_fn_args
+        if ty_to_cpp(signature_flat[i]) == "void*"
+    )
+    if not alloc_cases:
+        alloc_cases = f"    default: return {kernel_name}_record_malloc(malloc(nbytes));"
+    else:
+        alloc_cases = (
+            alloc_cases
+            + f"\n    default: return {kernel_name}_record_malloc(malloc(nbytes));"
+        )
 
     # Extern declaration for the Triton-generated kernel symbol.
     # Triton's LLVM lowering appends 6 i32 args: pid_x/y/z, gridX/Y/Z.
@@ -422,11 +457,15 @@ def make_aot_launcher(constants, signature, ids, kernel_name):
 #define {guard}
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* Launch the Triton kernel over a 3-D grid (sequential, for gem5 SE mode). */
 void {kernel_name}_launch(
     int32_t gridX, int32_t gridY, int32_t gridZ
     {(', ' + arg_decls) if arg_decls else ''});
+
+void *{kernel_name}_alloc(int arg_index, size_t nbytes);
+void {kernel_name}_free_all(void);
 
 #endif /* {guard} */
 """
@@ -435,8 +474,38 @@ void {kernel_name}_launch(
     source = f"""\
 #include "{kernel_name}_launcher.h"
 
+#include <stdlib.h>
+
+#include "libspm.h"
+
 /* Triton-generated kernel symbol (from the cross-compiled .s file). */
 extern void {kernel_name}({extern_arg_types});
+
+static void *{kernel_name}_malloc_ptrs[64];
+static int {kernel_name}_malloc_count = 0;
+
+static void *{kernel_name}_record_malloc(void *ptr)
+{{
+    if (ptr && {kernel_name}_malloc_count < 64)
+        {kernel_name}_malloc_ptrs[{kernel_name}_malloc_count++] = ptr;
+    return ptr;
+}}
+
+void *{kernel_name}_alloc(int arg_index, size_t nbytes)
+{{
+    switch (arg_index) {{
+{alloc_cases}
+    }}
+}}
+
+void {kernel_name}_free_all(void)
+{{
+    for (int i = 0; i < {kernel_name}_malloc_count; ++i)
+        free({kernel_name}_malloc_ptrs[i]);
+    {kernel_name}_malloc_count = 0;
+    spm_free_all();
+    dma_buf_free_all();
+}}
 
 void {kernel_name}_launch(
     int32_t gridX, int32_t gridY, int32_t gridZ
