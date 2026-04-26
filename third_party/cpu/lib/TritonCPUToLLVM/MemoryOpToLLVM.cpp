@@ -19,6 +19,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonCPU/IR/Dialect.h"
+#include "triton/Dialect/TritonCPU/IR/SPMAttrs.h"
 
 namespace mlir {
 namespace triton {
@@ -38,7 +39,18 @@ public:
   explicit TritonLLVMConversionTarget(MLIRContext &ctx)
       : ConversionTarget(ctx) {
     addLegalDialect<LLVM::LLVMDialect>();
-    addLegalOp<mlir::UnrealizedConversionCastOp>();
+    addDynamicallyLegalOp<mlir::UnrealizedConversionCastOp>(
+        [](mlir::UnrealizedConversionCastOp op) {
+          if (op.getNumOperands() == 1 && op.getNumResults() == 1) {
+            auto resTy = dyn_cast<MemRefType>(op.getResultTypes()[0]);
+            if (resTy &&
+                resTy.getMemorySpaceAsInt() ==
+                    triton::cpu::kSPMAddressSpace &&
+                op.getOperands()[0].getType().isInteger(64))
+              return false;
+          }
+          return true;
+        });
   }
 };
 
@@ -289,6 +301,47 @@ struct PtrBitcastConversion : public OpConversionPattern<triton::BitcastOp> {
   }
 };
 
+struct SpmAddrToMemRefConversion
+    : public OpConversionPattern<UnrealizedConversionCastOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(UnrealizedConversionCastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getNumOperands() != 1 || op.getNumResults() != 1)
+      return failure();
+    auto resultType = dyn_cast<MemRefType>(op.getResultTypes()[0]);
+    if (!resultType ||
+        resultType.getMemorySpaceAsInt() != triton::cpu::kSPMAddressSpace)
+      return failure();
+    if (!op.getOperands()[0].getType().isInteger(64))
+      return failure();
+
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value i64Addr = adaptor.getOperands()[0];
+
+    auto spmPtrTy = LLVM::LLVMPointerType::get(
+        rewriter.getContext(), triton::cpu::kSPMAddressSpace);
+    Value spmPtr = LLVM::IntToPtrOp::create(rewriter, loc, spmPtrTy, i64Addr);
+
+    auto memRefStructTy = getTypeConverter()->convertType(resultType);
+    Value res = b.undef(memRefStructTy);
+    res = LLVM::InsertValueOp::create(
+        rewriter, loc, memRefStructTy, res, spmPtr,
+        ArrayRef<int64_t>{0});
+    res = LLVM::InsertValueOp::create(
+        rewriter, loc, memRefStructTy, res, spmPtr,
+        ArrayRef<int64_t>{1});
+    res = LLVM::InsertValueOp::create(
+        rewriter, loc, memRefStructTy, res, b.i64_val(0),
+        ArrayRef<int64_t>{2});
+
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
+
 struct PtrSelectConversion : public OpConversionPattern<arith::SelectOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -335,6 +388,7 @@ struct MemoryOpToLLVM
     patterns.add<AddPtrOpConversion>(typeConverter, context);
     patterns.add<PtrBitcastConversion>(typeConverter, context);
     patterns.add<PtrSelectConversion>(typeConverter, context);
+    patterns.add<SpmAddrToMemRefConversion>(typeConverter, context);
 
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();

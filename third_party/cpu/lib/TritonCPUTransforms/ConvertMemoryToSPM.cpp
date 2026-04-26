@@ -59,6 +59,16 @@ static Value idxCst(OpBuilder &b, Location loc, int64_t val) {
   return arith::ConstantIndexOp::create(b, loc, val);
 }
 
+/// Cast a value to i64.  Handles index, i64 (no-op), and narrower integers.
+static Value toI64(OpBuilder &b, Location loc, Value val) {
+  Type ty = val.getType();
+  if (ty.isInteger(64))
+    return val;
+  if (ty.isIndex())
+    return arith::IndexCastOp::create(b, loc, b.getI64Type(), val);
+  return arith::ExtSIOp::create(b, loc, b.getI64Type(), val);
+}
+
 /// Byte size of a vector tile.
 static int64_t getTileBytes(VectorType vecTy) {
   int64_t elems = vecTy.getNumElements();
@@ -107,6 +117,84 @@ static Value computeDramAddr(OpBuilder &b, Location loc,
     if (ivOverride && origIv && idx == origIv)
       idx = ivOverride;
     Value idxI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), idx);
+    Value contrib = arith::MulIOp::create(
+        b, loc, idxI64, i64Cst(b, loc, strides[i] * elemBytes));
+    byteOff = arith::AddIOp::create(b, loc, byteOff, contrib);
+  }
+  return arith::AddIOp::create(b, loc, ptrI64, byteOff);
+}
+
+/// Compute the DRAM byte address for the *first iteration* of a loop.
+///
+/// Handles two IR forms:
+///   1. Regular: readOp's base/indices are defined outside the loop (or
+///      include the loop IV which we substitute with the lower bound).
+///   2. Block-pointer: readOp's base comes from extract_memref on a loop
+///      iter_arg.  We trace back to the initial block pointer value and
+///      create extract_memref / extract_indices on it outside the loop.
+static Value computePrologueDramAddr(OpBuilder &b, Location loc,
+                                     vector::TransferReadOp readOp,
+                                     scf::ForOp forOp) {
+  Value base = readOp.getBase();
+  auto memRefTy = cast<MemRefType>(base.getType());
+  unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides))
+    return nullptr;
+
+  auto *baseDefOp = base.getDefiningOp();
+  bool isBlockPtr = baseDefOp &&
+                    baseDefOp->getParentRegion() == &forOp.getRegion();
+
+  Value ptrI64;
+  SmallVector<Value> indices;
+
+  if (isBlockPtr) {
+    auto extractMR = dyn_cast<triton::cpu::ExtractMemRefOp>(baseDefOp);
+    if (!extractMR)
+      return nullptr;
+
+    Value blockPtr = extractMR.getSrc();
+    auto blockArg = dyn_cast<BlockArgument>(blockPtr);
+    if (!blockArg || blockArg.getOwner() != forOp.getBody())
+      return nullptr;
+
+    unsigned iterArgIdx = blockArg.getArgNumber() - 1;
+    if (iterArgIdx >= forOp.getInitArgs().size())
+      return nullptr;
+
+    Value initBlockPtr = forOp.getInitArgs()[iterArgIdx];
+    Value initMemRef = triton::cpu::ExtractMemRefOp::create(
+        b, loc, memRefTy, initBlockPtr);
+    auto initIndicesOp = triton::cpu::ExtractIndicesOp::create(
+        b, loc, initBlockPtr);
+
+    Value ptrIdx = memref::ExtractAlignedPointerAsIndexOp::create(
+        b, loc, initMemRef);
+    ptrI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), ptrIdx);
+
+    for (auto r : initIndicesOp.getResults())
+      indices.push_back(r);
+  } else {
+    Value ptrIdx = memref::ExtractAlignedPointerAsIndexOp::create(
+        b, loc, base);
+    ptrI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), ptrIdx);
+
+    Value lb = forOp.getLowerBound();
+    Value origIv = forOp.getInductionVar();
+    for (auto idx : readOp.getIndices()) {
+      if (idx == origIv)
+        indices.push_back(lb);
+      else
+        indices.push_back(idx);
+    }
+  }
+
+  Value byteOff = i64Cst(b, loc, 0);
+  for (unsigned i = 0; i < indices.size(); ++i) {
+    Value idxI64 = arith::IndexCastOp::create(
+        b, loc, b.getI64Type(), indices[i]);
     Value contrib = arith::MulIOp::create(
         b, loc, idxI64, i64Cst(b, loc, strides[i] * elemBytes));
     byteOff = arith::AddIOp::create(b, loc, byteOff, contrib);
@@ -297,6 +385,14 @@ static bool transformGemmLoop(scf::ForOp forOp,
   if (totalSpm > spmSize)
     return false;
 
+  // Loop boundary guard: trip count must be a known multiple of the step.
+  // If not provable at compile time, bail out to the cache path.
+  auto lbCst = getConstantIntValue(forOp.getLowerBound());
+  auto ubCst = getConstantIntValue(forOp.getUpperBound());
+  auto stepCst = getConstantIntValue(forOp.getStep());
+  if (!lbCst || !ubCst || !stepCst || (*ubCst - *lbCst) % *stepCst != 0)
+    return false;
+
   // SPM buffer layout (compile-time constants):
   //   spm_a0 = spmBase + 0
   //   spm_a1 = spmBase + tileA
@@ -316,12 +412,8 @@ static bool transformGemmLoop(scf::ForOp forOp,
   auto memRefTyB = cast<MemRefType>(readB.getBase().getType());
 
   // --- Prologue: DMA first tiles into buffer 0 ---
-  // Use the loop's lower bound as the induction variable for the first
-  // iteration's DRAM address computation.
-  Value lb = forOp.getLowerBound();
-  Value origIv = forOp.getInductionVar();
-  Value dramAddrA = computeDramAddr(b, loc, readA, lb, origIv);
-  Value dramAddrB = computeDramAddr(b, loc, readB, lb, origIv);
+  Value dramAddrA = computePrologueDramAddr(b, loc, readA, forOp);
+  Value dramAddrB = computePrologueDramAddr(b, loc, readB, forOp);
   if (!dramAddrA || !dramAddrB)
     return false;
 
@@ -389,14 +481,61 @@ static bool transformGemmLoop(scf::ForOp forOp,
   Value spmB1 = i64Cst(b, loc, addrB1);
   Value spmBCur = arith::SelectOp::create(b, loc, isZero, spmB0, spmB1);
 
+  // --- Prefetch next tiles FIRST (async, overlaps with compute below) ---
+  Value iv = newForOp.getInductionVar();
+  Value step = newForOp.getStep();
+  Value ub = newForOp.getUpperBound();
+  Value nextIv = arith::AddIOp::create(b, loc, iv, step);
+  Value hasNext = arith::CmpIOp::create(
+      b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+
+  Value spmANxt = arith::SelectOp::create(b, loc, isZero, spmA1, spmA0);
+  Value spmBNxt = arith::SelectOp::create(b, loc, isZero, spmB1, spmB0);
+
+  auto shapeA = loadA.vecTy.getShape();
+  auto shapeB = loadB.vecTy.getShape();
+  unsigned elemBytesA = memRefTyA.getElementType().getIntOrFloatBitWidth() / 8;
+  unsigned elemBytesB = memRefTyB.getElementType().getIntOrFloatBitWidth() / 8;
+
+  SmallVector<int64_t> stridesA, stridesB;
+  int64_t offA, offB;
+  (void)memRefTyA.getStridesAndOffset(stridesA, offA);
+  (void)memRefTyB.getStridesAndOffset(stridesB, offB);
+
+  int64_t kDimA = (shapeA.size() >= 2) ? 1 : 0;
+  int64_t stepBytesA = shapeA[kDimA] * stridesA[kDimA] * elemBytesA;
+  int64_t kDimB = 0;
+  int64_t stepBytesB = shapeB[kDimB] * stridesB[kDimB] * elemBytesB;
+
+  Value newLb = newForOp.getLowerBound();
+  Value kOffset = arith::SubIOp::create(b, loc, iv, newLb);
+  Value kOffI64 = toI64(b, loc, kOffset);
+  Value stepI64 = toI64(b, loc, step);
+
+  Value iterNum = arith::DivSIOp::create(b, loc, kOffI64, stepI64);
+  Value one = i64Cst(b, loc, 1);
+  Value nextIterNum = arith::AddIOp::create(b, loc, iterNum, one);
+
+  Value nextDramA = arith::AddIOp::create(
+      b, loc, dramAddrA,
+      arith::MulIOp::create(b, loc, nextIterNum, i64Cst(b, loc, stepBytesA)));
+  Value nextDramB = arith::AddIOp::create(
+      b, loc, dramAddrB,
+      arith::MulIOp::create(b, loc, nextIterNum, i64Cst(b, loc, stepBytesB)));
+
+  auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
+  b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  emitDmaEnqueue(b, loc, spmANxt, nextDramA, loadA.vecTy, memRefTyA);
+  emitDmaEnqueue(b, loc, spmBNxt, nextDramB, loadB.vecTy, memRefTyB);
+  b.setInsertionPointAfter(ifOp);
+
+  // --- SPM read + compute (from CURRENT buffer, while prefetch runs) ---
   for (auto &op : oldBody->getOperations()) {
     if (isa<scf::YieldOp>(op))
-      continue; // handle yield separately
+      continue;
     b.clone(op, mapping);
   }
 
-  // Now replace the transfer_reads with SPM reads.
-  // Find the cloned readA and readB.
   vector::TransferReadOp clonedReadA = nullptr, clonedReadB = nullptr;
   newBody->walk([&](vector::TransferReadOp clonedRead) {
     if (clonedRead.getBase() == mapping.lookupOrDefault(readA.getBase()) &&
@@ -410,7 +549,6 @@ static bool transformGemmLoop(scf::ForOp forOp,
   if (!clonedReadA || !clonedReadB)
     return false;
 
-  // Insert SPM reads right before the cloned reads.
   b.setInsertionPoint(clonedReadA);
   Value spmValA = emitSpmRead(b, loc, spmACur, loadA.vecTy);
   clonedReadA.replaceAllUsesWith(spmValA);
@@ -421,99 +559,8 @@ static bool transformGemmLoop(scf::ForOp forOp,
   clonedReadB.replaceAllUsesWith(spmValB);
   clonedReadB->erase();
 
-  // --- Prefetch next tiles (async) ---
-  // Insert after the SPM reads but before dma_wait.
-  // We need to check if there's a next iteration: k + step < upper_bound.
+  // DMA wait AFTER compute — blocks until prefetch for next iteration is done.
   b.setInsertionPointToEnd(newBody);
-
-  Value iv = newForOp.getInductionVar();
-  Value step = newForOp.getStep();
-  Value ub = newForOp.getUpperBound();
-  Value nextIv = arith::AddIOp::create(b, loc, iv, step);
-  Value hasNext = arith::CmpIOp::create(
-      b, loc, arith::CmpIPredicate::slt, nextIv, ub);
-
-  // Alternate buffer for prefetch.
-  Value spmANxt = arith::SelectOp::create(b, loc, isZero, spmA1, spmA0);
-  Value spmBNxt = arith::SelectOp::create(b, loc, isZero, spmB1, spmB0);
-
-  // Compute next DRAM addresses.
-  // The next iteration's DRAM address = current DRAM address recomputed
-  // with the next iteration's indices.  Since the original loop already
-  // advances pointers, we can compute the next DRAM addr by looking at
-  // what the transfer_read indices would be at k+step.
-  //
-  // For the MVP, we compute next DRAM addr as: current + step_bytes.
-  // This works because the K-loop advances linearly.
-  auto shapeA = loadA.vecTy.getShape();
-  auto shapeB = loadB.vecTy.getShape();
-  unsigned elemBytesA = memRefTyA.getElementType().getIntOrFloatBitWidth() / 8;
-  unsigned elemBytesB = memRefTyB.getElementType().getIntOrFloatBitWidth() / 8;
-
-  // For A[M,K]: advancing K by BLOCK_K means offset += BLOCK_K * elemBytes
-  // (stride along K dimension = 1 for row-major, or strides[1])
-  SmallVector<int64_t> stridesA, stridesB;
-  int64_t offA, offB;
-  (void)memRefTyA.getStridesAndOffset(stridesA, offA);
-  (void)memRefTyB.getStridesAndOffset(stridesB, offB);
-
-  // The K-dimension step in bytes for A: BLOCK_K * stride_k * elemBytes
-  // For row-major A[M,K]: stride_k = 1, so step = BLOCK_K * elemBytes
-  int64_t kDimA = (shapeA.size() >= 2) ? 1 : 0; // K is last dim for A
-  int64_t stepBytesA = shapeA[kDimA] * stridesA[kDimA] * elemBytesA;
-
-  // For B[K,N]: K is first dim, stride_k = N, step = BLOCK_K * N * elemBytes
-  int64_t kDimB = 0; // K is first dim for B
-  int64_t stepBytesB = shapeB[kDimB] * stridesB[kDimB] * elemBytesB;
-
-  // Recompute current DRAM addresses inside the loop body.
-  b.setInsertionPointToEnd(newBody);
-  // We need the DRAM addresses that were computed for the current iteration.
-  // Since we cloned the body, the original computeDramAddr logic is embedded
-  // in the cloned ops.  For the next iteration, we add the step.
-  //
-  // Actually, we need to recompute dramAddr inside the loop.  Let's find
-  // the memref.extract_aligned_pointer_as_index ops we need.
-  // Simpler approach: recompute from the mapped readOp's base and indices.
-  //
-  // Even simpler for MVP: compute dramAddr inside the loop from the original
-  // base + current indices (which are already in the cloned body).
-  // But the cloned reads are erased.  We need to save the DRAM addr before
-  // erasing.
-  //
-  // Let me restructure: compute DRAM addr BEFORE replacing reads.
-  // This requires restructuring the code flow.  For now, use the linear
-  // advancement approach: dramAddr_next = dramAddr_first + (k/step) * stepBytes.
-
-  // Compute iteration index.
-  Value newLb = newForOp.getLowerBound();
-  Value kOffset = arith::SubIOp::create(b, loc, iv, newLb);
-  // Convert to i64 for address arithmetic.
-  Value kOffI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), kOffset);
-  Value stepI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), step);
-
-  // Current iteration number (0-based).
-  Value iterNum = arith::DivSIOp::create(b, loc, kOffI64, stepI64);
-  // Next iteration number.
-  Value one = i64Cst(b, loc, 1);
-  Value nextIterNum = arith::AddIOp::create(b, loc, iterNum, one);
-
-  Value nextDramA = arith::AddIOp::create(
-      b, loc, dramAddrA,
-      arith::MulIOp::create(b, loc, nextIterNum, i64Cst(b, loc, stepBytesA)));
-  Value nextDramB = arith::AddIOp::create(
-      b, loc, dramAddrB,
-      arith::MulIOp::create(b, loc, nextIterNum, i64Cst(b, loc, stepBytesB)));
-
-  // Conditional prefetch.
-  auto ifOp = scf::IfOp::create(b, loc, /*resultTypes=*/TypeRange{}, hasNext,
-                                  /*withElseRegion=*/false);
-  b.setInsertionPointToStart(&ifOp.getThenRegion().front());
-  emitDmaEnqueue(b, loc, spmANxt, nextDramA, loadA.vecTy, memRefTyA);
-  emitDmaEnqueue(b, loc, spmBNxt, nextDramB, loadB.vecTy, memRefTyB);
-
-  // DMA wait at end of loop body (after prefetch, before yield).
-  b.setInsertionPointAfter(ifOp);
   triton::cpu::DmaWaitOp::create(b, loc);
 
   // --- Yield with flipped buf_idx ---
@@ -569,6 +616,12 @@ static bool transformReductionLoop(scf::ForOp forOp,
   if (load.tileBytes > spmSize)
     return false;
 
+  auto lbCst = getConstantIntValue(forOp.getLowerBound());
+  auto ubCst = getConstantIntValue(forOp.getUpperBound());
+  auto stepCst = getConstantIntValue(forOp.getStep());
+  if (!lbCst || !ubCst || !stepCst || (*ubCst - *lbCst) % *stepCst != 0)
+    return false;
+
   int64_t addrBuf = spmBase;
   Location loc = forOp.getLoc();
   OpBuilder b(forOp);
@@ -577,9 +630,7 @@ static bool transformReductionLoop(scf::ForOp forOp,
   auto memRefTy = cast<MemRefType>(readOp.getBase().getType());
 
   // Prologue: DMA first chunk.
-  Value origIv = forOp.getInductionVar();
-  Value lb = forOp.getLowerBound();
-  Value dramAddr = computeDramAddr(b, loc, readOp, lb, origIv);
+  Value dramAddr = computePrologueDramAddr(b, loc, readOp, forOp);
   if (!dramAddr)
     return false;
 
@@ -608,7 +659,21 @@ static bool transformReductionLoop(scf::ForOp forOp,
   if (!newBody->empty() && newBody->mightHaveTerminator())
     newBody->getTerminator()->erase();
 
-  // --- Prefetch next chunk (before compute) ---
+  // Clone the original body, replacing the transfer_read with SPM read.
+  // SPM read happens FIRST, before prefetch, to avoid single-buffer race:
+  // the current chunk must be fully read before prefetching overwrites it.
+  for (auto &op : oldBody->getOperations()) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+    if (&op == readOp.getOperation()) {
+      Value spmVal = emitSpmRead(b, loc, i64Cst(b, loc, addrBuf), load.vecTy);
+      mapping.map(readOp.getResult(), spmVal);
+      continue;
+    }
+    b.clone(op, mapping);
+  }
+
+  // --- Prefetch next chunk (AFTER compute to avoid single-buffer race) ---
   Value iv = newForOp.getInductionVar();
   Value step = newForOp.getStep();
   Value ub = newForOp.getUpperBound();
@@ -616,20 +681,15 @@ static bool transformReductionLoop(scf::ForOp forOp,
   Value hasNext = arith::CmpIOp::create(
       b, loc, arith::CmpIPredicate::slt, nextIv, ub);
 
-  // Compute next DRAM address.
-  // Use the base DRAM address (at lb) computed in the prologue, and
-  // advance by (nextIv - lb) * leading_stride * elemBytes.
   unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
   SmallVector<int64_t> strides;
   int64_t offset;
   (void)memRefTy.getStridesAndOffset(strides, offset);
   int64_t leadingStride = strides.empty() ? 1 : strides[0];
 
-  // dramAddr is the DRAM address at iteration lb.
-  // nextDram = dramAddr + (nextIv - lb) * leadingStride * elemBytes
   Value lbInLoop = newForOp.getLowerBound();
   Value nextOff = arith::SubIOp::create(b, loc, nextIv, lbInLoop);
-  Value nextOffI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), nextOff);
+  Value nextOffI64 = toI64(b, loc, nextOff);
   Value nextByteOff = arith::MulIOp::create(
       b, loc, nextOffI64, i64Cst(b, loc, leadingStride * elemBytes));
   Value nextDram = arith::AddIOp::create(b, loc, dramAddr, nextByteOff);
@@ -639,19 +699,6 @@ static bool transformReductionLoop(scf::ForOp forOp,
   emitDmaEnqueue(b, loc, i64Cst(b, loc, addrBuf), nextDram,
                  load.vecTy, memRefTy);
   b.setInsertionPointAfter(ifOp);
-
-  // Clone the original body, replacing the transfer_read with SPM read.
-  for (auto &op : oldBody->getOperations()) {
-    if (isa<scf::YieldOp>(op))
-      continue;
-    if (&op == readOp.getOperation()) {
-      // Replace with SPM read.
-      Value spmVal = emitSpmRead(b, loc, i64Cst(b, loc, addrBuf), load.vecTy);
-      mapping.map(readOp.getResult(), spmVal);
-      continue;
-    }
-    b.clone(op, mapping);
-  }
 
   // DMA wait at end of body.
   triton::cpu::DmaWaitOp::create(b, loc);

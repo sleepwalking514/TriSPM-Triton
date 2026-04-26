@@ -216,9 +216,12 @@ class CPUBackend(BaseBackend):
             # SPM transformation: convert tiled DRAM loads to DMA+SPM
             # transfers.  Must run after dot lowering (to detect
             # vector.contract consumers) and before type promotion.
-            spm_base = int(os.getenv("TRITON_SPM_BASE", "0x40000000"), 0)
-            spm_size = int(os.getenv("TRITON_SPM_SIZE", "65536"), 0)
-            cpu.passes.ttcpuir.add_convert_memory_to_spm(pm, spm_base, spm_size)
+            # TRITON_DISABLE_SPM=1 produces a cacheable-only binary suitable
+            # for the cache_baseline gem5 run (no DMA MMIO accesses).
+            if os.getenv("TRITON_DISABLE_SPM", "0") != "1":
+                spm_base = int(os.getenv("TRITON_SPM_BASE", "0x40000000"), 0)
+                spm_size = int(os.getenv("TRITON_SPM_SIZE", "262144"), 0)
+                cpu.passes.ttcpuir.add_convert_memory_to_spm(pm, spm_base, spm_size)
 
             # bf16 hardware support requires Zfbfmin (not in gem5 yet)
             promote_bf16_to_fp32 = True

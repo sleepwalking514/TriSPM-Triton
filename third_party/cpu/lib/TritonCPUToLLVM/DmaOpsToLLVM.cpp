@@ -167,7 +167,7 @@ struct DmaEnqueue2DOpConversion
 };
 
 // ===----------------------------------------------------------------------===
-// DmaWaitOp → volatile load from STATUS register (blocks until idle)
+// DmaWaitOp → polling loop on STATUS register until idle (== 0)
 // ===----------------------------------------------------------------------===
 struct DmaWaitOpConversion
     : public OpConversionPattern<triton::cpu::DmaWaitOp> {
@@ -177,16 +177,35 @@ struct DmaWaitOpConversion
   matchAndRewrite(triton::cpu::DmaWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    auto i64Ty = rewriter.getI64Type();
+    auto i1Ty = rewriter.getI1Type();
 
-    // Fence before the status check to ensure all preceding stores
-    // (including DMA trigger) are globally visible.
+    // Split the block at the DmaWaitOp.  Everything after the op goes
+    // into continuationBB; currentBlock keeps everything before the op.
+    Block *currentBlock = rewriter.getInsertionBlock();
+    Block *continuationBB = rewriter.splitBlock(currentBlock,
+                                                 Block::iterator(op));
+
+    // Create the poll loop block between current and continuation.
+    Block *pollBB = rewriter.createBlock(continuationBB);
+
+    // currentBlock: fence + branch to pollBB
+    rewriter.setInsertionPointToEnd(currentBlock);
     emitFence(rewriter, loc);
+    LLVM::BrOp::create(rewriter, loc, pollBB);
 
-    // Volatile load from STATUS register.  The gem5 DMA engine delays
-    // the response until idle, so this single load acts as a blocking wait.
-    emitVolatileLoad(rewriter, loc, DMA_MMIO_BASE, DMA_REG_STATUS);
+    // pollBB: volatile load STATUS, branch back if busy, else to continuation
+    rewriter.setInsertionPointToStart(pollBB);
+    Value status = emitVolatileLoad(rewriter, loc, DMA_MMIO_BASE,
+                                    DMA_REG_STATUS);
+    Value zero = createI64Constant(rewriter, loc, 0);
+    Value busy = LLVM::ICmpOp::create(rewriter, loc, i1Ty,
+                                      LLVM::ICmpPredicate::ne,
+                                      status, zero);
+    LLVM::CondBrOp::create(rewriter, loc, busy, pollBB, continuationBB);
 
-    // Fence after to ensure subsequent SPM reads see the DMA'd data.
+    // continuationBB: fence at the start, then original ops follow
+    rewriter.setInsertionPointToStart(continuationBB);
     emitFence(rewriter, loc);
 
     rewriter.eraseOp(op);
