@@ -422,7 +422,11 @@ static bool transformGemmLoop(scf::ForOp forOp,
                  loadA.vecTy, memRefTyA);
   emitDmaEnqueue(b, loc, i64Cst(b, loc, addrB0), dramAddrB,
                  loadB.vecTy, memRefTyB);
-  triton::cpu::DmaWaitOp::create(b, loc);
+  // No explicit prologue wait: the DmaWait emitted at the top of the
+  // body block (before any SPM read of buffer 0) already polls until
+  // the prologue DMAs complete.  Issuing another wait here just adds a
+  // redundant volatile-load BB and bookkeeping for ~zero stall (the
+  // body-top wait then sees status=0 immediately on iter 0).
 
   // --- Add buf_idx iter_arg to the loop ---
   // We need to add a new i64 iter_arg for the buffer index (0 or 1).

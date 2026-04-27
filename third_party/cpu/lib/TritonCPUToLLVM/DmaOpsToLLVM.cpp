@@ -37,11 +37,18 @@ using namespace mlir::triton::cpu;
 static constexpr uint64_t DMA_MMIO_BASE = 0xF0000000ULL;
 static constexpr uint64_t DMA_REG_SRC = 0x00;
 static constexpr uint64_t DMA_REG_DST = 0x08;
+// REG_LEN: lower 32 = width (LEN), upper 32 = height.  Writing triggers
+// the enqueue.  The compiler always uses the packed form so HEIGHT does
+// not need its own MMIO store.
 static constexpr uint64_t DMA_REG_LEN = 0x10;
 static constexpr uint64_t DMA_REG_STATUS = 0x18;
+// Legacy unpacked stride/height registers (kept for hand-written code).
 static constexpr uint64_t DMA_REG_SRC_STRIDE = 0x20;
 static constexpr uint64_t DMA_REG_DST_STRIDE = 0x28;
 static constexpr uint64_t DMA_REG_HEIGHT = 0x30;
+// REG_STRIDES_PACKED: lower 32 = SRC_STRIDE, upper 32 = DST_STRIDE.  The
+// compiler uses this to set both row pitches in a single MMIO store.
+static constexpr uint64_t DMA_REG_STRIDES_PACKED = 0x38;
 
 namespace {
 
@@ -137,24 +144,46 @@ struct DmaEnqueue2DOpConversion
   matchAndRewrite(triton::cpu::DmaEnqueue2DOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    auto i64Ty = rewriter.getI64Type();
 
-    // Write all DMA configuration registers BEFORE the trigger register.
+    // SRC and DST: 64-bit each, separate stores.
     emitVolatileStore(rewriter, loc, adaptor.getSrc(), DMA_MMIO_BASE,
                       DMA_REG_SRC);
     emitVolatileStore(rewriter, loc, adaptor.getDst(), DMA_MMIO_BASE,
                       DMA_REG_DST);
-    emitVolatileStore(rewriter, loc, adaptor.getSrcStride(), DMA_MMIO_BASE,
-                      DMA_REG_SRC_STRIDE);
-    emitVolatileStore(rewriter, loc, adaptor.getDstStride(), DMA_MMIO_BASE,
-                      DMA_REG_DST_STRIDE);
-    emitVolatileStore(rewriter, loc, adaptor.getHeight(), DMA_MMIO_BASE,
-                      DMA_REG_HEIGHT);
+
+    // Pack (srcStride, dstStride) into one i64: lower 32 = src, upper 32
+    // = dst.  One MMIO store replaces the two-store sequence used by
+    // older code paths.
+    Value mask32 = createI64Constant(rewriter, loc, 0xFFFFFFFFull);
+    Value shift32 = createI64Constant(rewriter, loc, 32);
+    Value srcStrideLo = LLVM::AndOp::create(rewriter, loc, i64Ty,
+                                            adaptor.getSrcStride(), mask32);
+    Value dstStrideLo = LLVM::AndOp::create(rewriter, loc, i64Ty,
+                                            adaptor.getDstStride(), mask32);
+    Value dstStrideHi = LLVM::ShlOp::create(rewriter, loc, i64Ty,
+                                            dstStrideLo, shift32);
+    Value stridesPacked = LLVM::OrOp::create(rewriter, loc, i64Ty,
+                                             srcStrideLo, dstStrideHi);
+    emitVolatileStore(rewriter, loc, stridesPacked, DMA_MMIO_BASE,
+                      DMA_REG_STRIDES_PACKED);
 
     // Fence: ensure all config registers are visible before trigger.
     emitFence(rewriter, loc);
 
-    // Write LEN register — this triggers the DMA enqueue.
-    emitVolatileStore(rewriter, loc, adaptor.getWidth(), DMA_MMIO_BASE,
+    // Pack (width, height) into LEN: lower 32 = width, upper 32 =
+    // height.  Writing this single store triggers the DMA enqueue and
+    // also delivers the row count, replacing the prior REG_HEIGHT +
+    // REG_LEN pair.
+    Value widthLo = LLVM::AndOp::create(rewriter, loc, i64Ty,
+                                        adaptor.getWidth(), mask32);
+    Value heightLo = LLVM::AndOp::create(rewriter, loc, i64Ty,
+                                         adaptor.getHeight(), mask32);
+    Value heightHi = LLVM::ShlOp::create(rewriter, loc, i64Ty,
+                                         heightLo, shift32);
+    Value lenHeightPacked = LLVM::OrOp::create(rewriter, loc, i64Ty,
+                                               widthLo, heightHi);
+    emitVolatileStore(rewriter, loc, lenHeightPacked, DMA_MMIO_BASE,
                       DMA_REG_LEN);
 
     // Fence: ensure the trigger write is ordered before any subsequent
