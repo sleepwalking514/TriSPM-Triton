@@ -388,11 +388,26 @@ def _read_tier_sidecar(kernel_name):
     launcher_dir = os.getenv("KERNEL_AUX_FILE_DIR",
                              os.getenv("KERNEL_LAUNCHER_DIR", "."))
     path = os.path.join(launcher_dir, f"{kernel_name}_tiers.json")
-    if not os.path.exists(path):
-        return {}
-    with open(path) as f:
-        data = json.load(f)
-    return {int(index): int(tier) for index, tier in data.items()}
+    tiers: dict[int, int] = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            data = json.load(f)
+        tiers = {int(index): int(tier) for index, tier in data.items()}
+
+    # Experiment-time override layered on top of the analysis pass result.
+    # Format: "idx=tier,idx=tier" e.g. "0=2,1=2" forces args 0 and 1 to Tier 2.
+    override = os.getenv("KERNEL_TIER_OVERRIDE", "").strip()
+    if override:
+        for entry in override.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "=" not in entry:
+                raise ValueError(
+                    f"KERNEL_TIER_OVERRIDE entry {entry!r} must be 'idx=tier'")
+            idx_str, tier_str = entry.split("=", 1)
+            tiers[int(idx_str)] = int(tier_str)
+    return tiers
 
 
 def make_aot_launcher(constants, signature, ids, kernel_name):
