@@ -208,6 +208,31 @@ def SPMTensorPlacement : Pass<"triton-cpu-spm-tensor-placement", "mlir::ModuleOp
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 
+def SplitLargeContract : Pass<"triton-cpu-split-large-contract", "mlir::ModuleOp"> {
+    let summary = "Split large vector.contract ops into register-friendly micro-tiles.";
+    let description = [{
+        Splits vector.contract operations whose accumulator M dimension exceeds
+        `microM` into ceil(M / microM) smaller contracts.  This reduces vector
+        register pressure on targets with limited physical registers (e.g.
+        RISC-V RVV VLEN=256 with 32 vregs).
+
+        Must run AFTER ConvertMemoryToSPM (so DMA granularity is unaffected)
+        and BEFORE LLVM lowering.
+    }];
+
+    let options = [
+        Option<"microM", "micro-m",
+               "int64_t", /*default*/"4",
+               "Maximum number of accumulator rows per micro-tile.">,
+    ];
+
+    let constructor = "mlir::triton::cpu::createSplitLargeContract()";
+
+    let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::scf::SCFDialect",
+                             "mlir::vector::VectorDialect"];
+}
+
 def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleOp"> {
     let summary = "Convert tiled DRAM loads to DMA-based SPM transfers.";
     let description = [{

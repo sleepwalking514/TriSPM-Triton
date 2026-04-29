@@ -114,6 +114,10 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
           pm.addPass(
               mlir::triton::cpu::createConvertMemoryToSPM(spmBase, spmSize));
         });
+  m.def("add_split_large_contract",
+        [](mlir::PassManager &pm, int64_t microM) {
+          pm.addPass(mlir::triton::cpu::createSplitLargeContract(microM));
+        });
   m.def("add_convert_dot_product", [](mlir::PassManager &pm,
                                       bool useHorizontalSum) {
     pm.addPass(mlir::triton::cpu::createConvertDotProduct(useHorizontalSum));

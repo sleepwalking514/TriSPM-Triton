@@ -50,6 +50,10 @@ std::unique_ptr<OperationPass<ModuleOp>> createConvertMemoryToSPM();
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize);
 
+std::unique_ptr<OperationPass<ModuleOp>> createSplitLargeContract();
+std::unique_ptr<OperationPass<ModuleOp>>
+createSplitLargeContract(int64_t microM);
+
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotOpToUkernelOps(
     Ukernels ukernels = mlir::triton::cpu::Ukernels::OneDNN);
 

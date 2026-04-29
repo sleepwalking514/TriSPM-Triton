@@ -226,6 +226,13 @@ class CPUBackend(BaseBackend):
                 cpu.passes.ttcpuir.add_spm_tensor_placement(pm)
                 cpu.passes.ttcpuir.add_convert_memory_to_spm(pm, spm_base, spm_size)
 
+            # Split large vector.contract ops into register-friendly
+            # micro-tiles.  Runs after SPM (DMA granularity unaffected)
+            # and before LLVM lowering.  MICRO_M controls the max
+            # accumulator rows per sub-contract (default 4).
+            micro_m = int(os.getenv("TRITON_MICRO_M", "4"), 0)
+            cpu.passes.ttcpuir.add_split_large_contract(pm, micro_m)
+
             # bf16 hardware support requires Zfbfmin (not in gem5 yet)
             promote_bf16_to_fp32 = True
             # Mixed precision matmul always needs conversion (no hw support)
