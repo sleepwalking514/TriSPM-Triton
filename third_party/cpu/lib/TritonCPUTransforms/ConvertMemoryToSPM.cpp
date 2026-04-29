@@ -704,13 +704,23 @@ static bool transformReductionLoop(scf::ForOp forOp,
   SmallVector<int64_t> strides;
   int64_t offset;
   (void)memRefTy.getStridesAndOffset(strides, offset);
-  int64_t leadingStride = strides.empty() ? 1 : strides[0];
+
+  // Find which dimension the loop IV indexes by matching the original
+  // transfer_read indices against the loop induction variable.
+  int64_t ivStride = strides.empty() ? 1 : strides[0];
+  Value origIv = forOp.getInductionVar();
+  for (unsigned i = 0; i < readOp.getIndices().size(); ++i) {
+    if (readOp.getIndices()[i] == origIv) {
+      ivStride = strides[i];
+      break;
+    }
+  }
 
   Value lbInLoop = newForOp.getLowerBound();
   Value nextOff = arith::SubIOp::create(b, loc, nextIv, lbInLoop);
   Value nextOffI64 = toI64(b, loc, nextOff);
   Value nextByteOff = arith::MulIOp::create(
-      b, loc, nextOffI64, i64Cst(b, loc, leadingStride * elemBytes));
+      b, loc, nextOffI64, i64Cst(b, loc, ivStride * elemBytes));
   Value nextDram = arith::AddIOp::create(b, loc, dramAddr, nextByteOff);
 
   auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);

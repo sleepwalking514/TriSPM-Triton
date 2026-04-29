@@ -7,35 +7,26 @@
 
 // CHECK-LABEL: @gemm_double_buffer
 //
-// Prologue: DMA first tiles into buffer 0, then wait.
+// Prologue: DMA first tiles into buffer 0 (no wait in prologue — wait is
+// at the top of the loop body to overlap with the previous iteration's
+// prefetch).
 // CHECK:       triton_cpu.dma_enqueue_2d
 // CHECK:       triton_cpu.dma_enqueue_2d
-// CHECK:       triton_cpu.dma_wait
 //
-// Loop body should contain:
-//   - arith.cmpi eq (buffer index check)
-//   - arith.select (buffer selection)
-//   - memref.reinterpret_cast {{.*}} memref<{{.*}}, 3>  (SPM read for A)
-//   - memref.reinterpret_cast {{.*}} memref<{{.*}}, 3>  (SPM read for B)
-//   - vector.contract (the dot product, unchanged)
-//   - scf.if (conditional prefetch)
-//   - triton_cpu.dma_enqueue_2d (prefetch A next)
-//   - triton_cpu.dma_enqueue_2d (prefetch B next)
-//   - triton_cpu.dma_wait (end of body)
-//
+// Loop body: wait → select buffers → prefetch next → SPM read → compute.
 // CHECK:       scf.for
+// CHECK:         triton_cpu.dma_wait
 // CHECK:         arith.cmpi eq
 // CHECK:         arith.select
 // CHECK:         arith.select
+// CHECK:         scf.if
+// CHECK:           triton_cpu.dma_enqueue_2d
+// CHECK:           triton_cpu.dma_enqueue_2d
 // CHECK:         memref.reinterpret_cast
 // CHECK:         vector.transfer_read {{.*}} memref<16x16xf32, strided<[16, 1]>, 3>
 // CHECK:         memref.reinterpret_cast
 // CHECK:         vector.transfer_read {{.*}} memref<16x16xf32, strided<[16, 1]>, 3>
 // CHECK:         vector.contract
-// CHECK:         scf.if
-// CHECK:           triton_cpu.dma_enqueue_2d
-// CHECK:           triton_cpu.dma_enqueue_2d
-// CHECK:         triton_cpu.dma_wait
 // CHECK:         scf.yield
 
 module {
@@ -87,19 +78,15 @@ module {
 // CHECK:       triton_cpu.dma_enqueue_2d
 // CHECK:       triton_cpu.dma_wait
 //
-// Loop body:
-//   - scf.if (conditional prefetch for next chunk)
-//   - triton_cpu.dma_enqueue_2d (prefetch next)
-//   - vector.transfer_read from SPM memref (address space 3)
-//   - arith.addf (reduction)
-//   - triton_cpu.dma_wait
+// Loop body: SPM read → compute → prefetch next → wait.
+// (Read current BEFORE prefetch to avoid single-buffer race.)
 //
 // CHECK:       scf.for
-// CHECK:         scf.if
-// CHECK:           triton_cpu.dma_enqueue_2d
 // CHECK:         memref.reinterpret_cast
 // CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
 // CHECK:         arith.addf
+// CHECK:         scf.if
+// CHECK:           triton_cpu.dma_enqueue_2d
 // CHECK:         triton_cpu.dma_wait
 // CHECK:         scf.yield
 
@@ -149,6 +136,60 @@ module {
       %one = arith.constant 1 : i32
       %sum = arith.addi %acc, %one : i32
       scf.yield %sum : i32
+    }
+
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
+// Test: 2D reduction with IV on non-leading dimension (stride=1).
+//       Verifies that the prefetch address uses the correct stride for the
+//       IV dimension, not always the leading stride.
+//
+//       memref<8x64xf32, strided<[64, 1]>> with transfer_read %X[%c0, %i]
+//       → IV indexes dim 1 (stride=1), so byte step = 1 * 4 = 4 per element.
+//       Bug (before fix): would use leading stride 64 → 256 bytes per step.
+// ============================================================================
+
+// CHECK-LABEL: @reduction_2d_non_leading_iv
+//
+// Prologue DMA + wait.
+// CHECK:       triton_cpu.dma_enqueue_2d
+// CHECK:       triton_cpu.dma_wait
+//
+// Loop body: SPM read → compute → prefetch (with stride=1*4=4) → wait.
+// The key assertion: arith.muli uses constant 4 (not 256) for the byte offset.
+// CHECK:       scf.for
+// CHECK:         memref.reinterpret_cast
+// CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
+// CHECK:         arith.addf
+// CHECK:         arith.subi
+// CHECK:         arith.index_cast
+// CHECK:         arith.muli
+// CHECK:         scf.if
+// CHECK:           triton_cpu.dma_enqueue_2d
+// CHECK:         triton_cpu.dma_wait
+// CHECK:         scf.yield
+
+module {
+  tt.func public @reduction_2d_non_leading_iv(
+      %X: memref<8x64xf32, strided<[64, 1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %c16 = arith.constant 16 : index
+    %c64 = arith.constant 64 : index
+    %cst = arith.constant 0.0 : f32
+    %acc_init = arith.constant dense<0.0> : vector<16xf32>
+
+    // Reduce along dim 1 (columns): IV indexes the non-leading dimension.
+    %result = scf.for %i = %c0 to %c64 step %c16
+        iter_args(%acc = %acc_init) -> (vector<16xf32>) {
+      %chunk = vector.transfer_read %X[%c0, %i], %cst
+          {in_bounds = [true]} : memref<8x64xf32, strided<[64, 1], offset: 0>>, vector<16xf32>
+      %sum = arith.addf %acc, %chunk : vector<16xf32>
+      scf.yield %sum : vector<16xf32>
     }
 
     tt.return
