@@ -5,6 +5,10 @@
 // sequential K-loops, each accumulating only MICRO_M rows.  Each loop gets
 // its own small loop-carried accumulator that fits in registers.
 //
+// When the K-loop was transformed by ConvertMemoryToSPM (double-buffered
+// DMA), the prologue DMA enqueues are cloned before each micro-loop so
+// that SPM buffer 0 contains the correct first-iteration tiles.
+//
 // Runs AFTER ConvertMemoryToSPM (DMA granularity unaffected) and BEFORE
 // LLVM lowering.
 //
@@ -19,7 +23,10 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+
+#include "triton/Dialect/TritonCPU/IR/Dialect.h"
 
 namespace mlir {
 namespace triton {
@@ -83,6 +90,30 @@ analyzeLoopContract(vector::ContractionOp contractOp) {
   return LoopContractInfo{forOp, contractOp, idx, accTy};
 }
 
+/// Collect the prologue DMA enqueue ops emitted by ConvertMemoryToSPM
+/// before `forOp`.  Scans backwards from the op preceding the loop,
+/// skipping pure (side-effect-free) ops like arith.constant that
+/// ConvertMemoryToSPM may have inserted between the DMA enqueues and
+/// the loop.  Stops at the first non-DMA op that has side effects.
+/// Reverses the collected ops to restore the original A/B enqueue order.
+static SmallVector<triton::cpu::DmaEnqueue2DOp>
+collectPrologueDma(scf::ForOp forOp) {
+  SmallVector<triton::cpu::DmaEnqueue2DOp> result;
+  Operation *cur = forOp->getPrevNode();
+  while (cur) {
+    if (auto dma = dyn_cast<triton::cpu::DmaEnqueue2DOp>(cur)) {
+      result.push_back(dma);
+      cur = cur->getPrevNode();
+    } else if (isPure(cur)) {
+      cur = cur->getPrevNode();
+    } else {
+      break;
+    }
+  }
+  std::reverse(result.begin(), result.end());
+  return result;
+}
+
 static bool splitLoopContract(const LoopContractInfo &info, int64_t microM) {
   scf::ForOp origFor = info.forOp;
   vector::ContractionOp origContract = info.contractOp;
@@ -99,9 +130,11 @@ static bool splitLoopContract(const LoopContractInfo &info, int64_t microM) {
   auto bMap = AffineMap::getMultiDimMapWithTargets(3, {2, 1}, ctx);
   auto cMap = AffineMap::getMultiDimMapWithTargets(3, {0, 1}, ctx);
 
+  // Collect prologue DMA enqueues placed by ConvertMemoryToSPM.
+  auto prologueDma = collectPrologueDma(origFor);
+
   OpBuilder b(origFor);
 
-  // Current init args — will be updated as micro-loops chain.
   SmallVector<Value> curInitArgs(origFor.getInitArgs());
   Value fullAcc = curInitArgs[accIdx];
   scf::ForOp lastFor;
@@ -110,16 +143,19 @@ static bool splitLoopContract(const LoopContractInfo &info, int64_t microM) {
     int64_t curM = std::min(microM, M - mOff);
     auto microAccTy = VectorType::get({curM, N}, elemTy);
 
-    // Extract micro-tile init accumulator.
+    // Re-prime SPM buffer 0 for micro-loops after the first.
+    if (mOff > 0) {
+      for (auto dma : prologueDma)
+        b.clone(*dma.getOperation());
+    }
+
     Value microInit = vector::ExtractStridedSliceOp::create(
         b, loc, fullAcc,
         /*offsets=*/{mOff, 0}, /*sizes=*/{curM, N}, /*strides=*/{1, 1});
 
-    // Replace acc init with micro-tile.
     SmallVector<Value> loopInits(curInitArgs);
     loopInits[accIdx] = microInit;
 
-    // Adjust the init arg types: the acc slot changes type.
     auto newFor = scf::ForOp::create(
         b, loc, origFor.getLowerBound(), origFor.getUpperBound(),
         origFor.getStep(), loopInits);
@@ -151,7 +187,6 @@ static bool splitLoopContract(const LoopContractInfo &info, int64_t microM) {
       if (&op == origContract.getOperation()) {
         Value mappedA = mapping.lookupOrDefault(origContract.getLhs());
         Value mappedB = mapping.lookupOrDefault(origContract.getRhs());
-        Value mappedAcc = mapping.lookupOrDefault(origContract.getAcc());
 
         auto origATy = cast<VectorType>(mappedA.getType());
         int64_t K = origATy.getDimSize(1);
@@ -159,6 +194,7 @@ static bool splitLoopContract(const LoopContractInfo &info, int64_t microM) {
             b, loc, mappedA,
             /*offsets=*/{mOff, 0}, /*sizes=*/{curM, K}, /*strides=*/{1, 1});
 
+        Value mappedAcc = mapping.lookupOrDefault(origContract.getAcc());
         Value microResult = vector::ContractionOp::create(
             b, loc, microAccTy, aSlice, mappedB, mappedAcc,
             mapsAttr, iterAttr);
@@ -170,7 +206,6 @@ static bool splitLoopContract(const LoopContractInfo &info, int64_t microM) {
       b.clone(op, mapping);
     }
 
-    // Yield.
     auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
     SmallVector<Value> yieldVals;
     for (auto val : oldYield.getOperands())
@@ -179,21 +214,15 @@ static bool splitLoopContract(const LoopContractInfo &info, int64_t microM) {
 
     b.setInsertionPointAfter(newFor);
 
-    // Insert micro-tile result back into full accumulator.
     Value microResult = newFor.getResult(accIdx);
     fullAcc = vector::InsertStridedSliceOp::create(
         b, loc, microResult, fullAcc,
         /*offsets=*/{mOff, 0}, /*strides=*/{1, 1});
 
-    // Each micro-loop is a row slice of the original K-loop, so loop-carried
-    // block pointers must restart from the original init args.  Only the full
-    // accumulator is updated between slices.
     curInitArgs[accIdx] = fullAcc;
-
     lastFor = newFor;
   }
 
-  // Replace original loop results.
   for (unsigned i = 0; i < origFor.getNumResults(); ++i) {
     if (i == accIdx)
       origFor.getResult(i).replaceAllUsesWith(fullAcc);
