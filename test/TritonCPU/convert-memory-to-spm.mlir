@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536" | FileCheck %s
+// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s
 
 // ============================================================================
 // Test: GEMM K-loop with two tiled loads feeding vector.contract
@@ -69,25 +69,27 @@ module {
 
 // ============================================================================
 // Test: Reduction loop with single tiled load (not feeding dot)
-//       → single-buffer DMA prefetch
+//       → double-buffered DMA prefetch
 // ============================================================================
 
 // CHECK-LABEL: @reduction_prefetch
 //
-// Prologue: DMA first chunk, then wait.
+// Prologue: DMA first chunk.  The loop-body top wait covers it on iter 0.
 // CHECK:       triton_cpu.dma_enqueue_2d
-// CHECK:       triton_cpu.dma_wait
 //
-// Loop body: SPM read → compute → prefetch next → wait.
-// (Read current BEFORE prefetch to avoid single-buffer race.)
+// Loop body: wait → select current/next buffers → prefetch next → SPM read
+// → compute → yield flipped buffer index.
 //
 // CHECK:       scf.for
+// CHECK:         triton_cpu.dma_wait
+// CHECK:         arith.cmpi eq
+// CHECK:         arith.select
+// CHECK:         arith.select
+// CHECK:         scf.if
+// CHECK:           triton_cpu.dma_enqueue_2d
 // CHECK:         memref.reinterpret_cast
 // CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
 // CHECK:         arith.addf
-// CHECK:         scf.if
-// CHECK:           triton_cpu.dma_enqueue_2d
-// CHECK:         triton_cpu.dma_wait
 // CHECK:         scf.yield
 
 module {
@@ -156,22 +158,21 @@ module {
 
 // CHECK-LABEL: @reduction_2d_non_leading_iv
 //
-// Prologue DMA + wait.
+// Prologue DMA; loop-body top wait covers it on iter 0.
 // CHECK:       triton_cpu.dma_enqueue_2d
-// CHECK:       triton_cpu.dma_wait
 //
-// Loop body: SPM read → compute → prefetch (with stride=1*4=4) → wait.
+// Loop body: wait → prefetch next (with stride=1*4=4) → SPM read → compute.
 // The key assertion: arith.muli uses constant 4 (not 256) for the byte offset.
 // CHECK:       scf.for
-// CHECK:         memref.reinterpret_cast
-// CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
-// CHECK:         arith.addf
+// CHECK:         triton_cpu.dma_wait
 // CHECK:         arith.subi
 // CHECK:         arith.index_cast
 // CHECK:         arith.muli
 // CHECK:         scf.if
 // CHECK:           triton_cpu.dma_enqueue_2d
-// CHECK:         triton_cpu.dma_wait
+// CHECK:         memref.reinterpret_cast
+// CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
+// CHECK:         arith.addf
 // CHECK:         scf.yield
 
 module {

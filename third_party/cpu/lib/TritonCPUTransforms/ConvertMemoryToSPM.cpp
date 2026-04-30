@@ -7,8 +7,9 @@
 //   1) GEMM double-buffering: K-loop with two tiled loads feeding a dot
 //      product.  Each load gets two SPM buffers; while the current tiles
 //      are computed, the next tiles are prefetched asynchronously.
-//   2) Reduction prefetch: single loop with one tiled load.  Single-buffer
-//      DMA prefetch for the next chunk.
+//   2) Reduction double-buffering: single loop with one tiled load.  Each load
+//      gets two SPM buffers; the next chunk is prefetched while the current
+//      chunk is reduced.
 //
 // Loads that don't match these patterns are left unchanged (cache path).
 //
@@ -931,11 +932,11 @@ static bool transformGemmLoop(scf::ForOp forOp,
 }
 
 //===----------------------------------------------------------------------===//
-// Reduction single-buffer prefetch transformation.
+// Reduction double-buffering transformation.
 //
 // For loops with a single tiled load (not feeding a dot), insert a
-// single-buffer DMA prefetch: DMA the next chunk while computing the
-// current one.
+// double-buffered DMA prefetch: DMA the next chunk into the alternate
+// SPM buffer while reducing the current chunk.
 //
 // Input:
 //   scf.for %i = 0 to N step BS {
@@ -945,37 +946,42 @@ static bool transformGemmLoop(scf::ForOp forOp,
 //
 // Output:
 //   // Prologue: DMA first chunk
-//   dma_enqueue_2d(spm_buf, dram_start, ...)
-//   dma_wait
+//   dma_enqueue_2d(spm_buf0, dram_start, ...)
 //
-//   scf.for %i = 0 to N step BS {
-//     // Prefetch next chunk (async)
+//   scf.for %i = 0 to N step BS iter_args(%buf_idx = 0) {
+//     dma_wait  // wait for current chunk: prologue on iter 0, prior prefetch
+//     %spm_cur = select(%buf_idx == 0, spm_buf0, spm_buf1)
+//     %spm_nxt = select(%buf_idx == 0, spm_buf1, spm_buf0)
+//     // Prefetch next chunk (async, into alternate buffer)
 //     scf.if (%i + BS < N) {
-//       dma_enqueue_2d(spm_buf, dram_next, ...)
+//       dma_enqueue_2d(spm_nxt, dram_next, ...)
 //     }
 //     // Read current from SPM
-//     %x = transfer_read spm_buf : memref<..., 3>
+//     %x = transfer_read spm_cur : memref<..., 3>
 //     ... reduce ...
-//     dma_wait
+//     yield (1 - %buf_idx), ...
 //   }
 //===----------------------------------------------------------------------===//
 
 static bool transformReductionLoop(scf::ForOp forOp,
                                    const TiledLoadInfo &load,
                                    int64_t spmBase, int64_t spmSize) {
-  SPMSpaceManager spmLayout(spmBase, spmSize);
-  auto allocBuf = spmLayout.alloc(load.tileBytes, /*alignment=*/1,
-                                  SPMSpaceManager::Lifetime::Loop);
-  if (!allocBuf)
-    return false;
-
   auto lbCst = getConstantIntValue(forOp.getLowerBound());
   auto ubCst = getConstantIntValue(forOp.getUpperBound());
   auto stepCst = getConstantIntValue(forOp.getStep());
   if (!lbCst || !ubCst || !stepCst || (*ubCst - *lbCst) % *stepCst != 0)
     return false;
 
-  int64_t addrBuf = allocBuf->address;
+  SPMSpaceManager spmLayout(spmBase, spmSize);
+  auto allocBuf0 = spmLayout.alloc(load.tileBytes, /*alignment=*/1,
+                                   SPMSpaceManager::Lifetime::Loop);
+  auto allocBuf1 = spmLayout.alloc(load.tileBytes, /*alignment=*/1,
+                                   SPMSpaceManager::Lifetime::Loop);
+  if (!allocBuf0 || !allocBuf1)
+    return false;
+
+  int64_t addrBuf0 = allocBuf0->address;
+  int64_t addrBuf1 = allocBuf1->address;
   Location loc = forOp.getLoc();
   OpBuilder b(forOp);
 
@@ -987,14 +993,12 @@ static bool transformReductionLoop(scf::ForOp forOp,
   if (!dramAddr)
     return false;
 
-  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrBuf), dramAddr,
+  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrBuf0), dramAddr,
                  load.vecTy, memRefTy);
-  triton::cpu::DmaWaitOp::create(b, loc);
 
-  // Rebuild loop (no new iter_args needed for single-buffer).
-  // We insert prefetch + SPM read inside the existing loop body.
-  // To keep things simple, clone the loop like we did for GEMM.
+  // Rebuild loop with one extra iter_arg: the current buffer index.
   SmallVector<Value> initArgs(forOp.getInitArgs());
+  initArgs.push_back(i64Cst(b, loc, 0));
   auto newForOp = scf::ForOp::create(
       b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
       initArgs);
@@ -1004,29 +1008,29 @@ static bool transformReductionLoop(scf::ForOp forOp,
 
   IRMapping mapping;
   mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
-  for (unsigned i = 0; i < forOp.getRegionIterArgs().size(); ++i)
+  unsigned numOldArgs = forOp.getRegionIterArgs().size();
+  for (unsigned i = 0; i < numOldArgs; ++i)
     mapping.map(forOp.getRegionIterArgs()[i],
                 newForOp.getRegionIterArgs()[i]);
+  Value bufIdx = newForOp.getRegionIterArgs()[numOldArgs];
 
   b.setInsertionPointToStart(newBody);
   if (!newBody->empty() && newBody->mightHaveTerminator())
     newBody->getTerminator()->erase();
 
-  // Clone the original body, replacing the transfer_read with SPM read.
-  // SPM read happens FIRST, before prefetch, to avoid single-buffer race:
-  // the current chunk must be fully read before prefetching overwrites it.
-  for (auto &op : oldBody->getOperations()) {
-    if (isa<scf::YieldOp>(op))
-      continue;
-    if (&op == readOp.getOperation()) {
-      Value spmVal = emitSpmRead(b, loc, i64Cst(b, loc, addrBuf), load.vecTy);
-      mapping.map(readOp.getResult(), spmVal);
-      continue;
-    }
-    b.clone(op, mapping);
-  }
+  // Wait for the DMA that filled the current buffer.  Iteration 0 waits for
+  // the prologue; later iterations wait for the prior iteration's prefetch.
+  triton::cpu::DmaWaitOp::create(b, loc);
 
-  // --- Prefetch next chunk (AFTER compute to avoid single-buffer race) ---
+  Value zero = i64Cst(b, loc, 0);
+  Value isZero = arith::CmpIOp::create(
+      b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
+  Value spmBuf0 = i64Cst(b, loc, addrBuf0);
+  Value spmBuf1 = i64Cst(b, loc, addrBuf1);
+  Value spmCur = arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
+  Value spmNxt = arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
+
+  // --- Prefetch next chunk into the alternate buffer. ---
   Value iv = newForOp.getInductionVar();
   Value step = newForOp.getStep();
   Value ub = newForOp.getUpperBound();
@@ -1059,18 +1063,31 @@ static bool transformReductionLoop(scf::ForOp forOp,
 
   auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
   b.setInsertionPointToStart(&ifOp.getThenRegion().front());
-  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrBuf), nextDram,
-                 load.vecTy, memRefTy);
+  emitDmaEnqueue(b, loc, spmNxt, nextDram, load.vecTy, memRefTy);
   b.setInsertionPointAfter(ifOp);
 
-  // DMA wait at end of body.
-  triton::cpu::DmaWaitOp::create(b, loc);
+  // Clone the original body, replacing the transfer_read with the current
+  // SPM buffer read.  The prefetch above targets the alternate buffer, so the
+  // DMA can overlap with the reduction without racing this read.
+  for (auto &op : oldBody->getOperations()) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+    if (&op == readOp.getOperation()) {
+      Value spmVal = emitSpmRead(b, loc, spmCur, load.vecTy);
+      mapping.map(readOp.getResult(), spmVal);
+      continue;
+    }
+    b.clone(op, mapping);
+  }
 
   // Yield.
   auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
   SmallVector<Value> yieldVals;
   for (auto val : oldYield.getOperands())
     yieldVals.push_back(mapping.lookupOrDefault(val));
+  Value one = i64Cst(b, loc, 1);
+  Value flipped = arith::SubIOp::create(b, loc, one, bufIdx);
+  yieldVals.push_back(flipped);
   scf::YieldOp::create(b, loc, yieldVals);
 
   for (unsigned i = 0; i < forOp.getNumResults(); ++i)

@@ -244,7 +244,7 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
         being computed, the next tiles are prefetched asynchronously.
 
         For reduction patterns (single loop accumulating over a dimension), the pass
-        inserts single-buffer DMA prefetch for the next chunk.
+        inserts double-buffered DMA prefetch for the next chunk.
 
         Loads that don't match SPM-eligible patterns (scalar loads, irregular access,
         low-reuse elementwise ops) are left unchanged to use the cache hierarchy.
