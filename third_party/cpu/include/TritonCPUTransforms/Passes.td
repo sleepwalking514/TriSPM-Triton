@@ -222,7 +222,7 @@ def SplitLargeContract : Pass<"triton-cpu-split-large-contract", "mlir::ModuleOp
 
     let options = [
         Option<"microM", "micro-m",
-               "int64_t", /*default*/"4",
+               "int64_t", /*default*/"8",
                "Maximum number of accumulator rows per micro-tile.">,
     ];
 
@@ -258,7 +258,7 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
                "int64_t", /*default*/"262144",
                "Size of the scratchpad memory in bytes.">,
         Option<"microM", "micro-m",
-               "int64_t", /*default*/"4",
+               "int64_t", /*default*/"8",
                "Micro-tile M dimension for fused SPM GEMM lowering.">,
         Option<"windowK", "window-k",
                "int64_t", /*default*/"4",

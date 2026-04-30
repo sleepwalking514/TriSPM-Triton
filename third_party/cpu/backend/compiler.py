@@ -223,7 +223,7 @@ class CPUBackend(BaseBackend):
             if os.getenv("TRITON_DISABLE_SPM", "0") != "1":
                 spm_base = int(os.getenv("TRITON_SPM_BASE", "0x40000000"), 0)
                 spm_size = int(os.getenv("TRITON_SPM_SIZE", "262144"), 0)
-                micro_m = int(os.getenv("TRITON_MICRO_M", "4"), 0)
+                micro_m = int(os.getenv("TRITON_MICRO_M", "8"), 0)
                 window_k = int(os.getenv("TRITON_SPM_WINDOW_K", "4"), 0)
                 cpu.passes.ttcpuir.add_spm_tensor_placement(pm)
                 cpu.passes.ttcpuir.add_convert_memory_to_spm(
