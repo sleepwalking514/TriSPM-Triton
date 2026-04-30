@@ -709,8 +709,17 @@ static bool transformGemmLoop(scf::ForOp forOp,
   if (dotLoads.size() != 2)
     return false;
 
-  auto &loadA = dotLoads[0];
-  auto &loadB = dotLoads[1];
+  TiledLoadInfo loadA = dotLoads[0];
+  TiledLoadInfo loadB = dotLoads[1];
+  auto contractInfo =
+      analyzeGemmContract(forOp, loadA.readOp, loadB.readOp);
+  if (!contractInfo) {
+    contractInfo = analyzeGemmContract(forOp, loadB.readOp, loadA.readOp);
+    if (!contractInfo)
+      return false;
+    std::swap(loadA, loadB);
+  }
+
   int64_t tileA = loadA.tileBytes;
   int64_t tileB = loadB.tileBytes;
 
@@ -888,15 +897,16 @@ static bool transformGemmLoop(scf::ForOp forOp,
     b.clone(op, mapping);
   }
 
-  vector::TransferReadOp clonedReadA = nullptr, clonedReadB = nullptr;
-  newBody->walk([&](vector::TransferReadOp clonedRead) {
-    if (clonedRead.getBase() == mapping.lookupOrDefault(readA.getBase()) &&
-        clonedRead.getLoc() == readA.getLoc() && !clonedReadA)
-      clonedReadA = clonedRead;
-    else if (clonedRead.getBase() == mapping.lookupOrDefault(readB.getBase()) &&
-             clonedRead.getLoc() == readB.getLoc() && !clonedReadB)
-      clonedReadB = clonedRead;
-  });
+  Value clonedReadAValue = mapping.lookupOrNull(readA.getResult());
+  Value clonedReadBValue = mapping.lookupOrNull(readB.getResult());
+  auto clonedReadA = clonedReadAValue
+                         ? dyn_cast_or_null<vector::TransferReadOp>(
+                               clonedReadAValue.getDefiningOp())
+                         : nullptr;
+  auto clonedReadB = clonedReadBValue
+                         ? dyn_cast_or_null<vector::TransferReadOp>(
+                               clonedReadBValue.getDefiningOp())
+                         : nullptr;
 
   if (!clonedReadA || !clonedReadB)
     return false;

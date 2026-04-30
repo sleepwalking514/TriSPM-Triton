@@ -47,6 +47,7 @@ DMA_REG_STATUS  = 0x18
 DMA_REG_SRC_STRIDE = 0x20
 DMA_REG_DST_STRIDE = 0x28
 DMA_REG_HEIGHT  = 0x30
+DMA_REG_STRIDES_PACKED = 0x38
 
 
 def run_triton_opt(mlir_source: str, passes: list[str]) -> str:
@@ -136,7 +137,7 @@ class TestDmaOpsToLLVM:
         return run_triton_opt(mlir, [self.LOWERING_PASS])
 
     def test_enqueue_produces_volatile_stores(self):
-        """dma_enqueue_2d should lower to 6 volatile stores."""
+        """dma_enqueue_2d should lower to packed MMIO descriptor stores."""
         mlir = textwrap.dedent("""\
             module {
               tt.func public @test_enqueue(
@@ -150,8 +151,8 @@ class TestDmaOpsToLLVM:
         output = self._lower(mlir)
         # The op should be completely consumed
         assert "triton_cpu.dma_enqueue_2d" not in output
-        # Should have volatile stores (5 config + 1 trigger = 6 total)
-        assert output.count("llvm.store volatile") == 6
+        # SRC + DST + packed strides + packed LEN/HEIGHT trigger.
+        assert output.count("llvm.store volatile") == 4
         # Should have exactly 2 `fence iorw, iorw` (pre-trigger + post-trigger),
         # emitted as inline asm with has_side_effects so the optimizer cannot
         # weaken or eliminate them.
@@ -175,9 +176,31 @@ class TestDmaOpsToLLVM:
         assert str(DMA_MMIO_BASE + DMA_REG_SRC) in output         # SRC = 0xF0000000
         assert str(DMA_MMIO_BASE + DMA_REG_DST) in output         # DST = 0xF0000008
         assert str(DMA_MMIO_BASE + DMA_REG_LEN) in output         # LEN = 0xF0000010
-        assert str(DMA_MMIO_BASE + DMA_REG_SRC_STRIDE) in output  # SRC_STRIDE
-        assert str(DMA_MMIO_BASE + DMA_REG_DST_STRIDE) in output  # DST_STRIDE
-        assert str(DMA_MMIO_BASE + DMA_REG_HEIGHT) in output      # HEIGHT
+        assert str(DMA_MMIO_BASE + DMA_REG_STRIDES_PACKED) in output
+        assert str(DMA_MMIO_BASE + DMA_REG_SRC_STRIDE) not in output
+        assert str(DMA_MMIO_BASE + DMA_REG_DST_STRIDE) not in output
+        assert str(DMA_MMIO_BASE + DMA_REG_HEIGHT) not in output
+
+    def test_custom_mmio_base_option(self):
+        """The lowering pass should honor a non-default DMA MMIO base."""
+        custom_base = 0xE0000000
+        mlir = textwrap.dedent("""\
+            module {
+              tt.func public @test_custom_base(
+                  %dst: i64, %src: i64, %width: i64,
+                  %height: i64, %src_stride: i64, %dst_stride: i64) {
+                triton_cpu.dma_enqueue_2d(%dst, %src, %width, %height, %src_stride, %dst_stride)
+                triton_cpu.dma_wait
+                tt.return
+              }
+            }
+        """)
+        output = run_triton_opt(
+            mlir, ["-triton-cpu-dma-ops-to-llvm=dma-mmio-base=0xE0000000"])
+        assert str(custom_base + DMA_REG_SRC) in output
+        assert str(custom_base + DMA_REG_DST) in output
+        assert str(custom_base + DMA_REG_LEN) in output
+        assert str(custom_base + DMA_REG_STATUS) in output
 
     def test_wait_produces_volatile_load(self):
         """dma_wait should lower to a volatile load from STATUS register."""
@@ -223,23 +246,23 @@ class TestDmaOpsToLLVM:
 
         # Must have at least 2 fences
         assert len(fence_positions) >= 2, f"Expected >=2 fences, got {len(fence_positions)}"
-        # Must have 6 stores
-        assert len(store_positions) == 6, f"Expected 6 stores, got {len(store_positions)}"
+        # Must have four stores: SRC, DST, packed strides, packed LEN/HEIGHT.
+        assert len(store_positions) == 4, f"Expected 4 stores, got {len(store_positions)}"
 
-        # First 5 stores (config) should be before the first fence
+        # First 3 stores (config) should be before the first fence.
         first_fence = fence_positions[0]
-        for pos in store_positions[:5]:
+        for pos in store_positions[:3]:
             assert pos < first_fence, \
                 f"Config store at line {pos} should be before first fence at line {first_fence}"
 
-        # 6th store (LEN trigger) should be after the first fence
-        assert store_positions[5] > first_fence, \
-            f"LEN trigger store at line {store_positions[5]} should be after first fence at line {first_fence}"
+        # 4th store (packed LEN/HEIGHT trigger) should be after the first fence.
+        assert store_positions[3] > first_fence, \
+            f"LEN trigger store at line {store_positions[3]} should be after first fence at line {first_fence}"
 
-        # 6th store should be before the second fence
+        # 4th store should be before the second fence.
         second_fence = fence_positions[1]
-        assert store_positions[5] < second_fence, \
-            f"LEN trigger at line {store_positions[5]} should be before second fence at line {second_fence}"
+        assert store_positions[3] < second_fence, \
+            f"LEN trigger at line {store_positions[3]} should be before second fence at line {second_fence}"
 
     def test_full_sequence_enqueue_wait(self):
         """Enqueue + wait should produce the complete MMIO sequence."""
@@ -258,8 +281,8 @@ class TestDmaOpsToLLVM:
         # Both ops should be consumed
         assert "triton_cpu.dma_enqueue_2d" not in output
         assert "triton_cpu.dma_wait" not in output
-        # 6 stores (enqueue) + 1 load (wait)
-        assert output.count("llvm.store volatile") == 6
+        # 4 stores (enqueue) + 1 load (wait)
+        assert output.count("llvm.store volatile") == 4
         assert output.count("llvm.load volatile") == 1
         # 4 `fence iorw, iorw` inline-asm fences: 2 from enqueue + 2 from wait
         assert output.count('"fence iorw, iorw"') == 4
@@ -280,8 +303,8 @@ class TestDmaOpsToLLVM:
             }
         """)
         output = self._lower(mlir)
-        # 12 stores (2 × 6) + 1 load (wait)
-        assert output.count("llvm.store volatile") == 12
+        # 8 stores (2 × 4) + 1 load (wait)
+        assert output.count("llvm.store volatile") == 8
         assert output.count("llvm.load volatile") == 1
         # 6 `fence iorw, iorw` inline-asm fences: 2×2 from enqueues + 2 from wait
         assert output.count('"fence iorw, iorw"') == 6
@@ -307,7 +330,7 @@ class TestDmaIntToPtr:
             }
         """)
         output = run_triton_opt(mlir, ["-triton-cpu-dma-ops-to-llvm"])
-        # All MMIO addresses should use inttoptr
-        assert output.count("llvm.inttoptr") >= 6
+        # All packed MMIO descriptor addresses should use inttoptr.
+        assert output.count("llvm.inttoptr") >= 4
         # Should NOT use getelementptr for MMIO
         assert "llvm.getelementptr" not in output

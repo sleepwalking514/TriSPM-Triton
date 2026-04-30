@@ -10,6 +10,7 @@
 
 namespace mlir {
 namespace triton {
+#define GEN_PASS_DECL_DMAOPSTOLLVM
 #define GEN_PASS_DEF_DMAOPSTOLLVM
 #include "cpu/include/TritonCPUToLLVM/Passes.h.inc"
 } // namespace triton
@@ -22,7 +23,7 @@ using namespace mlir::triton::cpu;
 // ============================================================================
 // DMA MMIO register layout (must match gem5 DmaEngine model)
 //
-//   Base address: 0xF000'0000  (configurable via pass option)
+//   Default base address: 0xF000'0000  (configurable via pass option)
 //
 //   Offset  Register    Description
 //   0x00    SRC         Source address (64-bit)
@@ -34,7 +35,6 @@ using namespace mlir::triton::cpu;
 //   0x30    HEIGHT      Number of rows (64-bit)
 // ============================================================================
 
-static constexpr uint64_t DMA_MMIO_BASE = 0xF0000000ULL;
 static constexpr uint64_t DMA_REG_SRC = 0x00;
 static constexpr uint64_t DMA_REG_DST = 0x08;
 // REG_LEN: lower 32 = width (LEN), upper 32 = height.  Writing triggers
@@ -138,7 +138,10 @@ static void emitFence(ConversionPatternRewriter &rewriter, Location loc) {
 // ===----------------------------------------------------------------------===
 struct DmaEnqueue2DOpConversion
     : public OpConversionPattern<triton::cpu::DmaEnqueue2DOp> {
-  using OpConversionPattern::OpConversionPattern;
+  DmaEnqueue2DOpConversion(const TypeConverter &typeConverter,
+                           MLIRContext *context, uint64_t dmaMmioBase)
+      : OpConversionPattern(typeConverter, context),
+        dmaMmioBase(dmaMmioBase) {}
 
   LogicalResult
   matchAndRewrite(triton::cpu::DmaEnqueue2DOp op, OpAdaptor adaptor,
@@ -147,9 +150,9 @@ struct DmaEnqueue2DOpConversion
     auto i64Ty = rewriter.getI64Type();
 
     // SRC and DST: 64-bit each, separate stores.
-    emitVolatileStore(rewriter, loc, adaptor.getSrc(), DMA_MMIO_BASE,
+    emitVolatileStore(rewriter, loc, adaptor.getSrc(), dmaMmioBase,
                       DMA_REG_SRC);
-    emitVolatileStore(rewriter, loc, adaptor.getDst(), DMA_MMIO_BASE,
+    emitVolatileStore(rewriter, loc, adaptor.getDst(), dmaMmioBase,
                       DMA_REG_DST);
 
     // Pack (srcStride, dstStride) into one i64: lower 32 = src, upper 32
@@ -165,7 +168,7 @@ struct DmaEnqueue2DOpConversion
                                             dstStrideLo, shift32);
     Value stridesPacked = LLVM::OrOp::create(rewriter, loc, i64Ty,
                                              srcStrideLo, dstStrideHi);
-    emitVolatileStore(rewriter, loc, stridesPacked, DMA_MMIO_BASE,
+    emitVolatileStore(rewriter, loc, stridesPacked, dmaMmioBase,
                       DMA_REG_STRIDES_PACKED);
 
     // Fence: ensure all config registers are visible before trigger.
@@ -183,7 +186,7 @@ struct DmaEnqueue2DOpConversion
                                          heightLo, shift32);
     Value lenHeightPacked = LLVM::OrOp::create(rewriter, loc, i64Ty,
                                                widthLo, heightHi);
-    emitVolatileStore(rewriter, loc, lenHeightPacked, DMA_MMIO_BASE,
+    emitVolatileStore(rewriter, loc, lenHeightPacked, dmaMmioBase,
                       DMA_REG_LEN);
 
     // Fence: ensure the trigger write is ordered before any subsequent
@@ -193,6 +196,9 @@ struct DmaEnqueue2DOpConversion
     rewriter.eraseOp(op);
     return success();
   }
+
+private:
+  uint64_t dmaMmioBase;
 };
 
 // ===----------------------------------------------------------------------===
@@ -200,7 +206,10 @@ struct DmaEnqueue2DOpConversion
 // ===----------------------------------------------------------------------===
 struct DmaWaitOpConversion
     : public OpConversionPattern<triton::cpu::DmaWaitOp> {
-  using OpConversionPattern::OpConversionPattern;
+  DmaWaitOpConversion(const TypeConverter &typeConverter,
+                      MLIRContext *context, uint64_t dmaMmioBase)
+      : OpConversionPattern(typeConverter, context),
+        dmaMmioBase(dmaMmioBase) {}
 
   LogicalResult
   matchAndRewrite(triton::cpu::DmaWaitOp op, OpAdaptor adaptor,
@@ -225,7 +234,7 @@ struct DmaWaitOpConversion
 
     // pollBB: volatile load STATUS, branch back if busy, else to continuation
     rewriter.setInsertionPointToStart(pollBB);
-    Value status = emitVolatileLoad(rewriter, loc, DMA_MMIO_BASE,
+    Value status = emitVolatileLoad(rewriter, loc, dmaMmioBase,
                                     DMA_REG_STATUS);
     Value zero = createI64Constant(rewriter, loc, 0);
     Value busy = LLVM::ICmpOp::create(rewriter, loc, i1Ty,
@@ -240,6 +249,9 @@ struct DmaWaitOpConversion
     rewriter.eraseOp(op);
     return success();
   }
+
+private:
+  uint64_t dmaMmioBase;
 };
 
 // ===----------------------------------------------------------------------===
@@ -255,13 +267,20 @@ struct DmaOpsToLLVM
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
 
+    if (useXspmInsn) {
+      mod.emitError("triton-cpu-dma-ops-to-llvm use-xspm-insn path is not "
+                    "implemented yet; use the default MMIO lowering");
+      return signalPassFailure();
+    }
+
     mlir::LowerToLLVMOptions option(context);
     TritonCPUToLLVMTypeConverter typeConverter(context, option);
     TritonLLVMConversionTarget convTarget(*context);
 
     RewritePatternSet patterns(context);
-    patterns.add<DmaEnqueue2DOpConversion>(typeConverter, context);
-    patterns.add<DmaWaitOpConversion>(typeConverter, context);
+    patterns.add<DmaEnqueue2DOpConversion>(typeConverter, context,
+                                           dmaMmioBase);
+    patterns.add<DmaWaitOpConversion>(typeConverter, context, dmaMmioBase);
 
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();
@@ -276,6 +295,14 @@ namespace cpu {
 
 std::unique_ptr<OperationPass<ModuleOp>> createDmaOpsToLLVMPass() {
   return std::make_unique<DmaOpsToLLVM>();
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createDmaOpsToLLVMPass(uint64_t dmaMmioBase, bool useXspmInsn) {
+  ::mlir::triton::DmaOpsToLLVMOptions options;
+  options.dmaMmioBase = dmaMmioBase;
+  options.useXspmInsn = useXspmInsn;
+  return std::make_unique<DmaOpsToLLVM>(options);
 }
 
 } // namespace cpu

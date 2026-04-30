@@ -1,4 +1,6 @@
 // RUN: triton-opt %s -split-input-file -triton-cpu-dma-ops-to-llvm | FileCheck %s
+// RUN: triton-opt %s -split-input-file -triton-cpu-dma-ops-to-llvm="dma-mmio-base=0xE0000000" | FileCheck %s --check-prefix=BASE
+// RUN: not triton-opt %s -split-input-file -triton-cpu-dma-ops-to-llvm="use-xspm-insn=1" 2>&1 | FileCheck %s --check-prefix=XSPMERR
 
 // ============================================================================
 // Test: DmaEnqueue2DOp lowers to volatile MMIO stores + fences
@@ -11,20 +13,20 @@
 // CHECK:       %[[DST_ADDR:.+]] = llvm.mlir.constant(4026531848 : i64) : i64
 // CHECK-NEXT:  %[[DST_PTR:.+]] = llvm.inttoptr %[[DST_ADDR]] : i64 to !llvm.ptr
 // CHECK-NEXT:  llvm.store volatile %arg0, %[[DST_PTR]] : i64, !llvm.ptr
-// CHECK:       %[[SRCSTRIDE_ADDR:.+]] = llvm.mlir.constant(4026531872 : i64) : i64
-// CHECK-NEXT:  %[[SRCSTRIDE_PTR:.+]] = llvm.inttoptr %[[SRCSTRIDE_ADDR]] : i64 to !llvm.ptr
-// CHECK-NEXT:  llvm.store volatile %arg4, %[[SRCSTRIDE_PTR]] : i64, !llvm.ptr
-// CHECK:       %[[DSTSTRIDE_ADDR:.+]] = llvm.mlir.constant(4026531880 : i64) : i64
-// CHECK-NEXT:  %[[DSTSTRIDE_PTR:.+]] = llvm.inttoptr %[[DSTSTRIDE_ADDR]] : i64 to !llvm.ptr
-// CHECK-NEXT:  llvm.store volatile %arg5, %[[DSTSTRIDE_PTR]] : i64, !llvm.ptr
-// CHECK:       %[[HEIGHT_ADDR:.+]] = llvm.mlir.constant(4026531888 : i64) : i64
-// CHECK-NEXT:  %[[HEIGHT_PTR:.+]] = llvm.inttoptr %[[HEIGHT_ADDR]] : i64 to !llvm.ptr
-// CHECK-NEXT:  llvm.store volatile %arg3, %[[HEIGHT_PTR]] : i64, !llvm.ptr
+// CHECK:       %[[STRIDES_ADDR:.+]] = llvm.mlir.constant(4026531896 : i64) : i64
+// CHECK-NEXT:  %[[STRIDES_PTR:.+]] = llvm.inttoptr %[[STRIDES_ADDR]] : i64 to !llvm.ptr
+// CHECK-NEXT:  llvm.store volatile %{{.+}}, %[[STRIDES_PTR]] : i64, !llvm.ptr
 // CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // CHECK:       %[[LEN_ADDR:.+]] = llvm.mlir.constant(4026531856 : i64) : i64
 // CHECK-NEXT:  %[[LEN_PTR:.+]] = llvm.inttoptr %[[LEN_ADDR]] : i64 to !llvm.ptr
-// CHECK-NEXT:  llvm.store volatile %arg2, %[[LEN_PTR]] : i64, !llvm.ptr
+// CHECK-NEXT:  llvm.store volatile %{{.+}}, %[[LEN_PTR]] : i64, !llvm.ptr
 // CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+//
+// BASE-LABEL: @dma_enqueue_2d_basic
+// BASE:       llvm.mlir.constant(3758096384 : i64) : i64
+// BASE:       llvm.mlir.constant(3758096392 : i64) : i64
+// BASE:       llvm.mlir.constant(3758096440 : i64) : i64
+// BASE:       llvm.mlir.constant(3758096400 : i64) : i64
 
 module {
   tt.func public @dma_enqueue_2d_basic(
@@ -47,6 +49,11 @@ module {
 // CHECK-NEXT:  %[[STATUS_PTR:.+]] = llvm.inttoptr %[[STATUS_ADDR]] : i64 to !llvm.ptr
 // CHECK-NEXT:  %{{.+}} = llvm.load volatile %[[STATUS_PTR]] : !llvm.ptr -> i64
 // CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+//
+// BASE-LABEL: @dma_wait_basic
+// BASE:       llvm.mlir.constant(3758096408 : i64) : i64
+//
+// XSPMERR: use-xspm-insn path is not implemented yet
 
 module {
   tt.func public @dma_wait_basic() {
@@ -62,9 +69,7 @@ module {
 // ============================================================================
 
 // CHECK-LABEL: @dma_enqueue_then_wait
-// Enqueue: 5 config stores + fence + LEN store + fence
-// CHECK:       llvm.store volatile
-// CHECK:       llvm.store volatile
+// Enqueue: SRC/DST/packed-strides stores + fence + packed LEN/HEIGHT store + fence
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
@@ -97,14 +102,10 @@ module {
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.store volatile
-// CHECK:       llvm.store volatile
 // CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
 // Second enqueue
-// CHECK:       llvm.store volatile
-// CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile

@@ -32,6 +32,8 @@ std::unique_ptr<OperationPass<triton::FuncOp>> createLowerMultiReductionPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAtomicOpsToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDebugOpsToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDmaOpsToLLVMPass();
+std::unique_ptr<OperationPass<ModuleOp>>
+createDmaOpsToLLVMPass(uint64_t dmaMmioBase, bool useXspmInsn);
 std::unique_ptr<OperationPass<ModuleOp>> createUkernelOpsToOneDNNLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createUkernelOpsToXSMMLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>>

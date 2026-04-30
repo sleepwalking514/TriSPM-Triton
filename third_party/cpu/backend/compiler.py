@@ -20,6 +20,13 @@ import triton.backends.cpu.driver as cpu_driver
 _AOT_MODE = os.getenv("TRITON_CPU_AOT", "0") != "0"
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 def min_dot_size(target: GPUTarget):
     # Other architectures will only support 16,16,16
     return lambda lhsType, rhsType: (4, 4, 4)
@@ -314,7 +321,10 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_debug_ops_to_llvmir(pm)
 
         if _AOT_MODE:
-            cpu.passes.ttcpuir.add_dma_ops_to_llvmir(pm)
+            dma_mmio_base = int(os.getenv("TRITON_DMA_MMIO_BASE", "0xF0000000"), 0)
+            use_xspm_insn = env_bool("TRITON_USE_XSPM_INSN", False)
+            cpu.passes.ttcpuir.add_dma_ops_to_llvmir(
+                pm, dma_mmio_base, use_xspm_insn)
 
         if not _AOT_MODE:
             vec_lib_requirements = {

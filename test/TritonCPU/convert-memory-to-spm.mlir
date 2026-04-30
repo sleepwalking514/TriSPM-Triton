@@ -68,6 +68,59 @@ module {
 // -----
 
 // ============================================================================
+// Test: GEMM with transfer reads in B/A IR order still identifies A and B via
+//       vector.contract lhs/rhs operands, not walk order.
+// ============================================================================
+
+// CHECK-LABEL: @gemm_reversed_load_order
+// CHECK:       triton_cpu.dma_enqueue_2d
+// CHECK:       triton_cpu.dma_enqueue_2d
+// CHECK:       scf.for
+// CHECK:         triton_cpu.dma_wait
+// CHECK:         scf.if
+// CHECK:           triton_cpu.dma_enqueue_2d
+// CHECK:           triton_cpu.dma_enqueue_2d
+// CHECK:         vector.transfer_read {{.*}} memref<16x16xf32, strided<[16, 1]>, 3>
+// CHECK:         vector.transfer_read {{.*}} memref<16x16xf32, strided<[16, 1]>, 3>
+// CHECK:         vector.contract
+
+module {
+  tt.func public @gemm_reversed_load_order(
+      %A: memref<64x64xf32, strided<[64, 1], offset: 0>>,
+      %B: memref<64x64xf32, strided<[64, 1], offset: 0>>,
+      %C: memref<64x64xf32, strided<[64, 1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %c16 = arith.constant 16 : index
+    %c64 = arith.constant 64 : index
+    %cst = arith.constant 0.0 : f32
+    %acc_init = arith.constant dense<0.0> : vector<16x16xf32>
+
+    %result = scf.for %k = %c0 to %c64 step %c16
+        iter_args(%acc = %acc_init) -> (vector<16x16xf32>) {
+      %b_tile = vector.transfer_read %B[%k, %c0], %cst
+          {in_bounds = [true, true]} : memref<64x64xf32, strided<[64, 1], offset: 0>>, vector<16x16xf32>
+      %a_tile = vector.transfer_read %A[%c0, %k], %cst
+          {in_bounds = [true, true]} : memref<64x64xf32, strided<[64, 1], offset: 0>>, vector<16x16xf32>
+
+      %dot = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %a_tile, %b_tile, %acc : vector<16x16xf32>, vector<16x16xf32> into vector<16x16xf32>
+
+      scf.yield %dot : vector<16x16xf32>
+    }
+
+    vector.transfer_write %result, %C[%c0, %c0]
+        {in_bounds = [true, true]} : vector<16x16xf32>, memref<64x64xf32, strided<[64, 1], offset: 0>>
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
 // Test: Reduction loop with single tiled load (not feeding dot)
 //       → double-buffered DMA prefetch
 // ============================================================================

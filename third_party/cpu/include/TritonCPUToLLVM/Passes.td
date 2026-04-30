@@ -72,6 +72,14 @@ def DmaOpsToLLVM : Pass<"triton-cpu-dma-ops-to-llvm", "mlir::ModuleOp"> {
       Lowers TritonCPU DMA operations to volatile LLVM stores/loads targeting
       the DMA engine's MMIO registers.  Used for SPM data transfers on RISC-V.
     }];
+    let options = [
+        Option<"dmaMmioBase", "dma-mmio-base",
+               "uint64_t", /*default*/"0xF0000000ULL",
+               "Base address of the DMA engine MMIO register block.">,
+        Option<"useXspmInsn", "use-xspm-insn",
+               "bool", /*default*/"false",
+               "Reserve the Phase 4 Xspm-instruction lowering path; currently unsupported.">,
+    ];
     let constructor = "mlir::triton::cpu::createDmaOpsToLLVMPass()";
 
     let dependentDialects = ["mlir::LLVM::LLVMDialect",
