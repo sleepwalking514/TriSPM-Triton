@@ -49,6 +49,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createSPMTensorPlacement();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertMemoryToSPM();
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize);
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
+                         int64_t microM, int64_t windowK);
 
 std::unique_ptr<OperationPass<ModuleOp>> createSplitLargeContract();
 std::unique_ptr<OperationPass<ModuleOp>>

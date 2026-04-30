@@ -14,6 +14,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
+#include <optional>
+#include <utility>
+
 #include "cpu/include/TritonCPUTransforms/Passes.h"
 #include "cpu/include/TritonCPUTransforms/SPMSpaceManager.h"
 
@@ -21,6 +25,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -282,6 +287,49 @@ static Value emitSpmRead(OpBuilder &b, Location loc,
       SmallVector<bool>(vecTy.getRank(), true));
 }
 
+/// Emit a vector.transfer_write to an SPM address.
+static void emitSpmWrite(OpBuilder &b, Location loc,
+                         Value spmAddr, Value value) {
+  auto vecTy = cast<VectorType>(value.getType());
+  auto shape = vecTy.getShape();
+  int64_t cols = (shape.size() >= 2) ? shape[1] : shape[0];
+  auto elemTy = vecTy.getElementType();
+
+  SmallVector<int64_t> memShape(shape.begin(), shape.end());
+  SmallVector<int64_t> memStrides;
+  if (vecTy.getRank() == 1) {
+    memStrides = {1};
+  } else {
+    memStrides = {cols, 1};
+  }
+  auto layout = StridedLayoutAttr::get(b.getContext(), 0, memStrides);
+  auto spmMemRefTy = MemRefType::get(
+      memShape, elemTy, layout,
+      b.getI64IntegerAttr(SPM_ADDR_SPACE));
+
+  auto baseMemRefTy = MemRefType::get(
+      {}, elemTy, /*layout=*/nullptr,
+      b.getI64IntegerAttr(SPM_ADDR_SPACE));
+  Value baseMemRef = UnrealizedConversionCastOp::create(
+      b, loc, baseMemRefTy, spmAddr)->getResult(0);
+
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<OpFoldResult> stridesFold;
+  for (auto s : memShape)
+    sizes.push_back(b.getIndexAttr(s));
+  for (auto s : memStrides)
+    stridesFold.push_back(b.getIndexAttr(s));
+
+  Value spmView = memref::ReinterpretCastOp::create(
+      b, loc, spmMemRefTy, baseMemRef,
+      /*offset=*/b.getIndexAttr(0), sizes, stridesFold);
+
+  SmallVector<Value> zeroIndices(vecTy.getRank(), idxCst(b, loc, 0));
+  vector::TransferWriteOp::create(
+      b, loc, value, spmView, zeroIndices,
+      SmallVector<bool>(vecTy.getRank(), true));
+}
+
 //===----------------------------------------------------------------------===//
 // Tiled load descriptor.
 //===----------------------------------------------------------------------===//
@@ -326,6 +374,79 @@ static SmallVector<TiledLoadInfo> findTiledLoads(scf::ForOp forOp) {
   return results;
 }
 
+static bool isGemmContract(vector::ContractionOp op) {
+  auto iterTypes = op.getIteratorTypes().getValue();
+  if (iterTypes.size() != 3)
+    return false;
+  using IT = vector::IteratorType;
+  auto get = [](Attribute a) {
+    return cast<vector::IteratorTypeAttr>(a).getValue();
+  };
+  if (get(iterTypes[0]) != IT::parallel ||
+      get(iterTypes[1]) != IT::parallel ||
+      get(iterTypes[2]) != IT::reduction)
+    return false;
+  auto maps = op.getIndexingMaps();
+  MLIRContext *ctx = op.getContext();
+  return cast<AffineMapAttr>(maps[0]).getValue() ==
+             AffineMap::getMultiDimMapWithTargets(3, {0, 2}, ctx) &&
+         cast<AffineMapAttr>(maps[1]).getValue() ==
+             AffineMap::getMultiDimMapWithTargets(3, {2, 1}, ctx) &&
+         cast<AffineMapAttr>(maps[2]).getValue() ==
+             AffineMap::getMultiDimMapWithTargets(3, {0, 1}, ctx);
+}
+
+struct GemmContractInfo {
+  vector::ContractionOp contractOp;
+  unsigned accIdx;
+  VectorType accTy;
+};
+
+static std::optional<GemmContractInfo>
+analyzeGemmContract(scf::ForOp forOp,
+                    vector::TransferReadOp readA,
+                    vector::TransferReadOp readB) {
+  vector::ContractionOp contractOp;
+  for (auto *user : readA->getUsers()) {
+    auto candidate = dyn_cast<vector::ContractionOp>(user);
+    if (!candidate || !isGemmContract(candidate))
+      continue;
+    if (candidate.getLhs() == readA.getResult() &&
+        candidate.getRhs() == readB.getResult()) {
+      contractOp = candidate;
+      break;
+    }
+  }
+  if (!contractOp)
+    return std::nullopt;
+
+  auto accTy = dyn_cast<VectorType>(contractOp.getAcc().getType());
+  if (!accTy || accTy.getRank() != 2)
+    return std::nullopt;
+
+  auto blockArg = dyn_cast<BlockArgument>(contractOp.getAcc());
+  if (!blockArg || blockArg.getOwner() != forOp.getBody())
+    return std::nullopt;
+
+  unsigned idx = blockArg.getArgNumber() - 1;
+  if (idx >= forOp.getRegionIterArgs().size())
+    return std::nullopt;
+
+  auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  if (yieldOp.getOperand(idx) != contractOp.getResult())
+    return std::nullopt;
+
+  return GemmContractInfo{contractOp, idx, accTy};
+}
+
+static int64_t chooseWindowK(int64_t trips, int64_t requestedWindowK) {
+  int64_t limit = std::max<int64_t>(1, std::min(trips, requestedWindowK));
+  for (int64_t w = limit; w >= 1; --w)
+    if (trips % w == 0)
+      return w;
+  return 1;
+}
+
 //===----------------------------------------------------------------------===//
 // GEMM double-buffering transformation.
 //
@@ -364,6 +485,219 @@ static SmallVector<TiledLoadInfo> findTiledLoads(scf::ForOp forOp) {
 //     yield (1 - %buf_idx), %c, ...
 //   }
 //===----------------------------------------------------------------------===//
+
+/// Transform a GEMM K-loop into a fused microM-aware SPM schedule.
+///
+/// This path keeps B resident for a small K window and only DMA-loads the
+/// microM rows of A that the current contract consumes.  The full accumulator
+/// tile is spilled to SPM between K windows so each inner loop carries only a
+/// microM x N vector accumulator.
+static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
+                                         ArrayRef<TiledLoadInfo> dotLoads,
+                                         int64_t spmBase, int64_t spmSize,
+                                         int64_t microM,
+                                         int64_t requestedWindowK) {
+  if (dotLoads.size() != 2 || microM <= 0 || requestedWindowK <= 0)
+    return false;
+
+  auto lbCst = getConstantIntValue(forOp.getLowerBound());
+  auto ubCst = getConstantIntValue(forOp.getUpperBound());
+  auto stepCst = getConstantIntValue(forOp.getStep());
+  if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
+      (*ubCst - *lbCst) % *stepCst != 0)
+    return false;
+
+  int64_t trips = (*ubCst - *lbCst) / *stepCst;
+  if (trips <= 0)
+    return false;
+  int64_t windowK = chooseWindowK(trips, requestedWindowK);
+
+  TiledLoadInfo loadA = dotLoads[0];
+  TiledLoadInfo loadB = dotLoads[1];
+  auto contractInfo =
+      analyzeGemmContract(forOp, loadA.readOp, loadB.readOp);
+  if (!contractInfo) {
+    contractInfo =
+        analyzeGemmContract(forOp, loadB.readOp, loadA.readOp);
+    if (!contractInfo)
+      return false;
+    std::swap(loadA, loadB);
+  }
+
+  vector::ContractionOp contractOp = contractInfo->contractOp;
+  unsigned accIdx = contractInfo->accIdx;
+  VectorType accTy = contractInfo->accTy;
+  auto aTy = dyn_cast<VectorType>(loadA.readOp.getType());
+  auto bTy = dyn_cast<VectorType>(loadB.readOp.getType());
+  if (!aTy || !bTy || aTy.getRank() != 2 || bTy.getRank() != 2 ||
+      accTy.getRank() != 2)
+    return false;
+
+  int64_t BM = accTy.getDimSize(0);
+  int64_t BN = accTy.getDimSize(1);
+  int64_t BK = aTy.getDimSize(1);
+  if (BM < microM || BM % microM != 0 || aTy.getDimSize(0) != BM ||
+      bTy.getDimSize(0) != BK || bTy.getDimSize(1) != BN)
+    return false;
+
+  // This fused schedule only materializes the accumulator result.  The block
+  // pointer loop results in the matmul kernel are dead; if a future pattern
+  // uses them, fall back to the conservative double-buffer path.
+  for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+    if (i != accIdx && !forOp.getResult(i).use_empty())
+      return false;
+
+  auto memRefTyA = cast<MemRefType>(loadA.readOp.getBase().getType());
+  auto memRefTyB = cast<MemRefType>(loadB.readOp.getBase().getType());
+  SmallVector<int64_t> stridesA, stridesB;
+  if (!getStaticStrides(memRefTyA, stridesA) ||
+      !getStaticStrides(memRefTyB, stridesB) ||
+      stridesA.size() < 2 || stridesB.size() < 2)
+    return false;
+
+  unsigned elemBytesA = memRefTyA.getElementType().getIntOrFloatBitWidth() / 8;
+  unsigned elemBytesB = memRefTyB.getElementType().getIntOrFloatBitWidth() / 8;
+  unsigned elemBytesAcc = accTy.getElementType().getIntOrFloatBitWidth() / 8;
+
+  int64_t stepBytesA = BK * stridesA[1] * elemBytesA;
+  int64_t stepBytesB = BK * stridesB[0] * elemBytesB;
+  int64_t rowBytesA = stridesA[0] * elemBytesA;
+  int64_t accRowBytes = BN * elemBytesAcc;
+
+  auto microATy = VectorType::get({microM, BK}, aTy.getElementType());
+  auto microAccTy = VectorType::get({microM, BN}, accTy.getElementType());
+  int64_t microABytes = getTileBytes(microATy);
+  int64_t bWindowBytes = loadB.tileBytes * windowK;
+  int64_t accBytes = getTileBytes(accTy);
+
+  SPMSpaceManager spmLayout(spmBase, spmSize);
+  auto allocBWindow = spmLayout.alloc(bWindowBytes, /*alignment=*/1,
+                                      SPMSpaceManager::Lifetime::Loop);
+  auto allocAMicro = spmLayout.alloc(microABytes, /*alignment=*/1,
+                                     SPMSpaceManager::Lifetime::Loop);
+  auto allocAcc = spmLayout.alloc(accBytes, /*alignment=*/1,
+                                  SPMSpaceManager::Lifetime::Loop);
+  if (!allocBWindow || !allocAMicro || !allocAcc)
+    return false;
+
+  int64_t addrBWindow = allocBWindow->address;
+  int64_t addrAMicro = allocAMicro->address;
+  int64_t addrAcc = allocAcc->address;
+
+  Location loc = forOp.getLoc();
+  OpBuilder b(forOp);
+
+  Value dramAddrA = computePrologueDramAddr(b, loc, loadA.readOp, forOp);
+  Value dramAddrB = computePrologueDramAddr(b, loc, loadB.readOp, forOp);
+  if (!dramAddrA || !dramAddrB)
+    return false;
+
+  MLIRContext *ctx = forOp.getContext();
+  auto aMap = AffineMap::getMultiDimMapWithTargets(3, {0, 2}, ctx);
+  auto bMap = AffineMap::getMultiDimMapWithTargets(3, {2, 1}, ctx);
+  auto cMap = AffineMap::getMultiDimMapWithTargets(3, {0, 1}, ctx);
+  auto mapsAttr = b.getAffineMapArrayAttr({aMap, bMap, cMap});
+  auto iterAttr = b.getArrayAttr(
+      {vector::IteratorTypeAttr::get(ctx, vector::IteratorType::parallel),
+       vector::IteratorTypeAttr::get(ctx, vector::IteratorType::parallel),
+       vector::IteratorTypeAttr::get(ctx, vector::IteratorType::reduction)});
+
+  Value fullInit = forOp.getInitArgs()[accIdx];
+  for (int64_t mOff = 0; mOff < BM; mOff += microM) {
+    Value microInit = vector::ExtractStridedSliceOp::create(
+        b, loc, fullInit,
+        /*offsets=*/{mOff, 0}, /*sizes=*/{microM, BN},
+        /*strides=*/{1, 1});
+    emitSpmWrite(b, loc, i64Cst(b, loc, addrAcc + mOff * accRowBytes),
+                 microInit);
+  }
+
+  auto winFor = scf::ForOp::create(
+      b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, trips),
+      i64Cst(b, loc, windowK));
+  Block *winBody = winFor.getBody();
+  if (!winBody->empty() && winBody->mightHaveTerminator())
+    winBody->getTerminator()->erase();
+
+  b.setInsertionPointToStart(winBody);
+  Value winIter = winFor.getInductionVar();
+
+  // Stage the resident B window once.  windowK is capped to the DMA queue
+  // depth default (4) by the caller/env setting.
+  auto bStageFor = scf::ForOp::create(
+      b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, windowK),
+      i64Cst(b, loc, 1));
+  Block *bStageBody = bStageFor.getBody();
+  if (!bStageBody->empty() && bStageBody->mightHaveTerminator())
+    bStageBody->getTerminator()->erase();
+
+  b.setInsertionPointToStart(bStageBody);
+  Value bLocal = bStageFor.getInductionVar();
+  Value bAbsIter = arith::AddIOp::create(b, loc, winIter, bLocal);
+  Value bDram = arith::AddIOp::create(
+      b, loc, dramAddrB,
+      arith::MulIOp::create(b, loc, bAbsIter,
+                            i64Cst(b, loc, stepBytesB)));
+  Value bSpm = arith::AddIOp::create(
+      b, loc, i64Cst(b, loc, addrBWindow),
+      arith::MulIOp::create(b, loc, bLocal,
+                            i64Cst(b, loc, loadB.tileBytes)));
+  emitDmaEnqueue(b, loc, bSpm, bDram, bTy, memRefTyB);
+  scf::YieldOp::create(b, loc);
+
+  b.setInsertionPointAfter(bStageFor);
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  for (int64_t mOff = 0; mOff < BM; mOff += microM) {
+    Value accAddr = i64Cst(b, loc, addrAcc + mOff * accRowBytes);
+    Value microInit = emitSpmRead(b, loc, accAddr, microAccTy);
+
+    auto kFor = scf::ForOp::create(
+        b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, windowK),
+        i64Cst(b, loc, 1), ValueRange{microInit});
+    Block *kBody = kFor.getBody();
+    if (!kBody->empty() && kBody->mightHaveTerminator())
+      kBody->getTerminator()->erase();
+
+    b.setInsertionPointToStart(kBody);
+    Value kLocal = kFor.getInductionVar();
+    Value kAbsIter = arith::AddIOp::create(b, loc, winIter, kLocal);
+    Value aDram = arith::AddIOp::create(
+        b, loc, dramAddrA,
+        arith::AddIOp::create(
+            b, loc,
+            arith::MulIOp::create(b, loc, kAbsIter,
+                                  i64Cst(b, loc, stepBytesA)),
+            i64Cst(b, loc, mOff * rowBytesA)));
+    emitDmaEnqueue(b, loc, i64Cst(b, loc, addrAMicro), aDram,
+                   microATy, memRefTyA);
+    triton::cpu::DmaWaitOp::create(b, loc);
+
+    Value aVal = emitSpmRead(b, loc, i64Cst(b, loc, addrAMicro), microATy);
+    Value bReadAddr = arith::AddIOp::create(
+        b, loc, i64Cst(b, loc, addrBWindow),
+        arith::MulIOp::create(b, loc, kLocal,
+                              i64Cst(b, loc, loadB.tileBytes)));
+    Value bVal = emitSpmRead(b, loc, bReadAddr, bTy);
+    Value microAcc = kFor.getRegionIterArgs()[0];
+    Value contracted = vector::ContractionOp::create(
+        b, loc, microAccTy, aVal, bVal, microAcc, mapsAttr, iterAttr);
+    scf::YieldOp::create(b, loc, contracted);
+
+    b.setInsertionPointAfter(kFor);
+    emitSpmWrite(b, loc, accAddr, kFor.getResult(0));
+  }
+
+  scf::YieldOp::create(b, loc);
+  b.setInsertionPointAfter(winFor);
+
+  Value finalAcc = emitSpmRead(b, loc, i64Cst(b, loc, addrAcc), accTy);
+  forOp.getResult(accIdx).replaceAllUsesWith(finalAcc);
+  forOp.erase();
+
+  (void)contractOp;
+  return true;
+}
 
 /// Transform a GEMM K-loop with double-buffered SPM.
 /// `dotLoads` must have exactly 2 entries (A and B tile loads).
@@ -757,6 +1091,13 @@ struct ConvertMemoryToSPM
     this->spmBase = spmBase_;
     this->spmSize = spmSize_;
   }
+  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_,
+                     int64_t microM_, int64_t windowK_) {
+    this->spmBase = spmBase_;
+    this->spmSize = spmSize_;
+    this->microM = microM_;
+    this->windowK = windowK_;
+  }
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
@@ -780,7 +1121,9 @@ struct ConvertMemoryToSPM
       }
 
       if (dotLoads.size() == 2) {
-        transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
+        if (!transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
+                                         microM, windowK))
+          transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
       } else if (dotLoads.empty() && nonDotLoads.size() == 1) {
         transformReductionLoop(forOp, nonDotLoads[0], spmBase, spmSize);
       }
@@ -802,6 +1145,13 @@ std::unique_ptr<OperationPass<ModuleOp>> createConvertMemoryToSPM() {
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize) {
   return std::make_unique<ConvertMemoryToSPM>(spmBase, spmSize);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
+                         int64_t microM, int64_t windowK) {
+  return std::make_unique<ConvertMemoryToSPM>(
+      spmBase, spmSize, microM, windowK);
 }
 
 } // namespace cpu

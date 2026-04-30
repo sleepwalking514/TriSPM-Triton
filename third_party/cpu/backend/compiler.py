@@ -223,13 +223,15 @@ class CPUBackend(BaseBackend):
             if os.getenv("TRITON_DISABLE_SPM", "0") != "1":
                 spm_base = int(os.getenv("TRITON_SPM_BASE", "0x40000000"), 0)
                 spm_size = int(os.getenv("TRITON_SPM_SIZE", "262144"), 0)
+                micro_m = int(os.getenv("TRITON_MICRO_M", "4"), 0)
+                window_k = int(os.getenv("TRITON_SPM_WINDOW_K", "4"), 0)
                 cpu.passes.ttcpuir.add_spm_tensor_placement(pm)
-                cpu.passes.ttcpuir.add_convert_memory_to_spm(pm, spm_base, spm_size)
+                cpu.passes.ttcpuir.add_convert_memory_to_spm(
+                    pm, spm_base, spm_size, micro_m, window_k)
 
                 # Split large vector.contract into register-friendly
                 # micro-tiles.  SPM-only: cache baseline doesn't need this
                 # and benefits more from the default large accumulator.
-                micro_m = int(os.getenv("TRITON_MICRO_M", "4"), 0)
                 cpu.passes.ttcpuir.add_split_large_contract(pm, micro_m)
 
             # bf16 hardware support requires Zfbfmin (not in gem5 yet)

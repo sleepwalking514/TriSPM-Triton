@@ -257,6 +257,12 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
         Option<"spmSize", "spm-size",
                "int64_t", /*default*/"262144",
                "Size of the scratchpad memory in bytes.">,
+        Option<"microM", "micro-m",
+               "int64_t", /*default*/"4",
+               "Micro-tile M dimension for fused SPM GEMM lowering.">,
+        Option<"windowK", "window-k",
+               "int64_t", /*default*/"4",
+               "Maximum K-iteration window for resident B tiles.">,
     ];
 
     let constructor = "mlir::triton::cpu::createConvertMemoryToSPM()";
