@@ -7,9 +7,9 @@
 //   1) GEMM double-buffering: K-loop with two tiled loads feeding a dot
 //      product.  Each load gets two SPM buffers; while the current tiles
 //      are computed, the next tiles are prefetched asynchronously.
-//   2) Reduction double-buffering: single loop with one tiled load.  Each load
-//      gets two SPM buffers; the next chunk is prefetched while the current
-//      chunk is reduced.
+//   2) Reduction/streaming double-buffering: single loop with one or more
+//      tiled loads sharing the loop IV.  Each load gets two SPM buffers; the
+//      next chunk is prefetched while the current chunk is consumed.
 //
 // Loads that don't match these patterns are left unchanged (cache path).
 //
@@ -207,6 +207,67 @@ static Value computePrologueDramAddr(OpBuilder &b, Location loc,
     byteOff = arith::AddIOp::create(b, loc, byteOff, contrib);
   }
   return arith::AddIOp::create(b, loc, ptrI64, byteOff);
+}
+
+static bool isLoopBlockPtrTransfer(vector::TransferReadOp readOp,
+                                   scf::ForOp forOp) {
+  auto *baseDefOp = readOp.getBase().getDefiningOp();
+  if (!baseDefOp || baseDefOp->getParentRegion() != &forOp.getRegion())
+    return false;
+
+  auto extractMR = dyn_cast<triton::cpu::ExtractMemRefOp>(baseDefOp);
+  if (!extractMR)
+    return false;
+
+  auto blockArg = dyn_cast<BlockArgument>(extractMR.getSrc());
+  if (!blockArg || blockArg.getOwner() != forOp.getBody())
+    return false;
+
+  unsigned iterArgIdx = blockArg.getArgNumber() - 1;
+  return iterArgIdx < forOp.getInitArgs().size();
+}
+
+static bool canComputePrologueDramAddr(vector::TransferReadOp readOp,
+                                       scf::ForOp forOp) {
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!memRefTy)
+    return false;
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides))
+    return false;
+
+  auto *baseDefOp = readOp.getBase().getDefiningOp();
+  if (baseDefOp && baseDefOp->getParentRegion() == &forOp.getRegion())
+    return isLoopBlockPtrTransfer(readOp, forOp);
+
+  return true;
+}
+
+static std::optional<int64_t>
+getLoopStepBytes(vector::TransferReadOp readOp, scf::ForOp forOp,
+                 bool requireLoopIv) {
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!memRefTy)
+    return std::nullopt;
+  unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides))
+    return std::nullopt;
+
+  Value origIv = forOp.getInductionVar();
+  for (unsigned i = 0; i < readOp.getIndices().size(); ++i) {
+    if (readOp.getIndices()[i] == origIv)
+      return strides[i] * elemBytes;
+  }
+
+  if (isLoopBlockPtrTransfer(readOp, forOp))
+    return (strides.empty() ? 1 : strides[0]) * elemBytes;
+
+  if (requireLoopIv)
+    return std::nullopt;
+
+  return (strides.empty() ? 1 : strides[0]) * elemBytes;
 }
 
 /// Emit triton_cpu.dma_enqueue_2d for a 2D tile.
@@ -973,9 +1034,23 @@ static bool transformGemmLoop(scf::ForOp forOp,
 //   }
 //===----------------------------------------------------------------------===//
 
+struct ReductionLoadPlan {
+  TiledLoadInfo load;
+  MemRefType memRefTy;
+  int64_t addrBuf0;
+  int64_t addrBuf1;
+  int64_t stepBytes;
+  Value dramAddr;
+  Value spmCur;
+  Value spmNxt;
+};
+
 static bool transformReductionLoop(scf::ForOp forOp,
-                                   const TiledLoadInfo &load,
+                                   ArrayRef<TiledLoadInfo> loads,
                                    int64_t spmBase, int64_t spmSize) {
+  if (loads.empty())
+    return false;
+
   auto lbCst = getConstantIntValue(forOp.getLowerBound());
   auto ubCst = getConstantIntValue(forOp.getUpperBound());
   auto stepCst = getConstantIntValue(forOp.getStep());
@@ -983,28 +1058,43 @@ static bool transformReductionLoop(scf::ForOp forOp,
     return false;
 
   SPMSpaceManager spmLayout(spmBase, spmSize);
-  auto allocBuf0 = spmLayout.alloc(load.tileBytes, /*alignment=*/1,
-                                   SPMSpaceManager::Lifetime::Loop);
-  auto allocBuf1 = spmLayout.alloc(load.tileBytes, /*alignment=*/1,
-                                   SPMSpaceManager::Lifetime::Loop);
-  if (!allocBuf0 || !allocBuf1)
-    return false;
+  SmallVector<ReductionLoadPlan> plans;
+  plans.reserve(loads.size());
 
-  int64_t addrBuf0 = allocBuf0->address;
-  int64_t addrBuf1 = allocBuf1->address;
+  for (const TiledLoadInfo &load : loads) {
+    auto readOp = load.readOp;
+    auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+    if (!memRefTy || !canComputePrologueDramAddr(readOp, forOp))
+      return false;
+
+    auto stepBytes = getLoopStepBytes(readOp, forOp,
+                                      /*requireLoopIv=*/true);
+    if (!stepBytes)
+      return false;
+
+    auto allocBuf0 = spmLayout.alloc(load.tileBytes, /*alignment=*/1,
+                                     SPMSpaceManager::Lifetime::Loop);
+    auto allocBuf1 = spmLayout.alloc(load.tileBytes, /*alignment=*/1,
+                                     SPMSpaceManager::Lifetime::Loop);
+    if (!allocBuf0 || !allocBuf1)
+      return false;
+
+    plans.push_back(ReductionLoadPlan{
+        load, memRefTy, allocBuf0->address, allocBuf1->address, *stepBytes,
+        Value(), Value(), Value()});
+  }
+
   Location loc = forOp.getLoc();
   OpBuilder b(forOp);
 
-  auto readOp = load.readOp;
-  auto memRefTy = cast<MemRefType>(readOp.getBase().getType());
-
-  // Prologue: DMA first chunk.
-  Value dramAddr = computePrologueDramAddr(b, loc, readOp, forOp);
-  if (!dramAddr)
-    return false;
-
-  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrBuf0), dramAddr,
-                 load.vecTy, memRefTy);
+  // Prologue: DMA first chunk for every stream.
+  for (ReductionLoadPlan &plan : plans) {
+    plan.dramAddr = computePrologueDramAddr(b, loc, plan.load.readOp, forOp);
+    if (!plan.dramAddr)
+      return false;
+    emitDmaEnqueue(b, loc, i64Cst(b, loc, plan.addrBuf0), plan.dramAddr,
+                   plan.load.vecTy, plan.memRefTy);
+  }
 
   // Rebuild loop with one extra iter_arg: the current buffer index.
   SmallVector<Value> initArgs(forOp.getInitArgs());
@@ -1035,10 +1125,12 @@ static bool transformReductionLoop(scf::ForOp forOp,
   Value zero = i64Cst(b, loc, 0);
   Value isZero = arith::CmpIOp::create(
       b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
-  Value spmBuf0 = i64Cst(b, loc, addrBuf0);
-  Value spmBuf1 = i64Cst(b, loc, addrBuf1);
-  Value spmCur = arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
-  Value spmNxt = arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
+  for (ReductionLoadPlan &plan : plans) {
+    Value spmBuf0 = i64Cst(b, loc, plan.addrBuf0);
+    Value spmBuf1 = i64Cst(b, loc, plan.addrBuf1);
+    plan.spmCur = arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
+    plan.spmNxt = arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
+  }
 
   // --- Prefetch next chunk into the alternate buffer. ---
   Value iv = newForOp.getInductionVar();
@@ -1048,45 +1140,42 @@ static bool transformReductionLoop(scf::ForOp forOp,
   Value hasNext = arith::CmpIOp::create(
       b, loc, arith::CmpIPredicate::slt, nextIv, ub);
 
-  unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
-  SmallVector<int64_t> strides;
-  int64_t offset;
-  (void)memRefTy.getStridesAndOffset(strides, offset);
-
-  // Find which dimension the loop IV indexes by matching the original
-  // transfer_read indices against the loop induction variable.
-  int64_t ivStride = strides.empty() ? 1 : strides[0];
-  Value origIv = forOp.getInductionVar();
-  for (unsigned i = 0; i < readOp.getIndices().size(); ++i) {
-    if (readOp.getIndices()[i] == origIv) {
-      ivStride = strides[i];
-      break;
-    }
-  }
-
   Value lbInLoop = newForOp.getLowerBound();
   Value nextOff = arith::SubIOp::create(b, loc, nextIv, lbInLoop);
   Value nextOffI64 = toI64(b, loc, nextOff);
-  Value nextByteOff = arith::MulIOp::create(
-      b, loc, nextOffI64, i64Cst(b, loc, ivStride * elemBytes));
-  Value nextDram = arith::AddIOp::create(b, loc, dramAddr, nextByteOff);
 
   auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
   b.setInsertionPointToStart(&ifOp.getThenRegion().front());
-  emitDmaEnqueue(b, loc, spmNxt, nextDram, load.vecTy, memRefTy);
+  for (ReductionLoadPlan &plan : plans) {
+    Value nextByteOff = arith::MulIOp::create(
+        b, loc, nextOffI64, i64Cst(b, loc, plan.stepBytes));
+    Value nextDram = arith::AddIOp::create(b, loc, plan.dramAddr,
+                                           nextByteOff);
+    emitDmaEnqueue(b, loc, plan.spmNxt, nextDram, plan.load.vecTy,
+                   plan.memRefTy);
+  }
   b.setInsertionPointAfter(ifOp);
 
   // Clone the original body, replacing the transfer_read with the current
-  // SPM buffer read.  The prefetch above targets the alternate buffer, so the
-  // DMA can overlap with the reduction without racing this read.
+  // SPM buffer reads.  The prefetch above targets the alternate buffers, so
+  // DMA can overlap with reduction/streaming compute without racing reads.
   for (auto &op : oldBody->getOperations()) {
     if (isa<scf::YieldOp>(op))
       continue;
-    if (&op == readOp.getOperation()) {
-      Value spmVal = emitSpmRead(b, loc, spmCur, load.vecTy);
-      mapping.map(readOp.getResult(), spmVal);
-      continue;
+
+    bool replacedRead = false;
+    for (const ReductionLoadPlan &plan : plans) {
+      auto readOp = plan.load.readOp;
+      if (&op == readOp.getOperation()) {
+        Value spmVal = emitSpmRead(b, loc, plan.spmCur, plan.load.vecTy);
+        mapping.map(readOp.getResult(), spmVal);
+        replacedRead = true;
+        break;
+      }
     }
+    if (replacedRead)
+      continue;
+
     b.clone(op, mapping);
   }
 
@@ -1151,8 +1240,8 @@ struct ConvertMemoryToSPM
         if (!transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
                                          microM, windowK))
           transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
-      } else if (dotLoads.empty() && nonDotLoads.size() == 1) {
-        transformReductionLoop(forOp, nonDotLoads[0], spmBase, spmSize);
+      } else if (dotLoads.empty()) {
+        transformReductionLoop(forOp, nonDotLoads, spmBase, spmSize);
       }
       // Otherwise: leave unchanged (cache path).
     }

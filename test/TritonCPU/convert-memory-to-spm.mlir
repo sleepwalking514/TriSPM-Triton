@@ -229,6 +229,56 @@ module {
 // -----
 
 // ============================================================================
+// Test: Reduction-like loop with multiple tiled loads sharing the same IV
+//       → all streams are double-buffered through SPM.
+// ============================================================================
+
+// CHECK-LABEL: @reduction_multi_load_prefetch
+//
+// Prologue: one DMA for each current stream.
+// CHECK:       triton_cpu.dma_enqueue_2d
+// CHECK:       triton_cpu.dma_enqueue_2d
+//
+// Loop body: one wait, two alternate-buffer prefetches, two SPM reads.
+// CHECK:       scf.for
+// CHECK:         triton_cpu.dma_wait
+// CHECK:         scf.if
+// CHECK:           triton_cpu.dma_enqueue_2d
+// CHECK:           triton_cpu.dma_enqueue_2d
+// CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
+// CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
+// CHECK:         arith.mulf
+// CHECK:         arith.addf
+// CHECK:         scf.yield
+
+module {
+  tt.func public @reduction_multi_load_prefetch(
+      %X: memref<64xf32, strided<[1], offset: 0>>,
+      %Scale: memref<64xf32, strided<[1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %c16 = arith.constant 16 : index
+    %c64 = arith.constant 64 : index
+    %cst = arith.constant 0.0 : f32
+    %acc_init = arith.constant dense<0.0> : vector<16xf32>
+
+    %result = scf.for %i = %c0 to %c64 step %c16
+        iter_args(%acc = %acc_init) -> (vector<16xf32>) {
+      %x = vector.transfer_read %X[%i], %cst
+          {in_bounds = [true]} : memref<64xf32, strided<[1], offset: 0>>, vector<16xf32>
+      %scale = vector.transfer_read %Scale[%i], %cst
+          {in_bounds = [true]} : memref<64xf32, strided<[1], offset: 0>>, vector<16xf32>
+      %scaled = arith.mulf %x, %scale : vector<16xf32>
+      %sum = arith.addf %acc, %scaled : vector<16xf32>
+      scf.yield %sum : vector<16xf32>
+    }
+
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
 // Test: Loop with no eligible loads → unchanged (no DMA ops inserted)
 // ============================================================================
 
@@ -280,8 +330,10 @@ module {
 // CHECK:         triton_cpu.dma_wait
 // CHECK:         arith.subi
 // CHECK:         arith.index_cast
-// CHECK:         arith.muli
 // CHECK:         scf.if
+// CHECK-NOT:       arith.constant 256 : i64
+// CHECK:           arith.constant 4 : i64
+// CHECK:           arith.muli {{.*}} : i64
 // CHECK:           triton_cpu.dma_enqueue_2d
 // CHECK:         memref.reinterpret_cast
 // CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
