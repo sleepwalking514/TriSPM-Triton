@@ -58,6 +58,35 @@ static constexpr unsigned SPM_ADDR_SPACE = triton::cpu::kSPMAddressSpace;
 // Helpers
 //===----------------------------------------------------------------------===//
 
+/// Tracks IR inserted immediately before an anchor operation so a failed
+/// speculative rewrite can leave the original cache path untouched.
+class InsertedBeforeGuard {
+public:
+  explicit InsertedBeforeGuard(Operation *anchor)
+      : anchor(anchor), prev(anchor->getPrevNode()) {}
+
+  ~InsertedBeforeGuard() { cleanup(); }
+
+  void commit() { active = false; }
+
+  void cleanup() {
+    if (!active)
+      return;
+    Operation *op = anchor->getPrevNode();
+    while (op && op != prev) {
+      Operation *toErase = op;
+      op = op->getPrevNode();
+      toErase->erase();
+    }
+    active = false;
+  }
+
+private:
+  Operation *anchor;
+  Operation *prev;
+  bool active = true;
+};
+
 static Value i64Cst(OpBuilder &b, Location loc, int64_t val) {
   return arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(val));
 }
@@ -647,12 +676,15 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   int64_t addrAcc = allocAcc->address;
 
   Location loc = forOp.getLoc();
+  InsertedBeforeGuard guard(forOp.getOperation());
   OpBuilder b(forOp);
 
   Value dramAddrA = computePrologueDramAddr(b, loc, loadA.readOp, forOp);
   Value dramAddrB = computePrologueDramAddr(b, loc, loadB.readOp, forOp);
-  if (!dramAddrA || !dramAddrB)
+  if (!dramAddrA || !dramAddrB) {
+    guard.cleanup();
     return false;
+  }
 
   MLIRContext *ctx = forOp.getContext();
   auto aMap = AffineMap::getMultiDimMapWithTargets(3, {0, 2}, ctx);
@@ -755,6 +787,7 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
 
   Value finalAcc = emitSpmRead(b, loc, i64Cst(b, loc, addrAcc), accTy);
   forOp.getResult(accIdx).replaceAllUsesWith(finalAcc);
+  guard.commit();
   forOp.erase();
 
   (void)contractOp;
@@ -810,6 +843,7 @@ static bool transformGemmLoop(scf::ForOp forOp,
   int64_t addrB1 = allocB1->address;
 
   Location loc = forOp.getLoc();
+  InsertedBeforeGuard guard(forOp.getOperation());
   OpBuilder b(forOp);
 
   auto readA = loadA.readOp;
@@ -820,8 +854,10 @@ static bool transformGemmLoop(scf::ForOp forOp,
   // --- Prologue: DMA first tiles into buffer 0 ---
   Value dramAddrA = computePrologueDramAddr(b, loc, readA, forOp);
   Value dramAddrB = computePrologueDramAddr(b, loc, readB, forOp);
-  if (!dramAddrA || !dramAddrB)
+  if (!dramAddrA || !dramAddrB) {
+    guard.cleanup();
     return false;
+  }
 
   emitDmaEnqueue(b, loc, i64Cst(b, loc, addrA0), dramAddrA,
                  loadA.vecTy, memRefTyA);
@@ -955,32 +991,18 @@ static bool transformGemmLoop(scf::ForOp forOp,
   for (auto &op : oldBody->getOperations()) {
     if (isa<scf::YieldOp>(op))
       continue;
+    if (&op == readA.getOperation()) {
+      Value spmValA = emitSpmRead(b, loc, spmACur, loadA.vecTy);
+      mapping.map(readA.getResult(), spmValA);
+      continue;
+    }
+    if (&op == readB.getOperation()) {
+      Value spmValB = emitSpmRead(b, loc, spmBCur, loadB.vecTy);
+      mapping.map(readB.getResult(), spmValB);
+      continue;
+    }
     b.clone(op, mapping);
   }
-
-  Value clonedReadAValue = mapping.lookupOrNull(readA.getResult());
-  Value clonedReadBValue = mapping.lookupOrNull(readB.getResult());
-  auto clonedReadA = clonedReadAValue
-                         ? dyn_cast_or_null<vector::TransferReadOp>(
-                               clonedReadAValue.getDefiningOp())
-                         : nullptr;
-  auto clonedReadB = clonedReadBValue
-                         ? dyn_cast_or_null<vector::TransferReadOp>(
-                               clonedReadBValue.getDefiningOp())
-                         : nullptr;
-
-  if (!clonedReadA || !clonedReadB)
-    return false;
-
-  b.setInsertionPoint(clonedReadA);
-  Value spmValA = emitSpmRead(b, loc, spmACur, loadA.vecTy);
-  clonedReadA.replaceAllUsesWith(spmValA);
-  clonedReadA->erase();
-
-  b.setInsertionPoint(clonedReadB);
-  Value spmValB = emitSpmRead(b, loc, spmBCur, loadB.vecTy);
-  clonedReadB.replaceAllUsesWith(spmValB);
-  clonedReadB->erase();
 
   // (DMA wait is at TOP of body, not here — see comment above.)
   b.setInsertionPointToEnd(newBody);
@@ -997,6 +1019,7 @@ static bool transformGemmLoop(scf::ForOp forOp,
   // Replace uses of old loop results with new loop results.
   for (unsigned i = 0; i < forOp.getNumResults(); ++i)
     forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
+  guard.commit();
   forOp.erase();
 
   return true;
@@ -1085,13 +1108,16 @@ static bool transformReductionLoop(scf::ForOp forOp,
   }
 
   Location loc = forOp.getLoc();
+  InsertedBeforeGuard guard(forOp.getOperation());
   OpBuilder b(forOp);
 
   // Prologue: DMA first chunk for every stream.
   for (ReductionLoadPlan &plan : plans) {
     plan.dramAddr = computePrologueDramAddr(b, loc, plan.load.readOp, forOp);
-    if (!plan.dramAddr)
+    if (!plan.dramAddr) {
+      guard.cleanup();
       return false;
+    }
     emitDmaEnqueue(b, loc, i64Cst(b, loc, plan.addrBuf0), plan.dramAddr,
                    plan.load.vecTy, plan.memRefTy);
   }
@@ -1191,6 +1217,7 @@ static bool transformReductionLoop(scf::ForOp forOp,
 
   for (unsigned i = 0; i < forOp.getNumResults(); ++i)
     forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
+  guard.commit();
   forOp.erase();
 
   return true;

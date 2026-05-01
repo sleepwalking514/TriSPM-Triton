@@ -361,3 +361,143 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// ============================================================================
+// Test: GEMM bail-out after matching dot loads leaves the loop unchanged.
+//       The dynamic step makes the boundary guard fail; no speculative prologue
+//       DMA or replacement loop should remain.
+// ============================================================================
+
+// CHECK-LABEL: @gemm_bailout_dynamic_step_no_dma
+// CHECK-NOT:   triton_cpu.dma_enqueue_2d
+// CHECK-NOT:   triton_cpu.dma_wait
+// CHECK:       scf.for
+// CHECK:         vector.transfer_read {{.*}} memref<64x64xf32
+// CHECK:         vector.transfer_read {{.*}} memref<64x64xf32
+// CHECK:         vector.contract
+
+module {
+  tt.func public @gemm_bailout_dynamic_step_no_dma(
+      %A: memref<64x64xf32, strided<[64, 1], offset: 0>>,
+      %B: memref<64x64xf32, strided<[64, 1], offset: 0>>,
+      %C: memref<64x64xf32, strided<[64, 1], offset: 0>>,
+      %step: index) {
+    %c0 = arith.constant 0 : index
+    %c64 = arith.constant 64 : index
+    %cst = arith.constant 0.0 : f32
+    %acc_init = arith.constant dense<0.0> : vector<16x16xf32>
+
+    %result = scf.for %k = %c0 to %c64 step %step
+        iter_args(%acc = %acc_init) -> (vector<16x16xf32>) {
+      %a_tile = vector.transfer_read %A[%c0, %k], %cst
+          {in_bounds = [true, true]} : memref<64x64xf32, strided<[64, 1], offset: 0>>, vector<16x16xf32>
+      %b_tile = vector.transfer_read %B[%k, %c0], %cst
+          {in_bounds = [true, true]} : memref<64x64xf32, strided<[64, 1], offset: 0>>, vector<16x16xf32>
+
+      %dot = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %a_tile, %b_tile, %acc : vector<16x16xf32>, vector<16x16xf32> into vector<16x16xf32>
+
+      scf.yield %dot : vector<16x16xf32>
+    }
+
+    vector.transfer_write %result, %C[%c0, %c0]
+        {in_bounds = [true, true]} : vector<16x16xf32>, memref<64x64xf32, strided<[64, 1], offset: 0>>
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
+// Test: GEMM bail-out after partially computing the prologue address cleans up
+//       speculative IR.  A's prologue address is computable, but B's transfer
+//       reads from a loop-local subview, so prologue address recovery fails.
+// ============================================================================
+
+// CHECK-LABEL: @gemm_bailout_partial_prologue_cleanup
+// CHECK-NOT:   memref.extract_aligned_pointer_as_index
+// CHECK-NOT:   triton_cpu.dma_enqueue_2d
+// CHECK-NOT:   triton_cpu.dma_wait
+// CHECK:       scf.for
+// CHECK:         vector.transfer_read {{.*}} memref<64x64xf32
+// CHECK:         memref.subview
+// CHECK:         vector.transfer_read
+// CHECK:         vector.contract
+
+module {
+  tt.func public @gemm_bailout_partial_prologue_cleanup(
+      %A: memref<64x64xf32, strided<[64, 1], offset: 0>>,
+      %B: memref<64x64xf32, strided<[64, 1], offset: 0>>,
+      %C: memref<64x64xf32, strided<[64, 1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %c16 = arith.constant 16 : index
+    %c64 = arith.constant 64 : index
+    %cst = arith.constant 0.0 : f32
+    %acc_init = arith.constant dense<0.0> : vector<16x16xf32>
+
+    %result = scf.for %k = %c0 to %c64 step %c16
+        iter_args(%acc = %acc_init) -> (vector<16x16xf32>) {
+      %a_tile = vector.transfer_read %A[%c0, %k], %cst
+          {in_bounds = [true, true]} : memref<64x64xf32, strided<[64, 1], offset: 0>>, vector<16x16xf32>
+      %b_view = memref.subview %B[%k, %c0] [16, 16] [1, 1]
+          : memref<64x64xf32, strided<[64, 1], offset: 0>> to memref<16x16xf32, strided<[64, 1], offset: ?>>
+      %b_tile = vector.transfer_read %b_view[%c0, %c0], %cst
+          {in_bounds = [true, true]} : memref<16x16xf32, strided<[64, 1], offset: ?>>, vector<16x16xf32>
+
+      %dot = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %a_tile, %b_tile, %acc : vector<16x16xf32>, vector<16x16xf32> into vector<16x16xf32>
+
+      scf.yield %dot : vector<16x16xf32>
+    }
+
+    vector.transfer_write %result, %C[%c0, %c0]
+        {in_bounds = [true, true]} : vector<16x16xf32>, memref<64x64xf32, strided<[64, 1], offset: 0>>
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
+// Test: Reduction bail-out after matching tiled loads leaves the loop unchanged.
+//       The dynamic step makes the boundary guard fail; no speculative prologue
+//       DMA or replacement loop should remain.
+// ============================================================================
+
+// CHECK-LABEL: @reduction_bailout_dynamic_step_no_dma
+// CHECK-NOT:   triton_cpu.dma_enqueue_2d
+// CHECK-NOT:   triton_cpu.dma_wait
+// CHECK:       scf.for
+// CHECK:         vector.transfer_read {{.*}} memref<64xf32
+// CHECK:         arith.addf
+
+module {
+  tt.func public @reduction_bailout_dynamic_step_no_dma(
+      %X: memref<64xf32, strided<[1], offset: 0>>,
+      %step: index) {
+    %c0 = arith.constant 0 : index
+    %c64 = arith.constant 64 : index
+    %cst = arith.constant 0.0 : f32
+    %acc_init = arith.constant dense<0.0> : vector<16xf32>
+
+    %result = scf.for %i = %c0 to %c64 step %step
+        iter_args(%acc = %acc_init) -> (vector<16xf32>) {
+      %chunk = vector.transfer_read %X[%i], %cst
+          {in_bounds = [true]} : memref<64xf32, strided<[1], offset: 0>>, vector<16xf32>
+      %sum = arith.addf %acc, %chunk : vector<16xf32>
+      scf.yield %sum : vector<16xf32>
+    }
+
+    tt.return
+  }
+}
