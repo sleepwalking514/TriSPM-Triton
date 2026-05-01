@@ -121,6 +121,66 @@ module {
 // -----
 
 // ============================================================================
+// Test: GEMM loop with an extra non-dot tiled load still transforms, because
+//       exactly two transfer reads feed vector.contract.
+// ============================================================================
+
+// CHECK-LABEL: @gemm_extra_non_dot_load
+// CHECK:       triton_cpu.dma_enqueue_2d
+// CHECK:       triton_cpu.dma_enqueue_2d
+// CHECK:       scf.for
+// CHECK:         triton_cpu.dma_wait
+// CHECK:         scf.if
+// CHECK:           triton_cpu.dma_enqueue_2d
+// CHECK:           triton_cpu.dma_enqueue_2d
+// CHECK:         vector.transfer_read {{.*}} memref<16x16xf32, strided<[16, 1]>, 3>
+// CHECK:         vector.transfer_read {{.*}} memref<16x16xf32, strided<[16, 1]>, 3>
+// CHECK:         vector.transfer_read {{.*}} vector<16xf32>
+// CHECK:         vector.contract
+
+module {
+  tt.func public @gemm_extra_non_dot_load(
+      %A: memref<64x64xf32, strided<[64, 1], offset: 0>>,
+      %B: memref<64x64xf32, strided<[64, 1], offset: 0>>,
+      %Bias: memref<64xf32, strided<[1], offset: 0>>,
+      %C: memref<64x64xf32, strided<[64, 1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %c16 = arith.constant 16 : index
+    %c64 = arith.constant 64 : index
+    %cst = arith.constant 0.0 : f32
+    %acc_init = arith.constant dense<0.0> : vector<16x16xf32>
+    %bias_init = arith.constant dense<0.0> : vector<16xf32>
+
+    %result:2 = scf.for %k = %c0 to %c64 step %c16
+        iter_args(%acc = %acc_init, %bias_acc = %bias_init)
+        -> (vector<16x16xf32>, vector<16xf32>) {
+      %a_tile = vector.transfer_read %A[%c0, %k], %cst
+          {in_bounds = [true, true]} : memref<64x64xf32, strided<[64, 1], offset: 0>>, vector<16x16xf32>
+      %b_tile = vector.transfer_read %B[%k, %c0], %cst
+          {in_bounds = [true, true]} : memref<64x64xf32, strided<[64, 1], offset: 0>>, vector<16x16xf32>
+      %bias = vector.transfer_read %Bias[%k], %cst
+          {in_bounds = [true]} : memref<64xf32, strided<[1], offset: 0>>, vector<16xf32>
+
+      %dot = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %a_tile, %b_tile, %acc : vector<16x16xf32>, vector<16x16xf32> into vector<16x16xf32>
+
+      %bias_next = arith.addf %bias_acc, %bias : vector<16xf32>
+      scf.yield %dot, %bias_next : vector<16x16xf32>, vector<16xf32>
+    }
+
+    vector.transfer_write %result#0, %C[%c0, %c0]
+        {in_bounds = [true, true]} : vector<16x16xf32>, memref<64x64xf32, strided<[64, 1], offset: 0>>
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
 // Test: Reduction loop with single tiled load (not feeding dot)
 //       → double-buffered DMA prefetch
 // ============================================================================
