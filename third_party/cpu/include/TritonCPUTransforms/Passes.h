@@ -58,6 +58,10 @@ std::unique_ptr<OperationPass<ModuleOp>>
 createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
                          int64_t microM, int64_t windowK,
                          bool enableReductions);
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
+                         int64_t microM, int64_t windowK,
+                         bool enableReductions, bool promotionReport);
 
 std::unique_ptr<OperationPass<ModuleOp>> createSplitLargeContract();
 std::unique_ptr<OperationPass<ModuleOp>>

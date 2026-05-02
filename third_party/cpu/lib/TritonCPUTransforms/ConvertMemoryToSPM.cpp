@@ -16,7 +16,9 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
+#include <string>
 #include <utility>
 
 #include "cpu/include/TritonCPUTransforms/Passes.h"
@@ -30,6 +32,11 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonCPU/IR/Dialect.h"
@@ -539,6 +546,147 @@ static int64_t chooseWindowK(int64_t trips, int64_t requestedWindowK) {
 }
 
 //===----------------------------------------------------------------------===//
+// Promotion evidence.
+//===----------------------------------------------------------------------===//
+
+struct SPMPromotionRecord {
+  std::string source;
+  std::string scope;
+  SmallVector<int64_t> shape;
+  int64_t uses = 0;
+  std::string copyIn;
+  std::string copyOut;
+  int64_t bytes = 0;
+  int64_t spmAddress = 0;
+  std::string overhead;
+  std::string benefit;
+};
+
+struct SPMPromotionRejection {
+  std::string pattern;
+  std::string reason;
+};
+
+struct SPMPromotionReport {
+  SmallVector<SPMPromotionRecord, 4> records;
+  SmallVector<SPMPromotionRejection, 4> rejections;
+};
+
+static void appendShape(SmallVectorImpl<int64_t> &shape, VectorType vecTy) {
+  for (int64_t dim : vecTy.getShape())
+    shape.push_back(dim);
+}
+
+static void writeJsonString(llvm::raw_ostream &os, StringRef value) {
+  os << "\"";
+  for (char c : value) {
+    switch (c) {
+    case '\\':
+      os << "\\\\";
+      break;
+    case '"':
+      os << "\\\"";
+      break;
+    case '\n':
+      os << "\\n";
+      break;
+    case '\r':
+      os << "\\r";
+      break;
+    case '\t':
+      os << "\\t";
+      break;
+    default:
+      os << c;
+      break;
+    }
+  }
+  os << "\"";
+}
+
+static void writeJsonShape(llvm::raw_ostream &os, ArrayRef<int64_t> shape) {
+  os << "[";
+  for (auto [index, dim] : llvm::enumerate(shape)) {
+    if (index)
+      os << ", ";
+    os << dim;
+  }
+  os << "]";
+}
+
+static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
+                                          const SPMPromotionReport &report) {
+  const char *auxDir = std::getenv("KERNEL_AUX_FILE_DIR");
+  if (!auxDir || StringRef(auxDir).empty())
+    return success();
+
+  SmallString<256> path(auxDir);
+  std::string filename = funcOp.getName().str() + "_promotions.json";
+  llvm::sys::path::append(path, filename);
+
+  std::error_code error;
+  llvm::raw_fd_ostream os(path, error, llvm::sys::fs::OF_Text);
+  if (error)
+    return funcOp.emitError("failed to write SPM promotion sidecar '")
+           << path << "': " << error.message();
+
+  os << "{\n";
+  os << "  \"kernel\": ";
+  writeJsonString(os, funcOp.getName());
+  os << ",\n";
+
+  os << "  \"promotions\": [\n";
+  for (auto [index, record] : llvm::enumerate(report.records)) {
+    os << "    {\n";
+    os << "      \"source\": ";
+    writeJsonString(os, record.source);
+    os << ",\n";
+    os << "      \"scope\": ";
+    writeJsonString(os, record.scope);
+    os << ",\n";
+    os << "      \"shape\": ";
+    writeJsonShape(os, record.shape);
+    os << ",\n";
+    os << "      \"uses\": " << record.uses << ",\n";
+    os << "      \"copy_in\": ";
+    writeJsonString(os, record.copyIn);
+    os << ",\n";
+    os << "      \"copy_out\": ";
+    writeJsonString(os, record.copyOut);
+    os << ",\n";
+    os << "      \"bytes\": " << record.bytes << ",\n";
+    os << "      \"spm_address\": " << record.spmAddress << ",\n";
+    os << "      \"overhead\": ";
+    writeJsonString(os, record.overhead);
+    os << ",\n";
+    os << "      \"benefit\": ";
+    writeJsonString(os, record.benefit);
+    os << "\n";
+    os << "    }";
+    if (index + 1 != report.records.size())
+      os << ",";
+    os << "\n";
+  }
+  os << "  ],\n";
+
+  os << "  \"rejections\": [\n";
+  for (auto [index, rejection] : llvm::enumerate(report.rejections)) {
+    os << "    {\"pattern\": ";
+    writeJsonString(os, rejection.pattern);
+    os << ", \"reason\": ";
+    writeJsonString(os, rejection.reason);
+    os << "}";
+    if (index + 1 != report.rejections.size())
+      os << ",";
+    os << "\n";
+  }
+  os << "  ]\n";
+  os << "}\n";
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // GEMM double-buffering transformation.
 //
 // Input pattern (K-loop):
@@ -587,20 +735,98 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
                                          ArrayRef<TiledLoadInfo> dotLoads,
                                          int64_t spmBase, int64_t spmSize,
                                          int64_t microM,
-                                         int64_t requestedWindowK) {
-  if (dotLoads.size() != 2 || microM <= 0 || requestedWindowK <= 0)
+                                         int64_t requestedWindowK,
+                                         SPMPromotionReport *report) {
+  auto reject = [&](StringRef reason) {
+    if (report)
+      report->rejections.push_back(
+          SPMPromotionRejection{"fused_micro_gemm", reason.str()});
     return false;
+  };
+
+  if (dotLoads.size() != 2)
+    return reject("expected exactly two dot-feeding tiled loads");
+  if (microM <= 0)
+    return reject("microM must be positive");
+  if (requestedWindowK <= 0)
+    return reject("requested windowK must be positive");
+
+  auto makeRecord = [](StringRef source, StringRef scope, VectorType shapeTy,
+                       int64_t uses, StringRef copyIn, StringRef copyOut,
+                       int64_t bytes, int64_t spmAddress, StringRef overhead,
+                       StringRef benefit) {
+    SPMPromotionRecord record;
+    record.source = source.str();
+    record.scope = scope.str();
+    appendShape(record.shape, shapeTy);
+    record.uses = uses;
+    record.copyIn = copyIn.str();
+    record.copyOut = copyOut.str();
+    record.bytes = bytes;
+    record.spmAddress = spmAddress;
+    record.overhead = overhead.str();
+    record.benefit = benefit.str();
+    return record;
+  };
+
+  auto makeBWindowRecord =
+      [&](VectorType shapeTy, int64_t window, int64_t uses, int64_t bytes,
+          int64_t spmAddress) {
+        SPMPromotionRecord record;
+        record.source = "B tile window";
+        record.scope = "loop-window";
+        appendShape(record.shape, shapeTy);
+        record.shape.push_back(window);
+        record.uses = uses;
+        record.copyIn = "DMA";
+        record.copyOut = "none";
+        record.bytes = bytes;
+        record.spmAddress = spmAddress;
+        record.overhead = "windowK DMA descriptors plus one wait per K window";
+        record.benefit =
+            "B window is loaded once and reused across all microM slices";
+        return record;
+      };
+
+  auto makeAccumulatorRecord =
+      [&](VectorType shapeTy, int64_t uses, int64_t bytes,
+          int64_t spmAddress) {
+        SPMPromotionRecord record;
+        record.source = "accumulator tile";
+        record.scope = "loop-window temporary";
+        appendShape(record.shape, shapeTy);
+        record.uses = uses;
+        record.copyIn = "CPU/vector store";
+        record.copyOut = "CPU/vector transfer read";
+        record.bytes = bytes;
+        record.spmAddress = spmAddress;
+        record.overhead = "SPM read/write around each microM slice";
+        record.benefit =
+            "keeps the full accumulator tile resident while inner loops carry "
+            "only microM rows";
+        return record;
+      };
+
+  auto makeAMicroRecord =
+      [&](VectorType shapeTy, int64_t uses, int64_t bytes,
+          int64_t spmAddress) {
+        return makeRecord("A micro tile", "single-iteration", shapeTy, uses,
+                          "DMA", "none", bytes, spmAddress,
+                          "one DMA descriptor and one wait per microM/K step",
+                          "limits A staging to the rows consumed by the current "
+                          "microM contract");
+      };
 
   auto lbCst = getConstantIntValue(forOp.getLowerBound());
   auto ubCst = getConstantIntValue(forOp.getUpperBound());
   auto stepCst = getConstantIntValue(forOp.getStep());
   if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
       (*ubCst - *lbCst) % *stepCst != 0)
-    return false;
+    return reject("loop bounds/step are not static with exact trip count");
 
   int64_t trips = (*ubCst - *lbCst) / *stepCst;
   if (trips <= 0)
-    return false;
+    return reject("loop trip count must be positive");
   int64_t windowK = chooseWindowK(trips, requestedWindowK);
 
   TiledLoadInfo loadA = dotLoads[0];
@@ -611,7 +837,7 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
     contractInfo =
         analyzeGemmContract(forOp, loadB.readOp, loadA.readOp);
     if (!contractInfo)
-      return false;
+      return reject("could not identify vector.contract consuming A/B loads");
     std::swap(loadA, loadB);
   }
 
@@ -622,21 +848,21 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   auto bTy = dyn_cast<VectorType>(loadB.readOp.getType());
   if (!aTy || !bTy || aTy.getRank() != 2 || bTy.getRank() != 2 ||
       accTy.getRank() != 2)
-    return false;
+    return reject("A, B, and accumulator must be rank-2 vectors");
 
   int64_t BM = accTy.getDimSize(0);
   int64_t BN = accTy.getDimSize(1);
   int64_t BK = aTy.getDimSize(1);
   if (BM < microM || BM % microM != 0 || aTy.getDimSize(0) != BM ||
       bTy.getDimSize(0) != BK || bTy.getDimSize(1) != BN)
-    return false;
+    return reject("matrix tile shape is incompatible with microM schedule");
 
   // This fused schedule only materializes the accumulator result.  The block
   // pointer loop results in the matmul kernel are dead; if a future pattern
   // uses them, fall back to the conservative double-buffer path.
   for (unsigned i = 0; i < forOp.getNumResults(); ++i)
     if (i != accIdx && !forOp.getResult(i).use_empty())
-      return false;
+      return reject("non-accumulator loop result is used");
 
   auto memRefTyA = cast<MemRefType>(loadA.readOp.getBase().getType());
   auto memRefTyB = cast<MemRefType>(loadB.readOp.getBase().getType());
@@ -644,7 +870,7 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   if (!getStaticStrides(memRefTyA, stridesA) ||
       !getStaticStrides(memRefTyB, stridesB) ||
       stridesA.size() < 2 || stridesB.size() < 2)
-    return false;
+    return reject("A/B memrefs require static rank-2 strides");
 
   unsigned elemBytesA = memRefTyA.getElementType().getIntOrFloatBitWidth() / 8;
   unsigned elemBytesB = memRefTyB.getElementType().getIntOrFloatBitWidth() / 8;
@@ -669,7 +895,7 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   auto allocAcc = spmLayout.alloc(accBytes, /*alignment=*/1,
                                   SPMSpaceManager::Lifetime::Loop);
   if (!allocBWindow || !allocAMicro || !allocAcc)
-    return false;
+    return reject("SPM capacity cannot fit B window, A micro tile, and accumulator");
 
   int64_t addrBWindow = allocBWindow->address;
   int64_t addrAMicro = allocAMicro->address;
@@ -683,7 +909,17 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   Value dramAddrB = computePrologueDramAddr(b, loc, loadB.readOp, forOp);
   if (!dramAddrA || !dramAddrB) {
     guard.cleanup();
-    return false;
+    return reject("failed to compute prologue DRAM address");
+  }
+
+  if (report) {
+    int64_t microSlices = BM / microM;
+    report->records.push_back(makeBWindowRecord(
+        bTy, windowK, microSlices * windowK, bWindowBytes, addrBWindow));
+    report->records.push_back(makeAMicroRecord(
+        microATy, /*uses=*/1, microABytes, addrAMicro));
+    report->records.push_back(makeAccumulatorRecord(
+        accTy, microSlices * 2 + 1, accBytes, addrAcc));
   }
 
   MLIRContext *ctx = forOp.getContext();
@@ -1250,9 +1486,20 @@ struct ConvertMemoryToSPM
     this->windowK = windowK_;
     this->enableReductions = enableReductions_;
   }
+  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_,
+                     int64_t microM_, int64_t windowK_,
+                     bool enableReductions_, bool promotionReport_) {
+    this->spmBase = spmBase_;
+    this->spmSize = spmSize_;
+    this->microM = microM_;
+    this->windowK = windowK_;
+    this->enableReductions = enableReductions_;
+    this->promotionReport = promotionReport_;
+  }
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    DenseMap<Operation *, SPMPromotionReport> reports;
 
     // Collect scf.for ops (avoid modifying while iterating).
     SmallVector<scf::ForOp> forOps;
@@ -1273,13 +1520,38 @@ struct ConvertMemoryToSPM
       }
 
       if (dotLoads.size() == 2) {
+        SPMPromotionReport *report = nullptr;
+        if (promotionReport) {
+          auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
+          if (funcOp)
+            report = &reports[funcOp.getOperation()];
+        }
         if (!transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
-                                         microM, windowK))
+                                         microM, windowK, report))
           transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
       } else if (dotLoads.empty() && enableReductions) {
         transformReductionLoop(forOp, nonDotLoads, spmBase, spmSize);
       }
       // Otherwise: leave unchanged (cache path).
+    }
+
+    if (promotionReport) {
+      bool failedSidecarWrite = false;
+      mod.walk([&](FunctionOpInterface funcOp) {
+        if (failedSidecarWrite)
+          return;
+        if (funcOp.getVisibility() != SymbolTable::Visibility::Public ||
+            funcOp.getFunctionBody().empty())
+          return;
+        auto it = reports.find(funcOp.getOperation());
+        const SPMPromotionReport emptyReport;
+        const SPMPromotionReport &report =
+            it == reports.end() ? emptyReport : it->second;
+        if (failed(writePromotionReport(funcOp, report)))
+          failedSidecarWrite = true;
+      });
+      if (failedSidecarWrite)
+        signalPassFailure();
     }
   }
 };
@@ -1312,6 +1584,14 @@ createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
                          bool enableReductions) {
   return std::make_unique<ConvertMemoryToSPM>(
       spmBase, spmSize, microM, windowK, enableReductions);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
+                         int64_t microM, int64_t windowK,
+                         bool enableReductions, bool promotionReport) {
+  return std::make_unique<ConvertMemoryToSPM>(
+      spmBase, spmSize, microM, windowK, enableReductions, promotionReport);
 }
 
 } // namespace cpu

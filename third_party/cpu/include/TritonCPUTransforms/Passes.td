@@ -272,6 +272,9 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
         Option<"enableReductions", "enable-reductions",
                "bool", /*default*/"true",
                "Enable reduction/streaming loop lowering through SPM.">,
+        Option<"promotionReport", "promotion-report",
+               "bool", /*default*/"false",
+               "Write SPM promotion records and rejection reasons to the AOT auxiliary directory.">,
     ];
 
     let constructor = "mlir::triton::cpu::createConvertMemoryToSPM()";

@@ -131,6 +131,14 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
           pm.addPass(mlir::triton::cpu::createConvertMemoryToSPM(
               spmBase, spmSize, microM, windowK, enableReductions));
         });
+  m.def("add_convert_memory_to_spm",
+        [](mlir::PassManager &pm, int64_t spmBase, int64_t spmSize,
+           int64_t microM, int64_t windowK, bool enableReductions,
+           bool promotionReport) {
+          pm.addPass(mlir::triton::cpu::createConvertMemoryToSPM(
+              spmBase, spmSize, microM, windowK, enableReductions,
+              promotionReport));
+        });
   m.def("add_split_large_contract",
         [](mlir::PassManager &pm, int64_t microM) {
           pm.addPass(mlir::triton::cpu::createSplitLargeContract(microM));
