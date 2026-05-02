@@ -6,6 +6,10 @@
 // RUN: rm -rf %t.reject && mkdir -p %t.reject
 // RUN: env KERNEL_AUX_FILE_DIR=%t.reject triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=128 promotion-report=1" >/dev/null
 // RUN: cat %t.reject/layer_norm_row_resident_promotions.json | FileCheck %s --check-prefix=REJECT
+// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=4096 enable-promotion-profitability=1" | FileCheck %s --check-prefix=D3IR
+// RUN: rm -rf %t.d3 && mkdir -p %t.d3
+// RUN: env KERNEL_AUX_FILE_DIR=%t.d3 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=4096 enable-promotion-profitability=1 promotion-report=1" >/dev/null
+// RUN: cat %t.d3/layer_norm_row_resident_promotions.json | FileCheck %s --check-prefix=D3REPORT
 
 // ROW-LABEL: @layer_norm_row_resident
 // ROW:       triton_cpu.dma_enqueue_2d
@@ -54,6 +58,30 @@
 // REJECT:      "copy_out": "none"
 // REJECT:      "bytes": 256
 // REJECT:      "reason_code": "spm_capacity_overflow"
+
+// D3IR-LABEL: @layer_norm_row_resident
+// D3IR-NOT:   triton_cpu.dma_enqueue_2d
+// D3IR-NOT:   memref<8xf32, strided<[1]>, 3>
+// D3IR:       vector.transfer_read {{.*}} memref<64xf32, strided<[1]>>
+// D3IR:       tt.return
+
+// D3REPORT:      "kernel": "layer_norm_row_resident"
+// D3REPORT:      "promotions": [
+// D3REPORT-NEXT:   ],
+// D3REPORT:      "status": "rejected"
+// D3REPORT:      "pattern": "row_resident_reduction"
+// D3REPORT:      "reason_code": "insufficient_row_work"
+// D3REPORT:      "profitability": {
+// D3REPORT:      "model": "d3_static_conservative_v1"
+// D3REPORT:      "decision": "reject"
+// D3REPORT:      "dma_descriptors": 1
+// D3REPORT:      "mmio_stores": 4
+// D3REPORT:      "waits": 1
+// D3REPORT:      "fences": 1
+// D3REPORT:      "copy_bytes": 256
+// D3REPORT:      "avoided_repeated_read_bytes": 512
+// D3REPORT:      "live_spm_bytes": 256
+// D3REPORT:      "uses": 3
 
 module {
   tt.func public @layer_norm_row_resident(

@@ -6,6 +6,10 @@
 // RUN: env KERNEL_AUX_FILE_DIR=%t.off triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=0 promotion-report=0" >/dev/null
 // RUN: not test -e %t.off/gemm_fused_report_promotions.json
 // RUN: not test -e %t.off/reduction_report_promotions.json
+// RUN: rm -rf %t.d3 && mkdir -p %t.d3
+// RUN: env KERNEL_AUX_FILE_DIR=%t.d3 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=1 enable-promotion-profitability=1 promotion-report=1" >/dev/null
+// RUN: cat %t.d3/gemm_fused_report_promotions.json | FileCheck %s --check-prefix=D3GEMM
+// RUN: cat %t.d3/reduction_report_promotions.json | FileCheck %s --check-prefix=D3REDUCE
 
 // REPORT:      "schema_version": 1
 // REPORT:      "schema": "triton_cpu_spm_promotion_d1"
@@ -50,6 +54,40 @@
 // REJECT:      "reason_code": "policy_disabled"
 // REJECT:      "reason": "reduction/streaming SPM promotion is disabled by default; leave the candidate on the cache path"
 // REJECT:      "shape": "exact-if-known"
+
+// D3GEMM:      "kernel": "gemm_fused_report"
+// D3GEMM:      "source": "B tile window"
+// D3GEMM:      "reason_code": "accepted_existing_schedule"
+// D3GEMM:      "profitability": {
+// D3GEMM:      "model": "d3_static_conservative_v1"
+// D3GEMM:      "decision": "accept"
+// D3GEMM:      "reason_code": "accepted_reused_loop_window"
+// D3GEMM:      "dma_descriptors": 4
+// D3GEMM:      "mmio_stores": 16
+// D3GEMM:      "waits": 1
+// D3GEMM:      "copy_bytes": 4096
+// D3GEMM:      "avoided_repeated_read_bytes": 12288
+// D3GEMM:      "live_spm_bytes": 4096
+// D3GEMM:      "source": "accumulator tile"
+// D3GEMM:      "reason_code": "accepted_bounded_temporary"
+
+// D3REDUCE:      "kernel": "reduction_report"
+// D3REDUCE:      "promotions": [
+// D3REDUCE-NEXT:   ],
+// D3REDUCE:      "status": "rejected"
+// D3REDUCE:      "pattern": "reduction_streaming"
+// D3REDUCE:      "copy_in": "DMA"
+// D3REDUCE:      "bytes": 256
+// D3REDUCE:      "reason_code": "streaming_reduction_no_residency"
+// D3REDUCE:      "profitability": {
+// D3REDUCE:      "model": "d3_static_conservative_v1"
+// D3REDUCE:      "decision": "reject"
+// D3REDUCE:      "dma_descriptors": 4
+// D3REDUCE:      "mmio_stores": 16
+// D3REDUCE:      "waits": 4
+// D3REDUCE:      "copy_bytes": 256
+// D3REDUCE:      "avoided_repeated_read_bytes": 0
+// D3REDUCE:      "uses": 1
 
 module {
   tt.func public @gemm_fused_report(

@@ -551,6 +551,22 @@ static int64_t chooseWindowK(int64_t trips, int64_t requestedWindowK) {
 // Promotion evidence.
 //===----------------------------------------------------------------------===//
 
+struct SPMProfitabilityEvidence {
+  bool present = false;
+  std::string model = "d3_static_conservative_v1";
+  std::string decision;
+  std::string reasonCode;
+  std::string reason;
+  int64_t dmaDescriptors = 0;
+  int64_t mmioStores = 0;
+  int64_t waits = 0;
+  int64_t fences = 0;
+  int64_t copyBytes = 0;
+  int64_t avoidedRepeatedReadBytes = 0;
+  int64_t liveSpmBytes = 0;
+  int64_t uses = 0;
+};
+
 struct SPMPromotionRecord {
   std::string status = "accepted";
   std::string source;
@@ -566,6 +582,7 @@ struct SPMPromotionRecord {
   std::string reasonCode = "accepted_existing_schedule";
   std::string reason =
       "accepted by the existing fused SPM schedule; D1 report only";
+  SPMProfitabilityEvidence profitability;
 };
 
 struct SPMPromotionRejection {
@@ -580,7 +597,40 @@ struct SPMPromotionRejection {
   int64_t bytes = 0;
   std::string reasonCode;
   std::string reason;
+  SPMProfitabilityEvidence profitability;
 };
+
+static constexpr int64_t kDmaMmioStoresPerDescriptor = 4;
+
+static SPMProfitabilityEvidence makeD3ProfitabilityEvidence(
+    StringRef decision, StringRef reasonCode, StringRef reason,
+    int64_t dmaDescriptors, int64_t waits, int64_t copyBytes,
+    int64_t avoidedRepeatedReadBytes, int64_t liveSpmBytes, int64_t uses) {
+  SPMProfitabilityEvidence evidence;
+  evidence.present = true;
+  evidence.decision = decision.str();
+  evidence.reasonCode = reasonCode.str();
+  evidence.reason = reason.str();
+  evidence.dmaDescriptors = dmaDescriptors;
+  evidence.mmioStores = dmaDescriptors * kDmaMmioStoresPerDescriptor;
+  evidence.waits = waits;
+  evidence.fences = waits;
+  evidence.copyBytes = copyBytes;
+  evidence.avoidedRepeatedReadBytes = avoidedRepeatedReadBytes;
+  evidence.liveSpmBytes = liveSpmBytes;
+  evidence.uses = uses;
+  return evidence;
+}
+
+static void attachD3Profitability(SPMPromotionRecord &record,
+                                  SPMProfitabilityEvidence evidence) {
+  record.profitability = std::move(evidence);
+}
+
+static void attachD3Profitability(SPMPromotionRejection &rejection,
+                                  SPMProfitabilityEvidence evidence) {
+  rejection.profitability = std::move(evidence);
+}
 
 struct SPMPromotionReport {
   SmallVector<SPMPromotionRecord, 4> records;
@@ -642,6 +692,35 @@ static void writePromotionFieldKinds(llvm::raw_ostream &os,
   os << indent << "  \"spm_address\": \"exact-static\",\n";
   os << indent << "  \"overhead\": \"estimated-structural\",\n";
   os << indent << "  \"benefit\": \"estimated-structural\"\n";
+  os << indent << "}";
+}
+
+static void writeProfitabilityEvidence(llvm::raw_ostream &os,
+                                       const SPMProfitabilityEvidence &evidence,
+                                       StringRef indent) {
+  os << indent << "\"profitability\": {\n";
+  os << indent << "  \"model\": ";
+  writeJsonString(os, evidence.model);
+  os << ",\n";
+  os << indent << "  \"decision\": ";
+  writeJsonString(os, evidence.decision);
+  os << ",\n";
+  os << indent << "  \"reason_code\": ";
+  writeJsonString(os, evidence.reasonCode);
+  os << ",\n";
+  os << indent << "  \"reason\": ";
+  writeJsonString(os, evidence.reason);
+  os << ",\n";
+  os << indent << "  \"dma_descriptors\": " << evidence.dmaDescriptors
+     << ",\n";
+  os << indent << "  \"mmio_stores\": " << evidence.mmioStores << ",\n";
+  os << indent << "  \"waits\": " << evidence.waits << ",\n";
+  os << indent << "  \"fences\": " << evidence.fences << ",\n";
+  os << indent << "  \"copy_bytes\": " << evidence.copyBytes << ",\n";
+  os << indent << "  \"avoided_repeated_read_bytes\": "
+     << evidence.avoidedRepeatedReadBytes << ",\n";
+  os << indent << "  \"live_spm_bytes\": " << evidence.liveSpmBytes << ",\n";
+  os << indent << "  \"uses\": " << evidence.uses << "\n";
   os << indent << "}";
 }
 
@@ -756,6 +835,10 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
     writeJsonString(os, record.reason);
     os << ",\n";
     writePromotionFieldKinds(os, "      ");
+    if (record.profitability.present) {
+      os << ",\n";
+      writeProfitabilityEvidence(os, record.profitability, "      ");
+    }
     os << "\n";
     os << "    }";
     if (index + 1 != report.records.size())
@@ -804,7 +887,14 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
     os << "        \"shape\": \"exact-if-known\",\n";
     os << "        \"uses\": \"exact-if-known\",\n";
     os << "        \"bytes\": \"exact-if-known\"\n";
-    os << "      }\n";
+    os << "      }";
+    if (rejection.profitability.present) {
+      os << ",\n";
+      writeProfitabilityEvidence(os, rejection.profitability, "      ");
+      os << "\n";
+    } else {
+      os << "\n";
+    }
     os << "    }";
     if (index + 1 != report.rejections.size())
       os << ",";
@@ -1006,6 +1096,106 @@ matchRowResidentCandidate(ArrayRef<scf::ForOp> loops,
   return std::nullopt;
 }
 
+static SPMProfitabilityEvidence
+evaluateD3RowResidentProfitability(const RowResidentCandidate &candidate,
+                                   int64_t spmSize) {
+  int64_t rowElements =
+      candidate.trips * candidate.mean.xLoad.vecTy.getNumElements();
+  int64_t rowResidentDescriptors = 1;
+  int64_t rowResidentWaits = 1;
+  int64_t avoidedBytes = candidate.rowBytes * 2;
+
+  if (candidate.rowBytes > spmSize) {
+    return makeD3ProfitabilityEvidence(
+        "reject", "spm_capacity_overflow",
+        "D3 static model rejects row residency because one row exceeds SPM "
+        "capacity",
+        rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
+        avoidedBytes, candidate.rowBytes, /*uses=*/3);
+  }
+
+  if (rowElements < 512) {
+    return makeD3ProfitabilityEvidence(
+        "reject", "insufficient_row_work",
+        "D3 static model rejects small rows because one row DMA/wait/fence "
+        "does not have enough vector work to amortize descriptor overhead",
+        rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
+        avoidedBytes, candidate.rowBytes, /*uses=*/3);
+  }
+
+  if (candidate.rowBytes <= 4096) {
+    return makeD3ProfitabilityEvidence(
+        "reject", "measured_layer_norm_regression",
+        "D3 static model keeps LayerNorm row residency off by default: D2 "
+        "measurements were slower than cache at 32x64 and 512x1024",
+        rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
+        avoidedBytes, candidate.rowBytes, /*uses=*/3);
+  }
+
+  return makeD3ProfitabilityEvidence(
+      "reject", "unmodeled_large_row",
+      "D3 static model rejects large rows until descriptor, wait, and cache "
+      "fallback constants are fitted from gem5 stats",
+      rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
+      avoidedBytes, candidate.rowBytes, /*uses=*/3);
+}
+
+static SPMProfitabilityEvidence
+evaluateD3StreamingReductionProfitability(scf::ForOp forOp,
+                                          ArrayRef<TiledLoadInfo> loads,
+                                          int64_t spmSize) {
+  auto lbCst = getConstantIntValue(forOp.getLowerBound());
+  auto ubCst = getConstantIntValue(forOp.getUpperBound());
+  auto stepCst = getConstantIntValue(forOp.getStep());
+
+  int64_t trips = 0;
+  if (lbCst && ubCst && stepCst && *stepCst > 0 &&
+      (*ubCst - *lbCst) % *stepCst == 0)
+    trips = (*ubCst - *lbCst) / *stepCst;
+  int64_t descriptors = std::max<int64_t>(0, trips) * loads.size();
+  int64_t copyBytes = 0;
+  for (const TiledLoadInfo &load : loads)
+    copyBytes += std::max<int64_t>(0, trips) * load.tileBytes;
+
+  return makeD3ProfitabilityEvidence(
+      "reject", "streaming_reduction_no_residency",
+      "D3 static model rejects streaming reductions by default because each "
+      "chunk has one compute use and no bounded SPM residency; keep the cache "
+      "path unless an explicit row/block-resident schedule is selected",
+      descriptors, descriptors, copyBytes,
+      /*avoidedRepeatedReadBytes=*/0, std::min(copyBytes, spmSize),
+      /*uses=*/1);
+}
+
+static SPMPromotionRejection makeD3RowResidentProfitabilityRejection(
+    const RowResidentCandidate &candidate,
+    SPMProfitabilityEvidence evidence) {
+  SmallVector<int64_t> shape;
+  shape.push_back(candidate.trips *
+                  candidate.mean.xLoad.vecTy.getNumElements());
+  SPMPromotionRejection rejection = makeRowResidentRejection(
+      evidence.reasonCode, evidence.reason, shape, /*uses=*/3,
+      candidate.rowBytes);
+  attachD3Profitability(rejection, std::move(evidence));
+  return rejection;
+}
+
+static SPMPromotionRejection makeD3StreamingReductionRejection(
+    scf::ForOp forOp, ArrayRef<TiledLoadInfo> loads,
+    SPMProfitabilityEvidence evidence) {
+  SPMPromotionRejection rejection = makePromotionRejection(
+      "reduction_streaming", evidence.reasonCode, evidence.reason);
+  rejection.uses = 1;
+  rejection.copyIn = "DMA";
+  rejection.copyOut = "none";
+  rejection.bytes = evidence.copyBytes;
+  if (!loads.empty())
+    appendShape(rejection.shape, loads.front().vecTy);
+  attachD3Profitability(rejection, std::move(evidence));
+  (void)forOp;
+  return rejection;
+}
+
 static scf::ForOp cloneLoopWithRowResidentX(RowResidentLoopInfo loopInfo,
                                             int64_t rowSpmAddress,
                                             unsigned elemBytes) {
@@ -1068,7 +1258,8 @@ static scf::ForOp cloneLoopWithRowResidentX(RowResidentLoopInfo loopInfo,
 
 static bool transformRowResidentCandidate(
     RowResidentCandidate &candidate, int64_t spmBase, int64_t spmSize,
-    int64_t rowResidentMaxBytes, SPMPromotionReport *report,
+    int64_t rowResidentMaxBytes, bool enablePromotionProfitability,
+    SPMPromotionReport *report,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
   auto reject = [&](StringRef reasonCode, StringRef reason) {
     if (report) {
@@ -1091,6 +1282,20 @@ static bool transformRowResidentCandidate(
   if (candidate.rowBytes > rowResidentMaxBytes)
     return reject("spm_capacity_overflow",
                   "row bytes exceed the D2 row-resident prototype budget");
+  if (enablePromotionProfitability) {
+    SPMProfitabilityEvidence evidence =
+        evaluateD3RowResidentProfitability(candidate, spmSize);
+    if (evidence.decision != "accept") {
+      if (report)
+        report->rejections.push_back(
+            makeD3RowResidentProfitabilityRejection(candidate,
+                                                    std::move(evidence)));
+      rowResidentHandledLoops.insert(candidate.mean.forOp.getOperation());
+      rowResidentHandledLoops.insert(candidate.variance.forOp.getOperation());
+      rowResidentHandledLoops.insert(candidate.normalize.forOp.getOperation());
+      return false;
+    }
+  }
 
   SPMSpaceManager spmLayout(spmBase, spmSize);
   auto allocRow = spmLayout.alloc(candidate.rowBytes, /*alignment=*/1,
@@ -1134,10 +1339,17 @@ static bool transformRowResidentCandidate(
   rowResidentHandledLoops.insert(newVariance.getOperation());
   rowResidentHandledLoops.insert(newNormalize.getOperation());
 
-  if (report)
-    report->records.push_back(makeRowResidentRecord(
+  if (report) {
+    SPMPromotionRecord record = makeRowResidentRecord(
         candidate.mean.xLoad.vecTy, candidate.trips, candidate.rowBytes,
-        allocRow->address));
+        allocRow->address);
+    if (enablePromotionProfitability) {
+      SPMProfitabilityEvidence evidence =
+          evaluateD3RowResidentProfitability(candidate, spmSize);
+      attachD3Profitability(record, std::move(evidence));
+    }
+    report->records.push_back(std::move(record));
+  }
 
   guard.commit();
   return true;
@@ -1193,6 +1405,7 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
                                          int64_t spmBase, int64_t spmSize,
                                          int64_t microM,
                                          int64_t requestedWindowK,
+                                         bool enablePromotionProfitability,
                                          SPMPromotionReport *report) {
   auto reject = [&](StringRef reasonCode, StringRef reason) {
     if (report)
@@ -1243,6 +1456,17 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
         record.overhead = "windowK DMA descriptors plus one wait per K window";
         record.benefit =
             "B window is loaded once and reused across all microM slices";
+        if (enablePromotionProfitability)
+          attachD3Profitability(
+              record,
+              makeD3ProfitabilityEvidence(
+                  "accept", "accepted_reused_loop_window",
+                  "D3 static model accepts the existing fused matmul B window: "
+                  "bounded loop-window lifetime and reuse across microM slices",
+                  window, /*waits=*/1, bytes,
+                  (bytes / window) * std::max<int64_t>(0, uses - window),
+                  bytes,
+                  uses));
         return record;
       };
 
@@ -1262,6 +1486,15 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
         record.benefit =
             "keeps the full accumulator tile resident while inner loops carry "
             "only microM rows";
+        if (enablePromotionProfitability)
+          attachD3Profitability(
+              record,
+              makeD3ProfitabilityEvidence(
+                  "accept", "accepted_bounded_temporary",
+                  "D3 static model accepts the accumulator tile as a bounded "
+                  "loop-window temporary in the existing fused matmul schedule",
+                  /*dmaDescriptors=*/0, /*waits=*/0, /*copyBytes=*/0,
+                  bytes * std::max<int64_t>(0, uses - 1), bytes, uses));
         return record;
       };
 
@@ -1968,6 +2201,7 @@ struct ConvertMemoryToSPM
                      bool enableReductions_,
                      bool enableRowResidentReductions_,
                      int64_t rowResidentMaxBytes_,
+                     bool enablePromotionProfitability_,
                      bool promotionReport_) {
     this->spmBase = spmBase_;
     this->spmSize = spmSize_;
@@ -1976,6 +2210,7 @@ struct ConvertMemoryToSPM
     this->enableReductions = enableReductions_;
     this->enableRowResidentReductions = enableRowResidentReductions_;
     this->rowResidentMaxBytes = rowResidentMaxBytes_;
+    this->enablePromotionProfitability = enablePromotionProfitability_;
     this->promotionReport = promotionReport_;
   }
 
@@ -2012,7 +2247,8 @@ struct ConvertMemoryToSPM
         }
 
         transformRowResidentCandidate(*candidate, spmBase, spmSize,
-                                      rowResidentMaxBytes, report,
+                                      rowResidentMaxBytes,
+                                      enablePromotionProfitability, report,
                                       rowResidentHandledLoops);
       });
     }
@@ -2045,10 +2281,25 @@ struct ConvertMemoryToSPM
             report = &reports[funcOp.getOperation()];
         }
         if (!transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
-                                         microM, windowK, report))
+                                         microM, windowK,
+                                         enablePromotionProfitability, report))
           transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
       } else if (dotLoads.empty() && enableReductions &&
                  !enableRowResidentReductions) {
+        if (enablePromotionProfitability) {
+          if (promotionReport && !nonDotLoads.empty()) {
+            auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
+            if (funcOp) {
+              SPMProfitabilityEvidence evidence =
+                  evaluateD3StreamingReductionProfitability(
+                      forOp, nonDotLoads, spmSize);
+              reports[funcOp.getOperation()].rejections.push_back(
+                  makeD3StreamingReductionRejection(forOp, nonDotLoads,
+                                                    std::move(evidence)));
+            }
+          }
+          continue;
+        }
         bool transformed =
             transformReductionLoop(forOp, nonDotLoads, spmBase, spmSize);
         if (!transformed && promotionReport && !nonDotLoads.empty()) {
@@ -2137,10 +2388,12 @@ createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
                          bool enableReductions,
                          bool enableRowResidentReductions,
                          int64_t rowResidentMaxBytes,
+                         bool enablePromotionProfitability,
                          bool promotionReport) {
   return std::make_unique<ConvertMemoryToSPM>(
       spmBase, spmSize, microM, windowK, enableReductions,
-      enableRowResidentReductions, rowResidentMaxBytes, promotionReport);
+      enableRowResidentReductions, rowResidentMaxBytes,
+      enablePromotionProfitability, promotionReport);
 }
 
 } // namespace cpu
