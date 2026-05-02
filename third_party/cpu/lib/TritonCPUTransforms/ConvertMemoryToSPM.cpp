@@ -42,6 +42,8 @@
 #include "triton/Dialect/TritonCPU/IR/Dialect.h"
 #include "triton/Dialect/TritonCPU/IR/SPMAttrs.h"
 
+#include "llvm/ADT/DenseSet.h"
+
 namespace mlir {
 namespace triton {
 namespace cpu {
@@ -655,6 +657,44 @@ static SPMPromotionRejection makePromotionRejection(StringRef pattern,
   return rejection;
 }
 
+static SPMPromotionRecord makeRowResidentRecord(VectorType chunkTy,
+                                                int64_t chunks,
+                                                int64_t bytes,
+                                                int64_t spmAddress) {
+  SPMPromotionRecord record;
+  record.source = "LayerNorm x row";
+  record.scope = "program-row";
+  record.shape.push_back(chunks * chunkTy.getNumElements());
+  record.uses = 3;
+  record.copyIn = "DMA";
+  record.copyOut = "none";
+  record.bytes = bytes;
+  record.spmAddress = spmAddress;
+  record.overhead = "one row DMA descriptor and one wait per program row";
+  record.benefit =
+      "x[row, :] is copied once and reused by mean, variance, and normalize";
+  record.reasonCode = "accepted_d2_opt_in_row_resident";
+  record.reason =
+      "accepted by the D2 opt-in row-resident reduction prototype";
+  return record;
+}
+
+static SPMPromotionRejection makeRowResidentRejection(
+    StringRef reasonCode, StringRef reason,
+    ArrayRef<int64_t> shape = ArrayRef<int64_t>(), int64_t uses = 0,
+    int64_t bytes = 0) {
+  SPMPromotionRejection rejection =
+      makePromotionRejection("row_resident_reduction", reasonCode, reason);
+  rejection.source = "LayerNorm x row";
+  rejection.scope = "program-row candidate";
+  rejection.uses = uses;
+  rejection.copyIn = "DMA";
+  rejection.copyOut = "none";
+  rejection.bytes = bytes;
+  rejection.shape.append(shape.begin(), shape.end());
+  return rejection;
+}
+
 static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
                                           const SPMPromotionReport &report) {
   const char *auxDir = std::getenv("KERNEL_AUX_FILE_DIR");
@@ -774,6 +814,333 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
   os << "}\n";
 
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// D2 row-resident reduction prototype.
+//
+// This is intentionally separate from the older reduction/streaming lowering:
+// it only runs behind enable-row-resident-reductions and only stages the
+// LayerNorm x row.  D1 sidecar records explain accepted/rejected evidence, but
+// no report field is consulted to choose a schedule.
+//===----------------------------------------------------------------------===//
+
+static BlockArgument traceFunctionArgument(Value value,
+                                           FunctionOpInterface funcOp,
+                                           unsigned depth = 0) {
+  if (depth > 8)
+    return nullptr;
+
+  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    Operation *parentOp = blockArg.getOwner()->getParentOp();
+    if (parentOp == funcOp)
+      return blockArg;
+
+    if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
+      for (auto [iterArg, initArg] :
+           llvm::zip_equal(forOp.getRegionIterArgs(), forOp.getInitArgs())) {
+        if (blockArg == iterArg)
+          return traceFunctionArgument(initArg, funcOp, depth + 1);
+      }
+    }
+
+    return nullptr;
+  }
+
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp)
+    return nullptr;
+
+  if (auto extractMemRef = dyn_cast<triton::cpu::ExtractMemRefOp>(defOp))
+    return traceFunctionArgument(extractMemRef.getSrc(), funcOp, depth + 1);
+
+  if (auto makeTensorPtr = dyn_cast<triton::MakeTensorPtrOp>(defOp))
+    return traceFunctionArgument(makeTensorPtr.getBase(), funcOp, depth + 1);
+
+  return nullptr;
+}
+
+struct RowResidentLoopInfo {
+  scf::ForOp forOp;
+  TiledLoadInfo xLoad;
+};
+
+struct RowResidentCandidate {
+  RowResidentLoopInfo mean;
+  RowResidentLoopInfo variance;
+  RowResidentLoopInfo normalize;
+  BlockArgument xArg;
+  int64_t trips = 0;
+  int64_t rowBytes = 0;
+  unsigned elemBytes = 0;
+};
+
+static bool sameStaticLoopShape(scf::ForOp lhs, scf::ForOp rhs) {
+  auto lhsLb = getConstantIntValue(lhs.getLowerBound());
+  auto lhsUb = getConstantIntValue(lhs.getUpperBound());
+  auto lhsStep = getConstantIntValue(lhs.getStep());
+  auto rhsLb = getConstantIntValue(rhs.getLowerBound());
+  auto rhsUb = getConstantIntValue(rhs.getUpperBound());
+  auto rhsStep = getConstantIntValue(rhs.getStep());
+  return lhsLb && lhsUb && lhsStep && rhsLb && rhsUb && rhsStep &&
+         *lhsLb == *rhsLb && *lhsUb == *rhsUb && *lhsStep == *rhsStep;
+}
+
+static bool isSupportedRowResidentXLoad(TiledLoadInfo load,
+                                        scf::ForOp forOp,
+                                        unsigned &elemBytes) {
+  if (load.feedsDot || load.vecTy.getRank() != 1)
+    return false;
+  Type elemTy = load.vecTy.getElementType();
+  if (!elemTy.isF32())
+    return false;
+
+  auto memRefTy = dyn_cast<MemRefType>(load.readOp.getBase().getType());
+  if (!memRefTy || !memRefTy.getElementType().isF32())
+    return false;
+
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides) || strides.size() != 1 ||
+      strides[0] != 1)
+    return false;
+
+  auto stepCst = getConstantIntValue(forOp.getStep());
+  if (!stepCst || *stepCst != load.vecTy.getNumElements())
+    return false;
+
+  auto stepBytes =
+      getLoopStepBytes(load.readOp, forOp, /*requireLoopIv=*/true);
+  elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+  return stepBytes && *stepBytes == static_cast<int64_t>(elemBytes) &&
+         canComputePrologueDramAddr(load.readOp, forOp);
+}
+
+static std::optional<RowResidentCandidate>
+matchRowResidentCandidate(ArrayRef<scf::ForOp> loops,
+                          FunctionOpInterface funcOp,
+                          std::string &rejectReasonCode,
+                          std::string &rejectReason) {
+  if (loops.size() < 3) {
+    rejectReasonCode = "unsupported_pattern";
+    rejectReason = "expected three top-level LayerNorm row loops";
+    return std::nullopt;
+  }
+
+  for (size_t i = 0; i + 2 < loops.size(); ++i) {
+    scf::ForOp meanLoop = loops[i];
+    scf::ForOp varLoop = loops[i + 1];
+    scf::ForOp normLoop = loops[i + 2];
+    if (!sameStaticLoopShape(meanLoop, varLoop) ||
+        !sameStaticLoopShape(meanLoop, normLoop))
+      continue;
+
+    SmallVector<TiledLoadInfo> meanLoads = findTiledLoads(meanLoop);
+    SmallVector<TiledLoadInfo> varLoads = findTiledLoads(varLoop);
+    SmallVector<TiledLoadInfo> normLoads = findTiledLoads(normLoop);
+    if (meanLoads.size() != 1 || varLoads.size() != 1 ||
+        normLoads.empty())
+      continue;
+
+    BlockArgument meanArg =
+        traceFunctionArgument(meanLoads[0].readOp.getBase(), funcOp);
+    BlockArgument varArg =
+        traceFunctionArgument(varLoads[0].readOp.getBase(), funcOp);
+    if (!meanArg || !varArg || meanArg != varArg)
+      continue;
+
+    std::optional<TiledLoadInfo> normXLoad;
+    for (TiledLoadInfo load : normLoads) {
+      if (traceFunctionArgument(load.readOp.getBase(), funcOp) == meanArg) {
+        normXLoad = load;
+        break;
+      }
+    }
+    if (!normXLoad)
+      continue;
+
+    unsigned elemBytes = 0;
+    unsigned elemBytesVar = 0;
+    unsigned elemBytesNorm = 0;
+    if (!isSupportedRowResidentXLoad(meanLoads[0], meanLoop, elemBytes) ||
+        !isSupportedRowResidentXLoad(varLoads[0], varLoop, elemBytesVar) ||
+        !isSupportedRowResidentXLoad(*normXLoad, normLoop, elemBytesNorm) ||
+        elemBytes != elemBytesVar || elemBytes != elemBytesNorm) {
+      rejectReasonCode = "unsupported_pattern";
+      rejectReason =
+          "candidate requires rank-1 contiguous fp32 x loads with static "
+          "BLOCK_N-sized loop steps";
+      return std::nullopt;
+    }
+
+    auto lbCst = getConstantIntValue(meanLoop.getLowerBound());
+    auto ubCst = getConstantIntValue(meanLoop.getUpperBound());
+    auto stepCst = getConstantIntValue(meanLoop.getStep());
+    if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
+        (*ubCst - *lbCst) % *stepCst != 0) {
+      rejectReasonCode = "dynamic_shape_or_stride";
+      rejectReason = "loop bounds/step are not static with exact trip count";
+      return std::nullopt;
+    }
+
+    int64_t trips = (*ubCst - *lbCst) / *stepCst;
+    if (trips <= 0) {
+      rejectReasonCode = "unsupported_pattern";
+      rejectReason = "loop trip count must be positive";
+      return std::nullopt;
+    }
+
+    int64_t rowBytes = trips * meanLoads[0].tileBytes;
+    RowResidentCandidate candidate;
+    candidate.mean = RowResidentLoopInfo{meanLoop, meanLoads[0]};
+    candidate.variance = RowResidentLoopInfo{varLoop, varLoads[0]};
+    candidate.normalize = RowResidentLoopInfo{normLoop, *normXLoad};
+    candidate.xArg = meanArg;
+    candidate.trips = trips;
+    candidate.rowBytes = rowBytes;
+    candidate.elemBytes = elemBytes;
+    return candidate;
+  }
+
+  rejectReasonCode = "unsupported_pattern";
+  rejectReason = "no LayerNorm-style row-resident candidate matched";
+  return std::nullopt;
+}
+
+static scf::ForOp cloneLoopWithRowResidentX(RowResidentLoopInfo loopInfo,
+                                            int64_t rowSpmAddress,
+                                            unsigned elemBytes) {
+  scf::ForOp forOp = loopInfo.forOp;
+  vector::TransferReadOp xRead = loopInfo.xLoad.readOp;
+  Location loc = forOp.getLoc();
+  OpBuilder b(forOp);
+
+  auto newForOp = scf::ForOp::create(
+      b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
+      forOp.getInitArgs());
+
+  Block *newBody = newForOp.getBody();
+  Block *oldBody = forOp.getBody();
+
+  IRMapping mapping;
+  mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  for (auto [oldArg, newArg] :
+       llvm::zip_equal(forOp.getRegionIterArgs(),
+                       newForOp.getRegionIterArgs()))
+    mapping.map(oldArg, newArg);
+
+  if (!newBody->empty() && newBody->mightHaveTerminator())
+    newBody->getTerminator()->erase();
+  b.setInsertionPointToStart(newBody);
+
+  Value elemOffset = arith::SubIOp::create(
+      b, loc, toI64(b, loc, newForOp.getInductionVar()),
+      toI64(b, loc, newForOp.getLowerBound()));
+  Value byteOffset = arith::MulIOp::create(
+      b, loc, elemOffset, i64Cst(b, loc, elemBytes));
+  Value xSpmAddr = arith::AddIOp::create(
+      b, loc, i64Cst(b, loc, rowSpmAddress), byteOffset);
+
+  for (auto &op : oldBody->getOperations()) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+
+    if (&op == xRead.getOperation()) {
+      Value spmVal = emitSpmRead(b, loc, xSpmAddr, loopInfo.xLoad.vecTy);
+      mapping.map(xRead.getResult(), spmVal);
+      continue;
+    }
+
+    b.clone(op, mapping);
+  }
+
+  auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
+  SmallVector<Value> yieldVals;
+  for (Value val : oldYield.getOperands())
+    yieldVals.push_back(mapping.lookupOrDefault(val));
+  scf::YieldOp::create(b, loc, yieldVals);
+
+  for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+    forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
+  forOp.erase();
+
+  return newForOp;
+}
+
+static bool transformRowResidentCandidate(
+    RowResidentCandidate &candidate, int64_t spmBase, int64_t spmSize,
+    int64_t rowResidentMaxBytes, SPMPromotionReport *report,
+    llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
+  auto reject = [&](StringRef reasonCode, StringRef reason) {
+    if (report) {
+      SmallVector<int64_t> shape;
+      if (candidate.trips > 0)
+        shape.push_back(candidate.trips *
+                        candidate.mean.xLoad.vecTy.getNumElements());
+      report->rejections.push_back(makeRowResidentRejection(
+          reasonCode, reason, shape, /*uses=*/3, candidate.rowBytes));
+    }
+    rowResidentHandledLoops.insert(candidate.mean.forOp.getOperation());
+    rowResidentHandledLoops.insert(candidate.variance.forOp.getOperation());
+    rowResidentHandledLoops.insert(candidate.normalize.forOp.getOperation());
+    return false;
+  };
+
+  if (rowResidentMaxBytes <= 0)
+    return reject("unsupported_config",
+                  "row-resident max bytes must be positive");
+  if (candidate.rowBytes > rowResidentMaxBytes)
+    return reject("spm_capacity_overflow",
+                  "row bytes exceed the D2 row-resident prototype budget");
+
+  SPMSpaceManager spmLayout(spmBase, spmSize);
+  auto allocRow = spmLayout.alloc(candidate.rowBytes, /*alignment=*/1,
+                                  SPMSpaceManager::Lifetime::Loop);
+  if (!allocRow)
+    return reject("spm_capacity_overflow",
+                  "SPM capacity cannot fit one resident x row");
+
+  Location loc = candidate.mean.forOp.getLoc();
+  InsertedBeforeGuard guard(candidate.mean.forOp.getOperation());
+  OpBuilder b(candidate.mean.forOp);
+
+  Value dramAddr =
+      computePrologueDramAddr(b, loc, candidate.mean.xLoad.readOp,
+                              candidate.mean.forOp);
+  if (!dramAddr) {
+    guard.cleanup();
+    return reject("dynamic_shape_or_stride",
+                  "failed to compute row prologue DRAM address");
+  }
+
+  auto rowVecTy = VectorType::get(
+      {candidate.trips * candidate.mean.xLoad.vecTy.getNumElements()},
+      candidate.mean.xLoad.vecTy.getElementType());
+  auto memRefTy = cast<MemRefType>(
+      candidate.mean.xLoad.readOp.getBase().getType());
+  emitDmaEnqueue(b, loc, i64Cst(b, loc, allocRow->address), dramAddr,
+                 rowVecTy, memRefTy);
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  scf::ForOp newMean =
+      cloneLoopWithRowResidentX(candidate.mean, allocRow->address,
+                                candidate.elemBytes);
+  scf::ForOp newVariance =
+      cloneLoopWithRowResidentX(candidate.variance, allocRow->address,
+                                candidate.elemBytes);
+  scf::ForOp newNormalize =
+      cloneLoopWithRowResidentX(candidate.normalize, allocRow->address,
+                                candidate.elemBytes);
+  rowResidentHandledLoops.insert(newMean.getOperation());
+  rowResidentHandledLoops.insert(newVariance.getOperation());
+  rowResidentHandledLoops.insert(newNormalize.getOperation());
+
+  if (report)
+    report->records.push_back(makeRowResidentRecord(
+        candidate.mean.xLoad.vecTy, candidate.trips, candidate.rowBytes,
+        allocRow->address));
+
+  guard.commit();
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1596,16 +1963,67 @@ struct ConvertMemoryToSPM
     this->enableReductions = enableReductions_;
     this->promotionReport = promotionReport_;
   }
+  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_,
+                     int64_t microM_, int64_t windowK_,
+                     bool enableReductions_,
+                     bool enableRowResidentReductions_,
+                     int64_t rowResidentMaxBytes_,
+                     bool promotionReport_) {
+    this->spmBase = spmBase_;
+    this->spmSize = spmSize_;
+    this->microM = microM_;
+    this->windowK = windowK_;
+    this->enableReductions = enableReductions_;
+    this->enableRowResidentReductions = enableRowResidentReductions_;
+    this->rowResidentMaxBytes = rowResidentMaxBytes_;
+    this->promotionReport = promotionReport_;
+  }
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     DenseMap<Operation *, SPMPromotionReport> reports;
+    llvm::DenseSet<Operation *> rowResidentHandledLoops;
+
+    if (enableRowResidentReductions) {
+      mod.walk([&](FunctionOpInterface funcOp) {
+        if (funcOp.getFunctionBody().empty())
+          return;
+
+        SmallVector<scf::ForOp> topLevelLoops;
+        Block &entryBlock = funcOp.getFunctionBody().front();
+        for (Operation &op : entryBlock) {
+          if (auto forOp = dyn_cast<scf::ForOp>(&op))
+            topLevelLoops.push_back(forOp);
+        }
+
+        SPMPromotionReport *report = nullptr;
+        if (promotionReport)
+          report = &reports[funcOp.getOperation()];
+
+        std::string rejectReasonCode;
+        std::string rejectReason;
+        auto candidate = matchRowResidentCandidate(
+            topLevelLoops, funcOp, rejectReasonCode, rejectReason);
+        if (!candidate) {
+          if (report && !rejectReasonCode.empty())
+            report->rejections.push_back(makeRowResidentRejection(
+                rejectReasonCode, rejectReason));
+          return;
+        }
+
+        transformRowResidentCandidate(*candidate, spmBase, spmSize,
+                                      rowResidentMaxBytes, report,
+                                      rowResidentHandledLoops);
+      });
+    }
 
     // Collect scf.for ops (avoid modifying while iterating).
     SmallVector<scf::ForOp> forOps;
     mod.walk([&](scf::ForOp forOp) { forOps.push_back(forOp); });
 
     for (auto forOp : forOps) {
+      if (rowResidentHandledLoops.contains(forOp.getOperation()))
+        continue;
       auto loads = findTiledLoads(forOp);
       if (loads.empty())
         continue;
@@ -1629,7 +2047,8 @@ struct ConvertMemoryToSPM
         if (!transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
                                          microM, windowK, report))
           transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
-      } else if (dotLoads.empty() && enableReductions) {
+      } else if (dotLoads.empty() && enableReductions &&
+                 !enableRowResidentReductions) {
         bool transformed =
             transformReductionLoop(forOp, nonDotLoads, spmBase, spmSize);
         if (!transformed && promotionReport && !nonDotLoads.empty()) {
@@ -1710,6 +2129,18 @@ createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
                          bool enableReductions, bool promotionReport) {
   return std::make_unique<ConvertMemoryToSPM>(
       spmBase, spmSize, microM, windowK, enableReductions, promotionReport);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
+                         int64_t microM, int64_t windowK,
+                         bool enableReductions,
+                         bool enableRowResidentReductions,
+                         int64_t rowResidentMaxBytes,
+                         bool promotionReport) {
+  return std::make_unique<ConvertMemoryToSPM>(
+      spmBase, spmSize, microM, windowK, enableReductions,
+      enableRowResidentReductions, rowResidentMaxBytes, promotionReport);
 }
 
 } // namespace cpu
