@@ -114,8 +114,10 @@ static Value emitVolatileLoad(ConversionPatternRewriter &rewriter, Location loc,
 // change) could re-order register writes around the LEN trigger.
 //
 // Emitting the fence as raw inline assembly with `has_side_effects = true`
-// pins the exact instruction we want and prevents the optimizer from
-// touching it.
+// pins the exact instruction we want without also clobbering ordinary memory.
+// The DMA MMIO accesses themselves are volatile loads/stores; adding a generic
+// memory clobber here forces LLVM to spill/reload large GEMM micro-kernels
+// around every DMA fence and loses the register-resident schedule.
 // ---------------------------------------------------------------------------
 static void emitFence(ConversionPatternRewriter &rewriter, Location loc) {
   auto *ctx = rewriter.getContext();
@@ -124,7 +126,7 @@ static void emitFence(ConversionPatternRewriter &rewriter, Location loc) {
       /*resultTypes=*/TypeRange(),
       /*operands=*/ValueRange(),
       /*asm_string=*/"fence iorw, iorw",
-      /*constraints=*/"~{memory}",
+      /*constraints=*/"",
       /*has_side_effects=*/true,
       /*is_align_stack=*/false,
       /*tail_call_kind=*/LLVM::TailCallKind::None,
