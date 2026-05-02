@@ -130,6 +130,15 @@ static bool isVector1Read(vector::TransferReadOp readOp) {
   return vecTy && vecTy.getNumElements() == 1;
 }
 
+static bool readFeedsDot(vector::TransferReadOp readOp) {
+  for (auto *user : readOp->getUsers()) {
+    if (isa<vector::ContractionOp>(user) ||
+        isa<triton::cpu::DotOp>(user))
+      return true;
+  }
+  return false;
+}
+
 static bool hasScalarReuse(FunctionOpInterface funcOp, BlockArgument arg) {
   bool hasReuse = false;
   funcOp->walk([&](Operation *op) {
@@ -196,6 +205,11 @@ static LogicalResult writeTierSidecar(
 
 struct SPMTensorPlacement
     : public triton::cpu::impl::SPMTensorPlacementBase<SPMTensorPlacement> {
+  SPMTensorPlacement() = default;
+  explicit SPMTensorPlacement(bool enableReductions_) {
+    this->enableReductions = enableReductions_;
+  }
+
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     MLIRContext *context = mod.getContext();
@@ -208,6 +222,9 @@ struct SPMTensorPlacement
 
       llvm::DenseSet<unsigned> candidateArgs;
       funcOp->walk([&](vector::TransferReadOp readOp) {
+        if (!enableReductions && !readFeedsDot(readOp))
+          return;
+
         BlockArgument arg;
         if (isEligibleTiledRead(readOp, funcOp, arg))
           candidateArgs.insert(arg.getArgNumber());
@@ -247,6 +264,11 @@ namespace cpu {
 
 std::unique_ptr<OperationPass<ModuleOp>> createSPMTensorPlacement() {
   return std::make_unique<SPMTensorPlacement>();
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createSPMTensorPlacement(bool enableReductions) {
+  return std::make_unique<SPMTensorPlacement>(enableReductions);
 }
 
 } // namespace cpu

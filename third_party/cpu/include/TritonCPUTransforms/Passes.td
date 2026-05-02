@@ -198,6 +198,12 @@ def SPMTensorPlacement : Pass<"triton-cpu-spm-tensor-placement", "mlir::ModuleOp
         scalar-reuse analysis, tier attributes, and sidecar export.
     }];
 
+    let options = [
+        Option<"enableReductions", "enable-reductions",
+               "bool", /*default*/"true",
+               "Emit tier sidecar entries for reduction/streaming-only tensors.">,
+    ];
+
     let constructor = "mlir::triton::cpu::createSPMTensorPlacement()";
 
     let dependentDialects = ["mlir::func::FuncDialect",
@@ -263,6 +269,9 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
         Option<"windowK", "window-k",
                "int64_t", /*default*/"4",
                "Maximum K-iteration window for resident B tiles.">,
+        Option<"enableReductions", "enable-reductions",
+               "bool", /*default*/"true",
+               "Enable reduction/streaming loop lowering through SPM.">,
     ];
 
     let constructor = "mlir::triton::cpu::createConvertMemoryToSPM()";

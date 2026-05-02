@@ -124,7 +124,7 @@ static void emitFence(ConversionPatternRewriter &rewriter, Location loc) {
       /*resultTypes=*/TypeRange(),
       /*operands=*/ValueRange(),
       /*asm_string=*/"fence iorw, iorw",
-      /*constraints=*/"",
+      /*constraints=*/"~{memory}",
       /*has_side_effects=*/true,
       /*is_align_stack=*/false,
       /*tail_call_kind=*/LLVM::TailCallKind::None,

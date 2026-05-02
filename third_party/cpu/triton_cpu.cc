@@ -109,6 +109,11 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_spm_tensor_placement", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createSPMTensorPlacement());
   });
+  m.def("add_spm_tensor_placement",
+        [](mlir::PassManager &pm, bool enableReductions) {
+          pm.addPass(
+              mlir::triton::cpu::createSPMTensorPlacement(enableReductions));
+        });
   m.def("add_convert_memory_to_spm",
         [](mlir::PassManager &pm, int64_t spmBase, int64_t spmSize) {
           pm.addPass(
@@ -119,6 +124,12 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
            int64_t microM, int64_t windowK) {
           pm.addPass(mlir::triton::cpu::createConvertMemoryToSPM(
               spmBase, spmSize, microM, windowK));
+        });
+  m.def("add_convert_memory_to_spm",
+        [](mlir::PassManager &pm, int64_t spmBase, int64_t spmSize,
+           int64_t microM, int64_t windowK, bool enableReductions) {
+          pm.addPass(mlir::triton::cpu::createConvertMemoryToSPM(
+              spmBase, spmSize, microM, windowK, enableReductions));
         });
   m.def("add_split_large_contract",
         [](mlir::PassManager &pm, int64_t microM) {

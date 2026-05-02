@@ -16,11 +16,11 @@
 // CHECK:       %[[STRIDES_ADDR:.+]] = llvm.mlir.constant(4026531896 : i64) : i64
 // CHECK-NEXT:  %[[STRIDES_PTR:.+]] = llvm.inttoptr %[[STRIDES_ADDR]] : i64 to !llvm.ptr
 // CHECK-NEXT:  llvm.store volatile %{{.+}}, %[[STRIDES_PTR]] : i64, !llvm.ptr
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // CHECK:       %[[LEN_ADDR:.+]] = llvm.mlir.constant(4026531856 : i64) : i64
 // CHECK-NEXT:  %[[LEN_PTR:.+]] = llvm.inttoptr %[[LEN_ADDR]] : i64 to !llvm.ptr
 // CHECK-NEXT:  llvm.store volatile %{{.+}}, %[[LEN_PTR]] : i64, !llvm.ptr
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 //
 // BASE-LABEL: @dma_enqueue_2d_basic
 // BASE:       llvm.mlir.constant(3758096384 : i64) : i64
@@ -44,11 +44,11 @@ module {
 // ============================================================================
 
 // CHECK-LABEL: @dma_wait_basic
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // CHECK:       %[[STATUS_ADDR:.+]] = llvm.mlir.constant(4026531864 : i64) : i64
 // CHECK-NEXT:  %[[STATUS_PTR:.+]] = llvm.inttoptr %[[STATUS_ADDR]] : i64 to !llvm.ptr
 // CHECK-NEXT:  %{{.+}} = llvm.load volatile %[[STATUS_PTR]] : !llvm.ptr -> i64
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 //
 // BASE-LABEL: @dma_wait_basic
 // BASE:       llvm.mlir.constant(3758096408 : i64) : i64
@@ -73,13 +73,13 @@ module {
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // Wait: fence + load + fence
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // CHECK:       llvm.load volatile
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 
 module {
   tt.func public @dma_enqueue_then_wait(
@@ -102,20 +102,20 @@ module {
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // Second enqueue
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // CHECK:       llvm.store volatile
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // Wait
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 // CHECK:       llvm.load volatile
-// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw"
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", "~{memory}"
 
 module {
   tt.func public @dma_double_buffer(

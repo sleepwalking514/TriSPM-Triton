@@ -232,9 +232,14 @@ class CPUBackend(BaseBackend):
                 spm_size = int(os.getenv("TRITON_SPM_SIZE", "262144"), 0)
                 micro_m = int(os.getenv("TRITON_MICRO_M", "8"), 0)
                 window_k = int(os.getenv("TRITON_SPM_WINDOW_K", "4"), 0)
-                cpu.passes.ttcpuir.add_spm_tensor_placement(pm)
+                enable_reductions = (
+                    os.getenv("TRITON_ENABLE_SPM_REDUCTIONS", "0") == "1"
+                )
+                cpu.passes.ttcpuir.add_spm_tensor_placement(
+                    pm, enable_reductions)
                 cpu.passes.ttcpuir.add_convert_memory_to_spm(
-                    pm, spm_base, spm_size, micro_m, window_k)
+                    pm, spm_base, spm_size, micro_m, window_k,
+                    enable_reductions)
 
                 # Split large vector.contract into register-friendly
                 # micro-tiles.  SPM-only: cache baseline doesn't need this

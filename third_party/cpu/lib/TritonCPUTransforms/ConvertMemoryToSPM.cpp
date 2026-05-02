@@ -1241,6 +1241,15 @@ struct ConvertMemoryToSPM
     this->microM = microM_;
     this->windowK = windowK_;
   }
+  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_,
+                     int64_t microM_, int64_t windowK_,
+                     bool enableReductions_) {
+    this->spmBase = spmBase_;
+    this->spmSize = spmSize_;
+    this->microM = microM_;
+    this->windowK = windowK_;
+    this->enableReductions = enableReductions_;
+  }
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
@@ -1267,7 +1276,7 @@ struct ConvertMemoryToSPM
         if (!transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
                                          microM, windowK))
           transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
-      } else if (dotLoads.empty()) {
+      } else if (dotLoads.empty() && enableReductions) {
         transformReductionLoop(forOp, nonDotLoads, spmBase, spmSize);
       }
       // Otherwise: leave unchanged (cache path).
@@ -1295,6 +1304,14 @@ createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
                          int64_t microM, int64_t windowK) {
   return std::make_unique<ConvertMemoryToSPM>(
       spmBase, spmSize, microM, windowK);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
+                         int64_t microM, int64_t windowK,
+                         bool enableReductions) {
+  return std::make_unique<ConvertMemoryToSPM>(
+      spmBase, spmSize, microM, windowK, enableReductions);
 }
 
 } // namespace cpu

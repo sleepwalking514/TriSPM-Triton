@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s
+// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=NOREDUCE
 
 // ============================================================================
 // Test: GEMM K-loop with two tiled loads feeding vector.contract
@@ -204,6 +205,12 @@ module {
 // CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
 // CHECK:         arith.addf
 // CHECK:         scf.yield
+//
+// NOREDUCE-LABEL: @reduction_prefetch
+// NOREDUCE-NOT:   triton_cpu.dma_enqueue_2d
+// NOREDUCE-NOT:   memref.reinterpret_cast
+// NOREDUCE:       vector.transfer_read
+// NOREDUCE-SAME:  memref<64xf32, strided<[1]>>
 
 module {
   tt.func public @reduction_prefetch(
