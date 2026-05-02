@@ -550,6 +550,7 @@ static int64_t chooseWindowK(int64_t trips, int64_t requestedWindowK) {
 //===----------------------------------------------------------------------===//
 
 struct SPMPromotionRecord {
+  std::string status = "accepted";
   std::string source;
   std::string scope;
   SmallVector<int64_t> shape;
@@ -560,10 +561,22 @@ struct SPMPromotionRecord {
   int64_t spmAddress = 0;
   std::string overhead;
   std::string benefit;
+  std::string reasonCode = "accepted_existing_schedule";
+  std::string reason =
+      "accepted by the existing fused SPM schedule; D1 report only";
 };
 
 struct SPMPromotionRejection {
+  std::string status = "rejected";
   std::string pattern;
+  std::string source;
+  std::string scope;
+  SmallVector<int64_t> shape;
+  int64_t uses = 0;
+  std::string copyIn = "none";
+  std::string copyOut = "none";
+  int64_t bytes = 0;
+  std::string reasonCode;
   std::string reason;
 };
 
@@ -614,6 +627,34 @@ static void writeJsonShape(llvm::raw_ostream &os, ArrayRef<int64_t> shape) {
   os << "]";
 }
 
+static void writePromotionFieldKinds(llvm::raw_ostream &os,
+                                     StringRef indent) {
+  os << indent << "\"field_kinds\": {\n";
+  os << indent << "  \"source\": \"exact\",\n";
+  os << indent << "  \"scope\": \"exact\",\n";
+  os << indent << "  \"shape\": \"exact\",\n";
+  os << indent << "  \"uses\": \"exact-static\",\n";
+  os << indent << "  \"bytes\": \"exact-static\",\n";
+  os << indent << "  \"copy_in\": \"exact\",\n";
+  os << indent << "  \"copy_out\": \"exact\",\n";
+  os << indent << "  \"spm_address\": \"exact-static\",\n";
+  os << indent << "  \"overhead\": \"estimated-structural\",\n";
+  os << indent << "  \"benefit\": \"estimated-structural\"\n";
+  os << indent << "}";
+}
+
+static SPMPromotionRejection makePromotionRejection(StringRef pattern,
+                                                    StringRef reasonCode,
+                                                    StringRef reason) {
+  SPMPromotionRejection rejection;
+  rejection.pattern = pattern.str();
+  rejection.source = pattern.str();
+  rejection.scope = "candidate";
+  rejection.reasonCode = reasonCode.str();
+  rejection.reason = reason.str();
+  return rejection;
+}
+
 static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
                                           const SPMPromotionReport &report) {
   const char *auxDir = std::getenv("KERNEL_AUX_FILE_DIR");
@@ -631,6 +672,9 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
            << path << "': " << error.message();
 
   os << "{\n";
+  os << "  \"schema_version\": 1,\n";
+  os << "  \"schema\": \"triton_cpu_spm_promotion_d1\",\n";
+  os << "  \"contract\": \"debug/evidence sidecar; not a graph manifest or durable IR contract\",\n";
   os << "  \"kernel\": ";
   writeJsonString(os, funcOp.getName());
   os << ",\n";
@@ -638,6 +682,9 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
   os << "  \"promotions\": [\n";
   for (auto [index, record] : llvm::enumerate(report.records)) {
     os << "    {\n";
+    os << "      \"status\": ";
+    writeJsonString(os, record.status);
+    os << ",\n";
     os << "      \"source\": ";
     writeJsonString(os, record.source);
     os << ",\n";
@@ -661,6 +708,14 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
     os << ",\n";
     os << "      \"benefit\": ";
     writeJsonString(os, record.benefit);
+    os << ",\n";
+    os << "      \"reason_code\": ";
+    writeJsonString(os, record.reasonCode);
+    os << ",\n";
+    os << "      \"reason\": ";
+    writeJsonString(os, record.reason);
+    os << ",\n";
+    writePromotionFieldKinds(os, "      ");
     os << "\n";
     os << "    }";
     if (index + 1 != report.records.size())
@@ -671,11 +726,46 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
 
   os << "  \"rejections\": [\n";
   for (auto [index, rejection] : llvm::enumerate(report.rejections)) {
-    os << "    {\"pattern\": ";
+    os << "    {\n";
+    os << "      \"status\": ";
+    writeJsonString(os, rejection.status);
+    os << ",\n";
+    os << "      \"pattern\": ";
     writeJsonString(os, rejection.pattern);
-    os << ", \"reason\": ";
+    os << ",\n";
+    os << "      \"source\": ";
+    writeJsonString(os, rejection.source);
+    os << ",\n";
+    os << "      \"scope\": ";
+    writeJsonString(os, rejection.scope);
+    os << ",\n";
+    os << "      \"shape\": ";
+    writeJsonShape(os, rejection.shape);
+    os << ",\n";
+    os << "      \"uses\": " << rejection.uses << ",\n";
+    os << "      \"copy_in\": ";
+    writeJsonString(os, rejection.copyIn);
+    os << ",\n";
+    os << "      \"copy_out\": ";
+    writeJsonString(os, rejection.copyOut);
+    os << ",\n";
+    os << "      \"bytes\": " << rejection.bytes << ",\n";
+    os << "      \"reason_code\": ";
+    writeJsonString(os, rejection.reasonCode);
+    os << ",\n";
+    os << "      \"reason\": ";
     writeJsonString(os, rejection.reason);
-    os << "}";
+    os << ",\n";
+    os << "      \"field_kinds\": {\n";
+    os << "        \"reason_code\": \"exact\",\n";
+    os << "        \"reason\": \"exact\",\n";
+    os << "        \"source\": \"exact\",\n";
+    os << "        \"scope\": \"exact\",\n";
+    os << "        \"shape\": \"exact-if-known\",\n";
+    os << "        \"uses\": \"exact-if-known\",\n";
+    os << "        \"bytes\": \"exact-if-known\"\n";
+    os << "      }\n";
+    os << "    }";
     if (index + 1 != report.rejections.size())
       os << ",";
     os << "\n";
@@ -737,19 +827,20 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
                                          int64_t microM,
                                          int64_t requestedWindowK,
                                          SPMPromotionReport *report) {
-  auto reject = [&](StringRef reason) {
+  auto reject = [&](StringRef reasonCode, StringRef reason) {
     if (report)
-      report->rejections.push_back(
-          SPMPromotionRejection{"fused_micro_gemm", reason.str()});
+      report->rejections.push_back(makePromotionRejection(
+          "fused_micro_gemm", reasonCode, reason));
     return false;
   };
 
   if (dotLoads.size() != 2)
-    return reject("expected exactly two dot-feeding tiled loads");
+    return reject("unsupported_pattern",
+                  "expected exactly two dot-feeding tiled loads");
   if (microM <= 0)
-    return reject("microM must be positive");
+    return reject("unsupported_config", "microM must be positive");
   if (requestedWindowK <= 0)
-    return reject("requested windowK must be positive");
+    return reject("unsupported_config", "requested windowK must be positive");
 
   auto makeRecord = [](StringRef source, StringRef scope, VectorType shapeTy,
                        int64_t uses, StringRef copyIn, StringRef copyOut,
@@ -822,11 +913,12 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   auto stepCst = getConstantIntValue(forOp.getStep());
   if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
       (*ubCst - *lbCst) % *stepCst != 0)
-    return reject("loop bounds/step are not static with exact trip count");
+    return reject("dynamic_shape_or_stride",
+                  "loop bounds/step are not static with exact trip count");
 
   int64_t trips = (*ubCst - *lbCst) / *stepCst;
   if (trips <= 0)
-    return reject("loop trip count must be positive");
+    return reject("unsupported_pattern", "loop trip count must be positive");
   int64_t windowK = chooseWindowK(trips, requestedWindowK);
 
   TiledLoadInfo loadA = dotLoads[0];
@@ -837,7 +929,8 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
     contractInfo =
         analyzeGemmContract(forOp, loadB.readOp, loadA.readOp);
     if (!contractInfo)
-      return reject("could not identify vector.contract consuming A/B loads");
+      return reject("unsupported_pattern",
+                    "could not identify vector.contract consuming A/B loads");
     std::swap(loadA, loadB);
   }
 
@@ -848,21 +941,24 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   auto bTy = dyn_cast<VectorType>(loadB.readOp.getType());
   if (!aTy || !bTy || aTy.getRank() != 2 || bTy.getRank() != 2 ||
       accTy.getRank() != 2)
-    return reject("A, B, and accumulator must be rank-2 vectors");
+    return reject("unsupported_pattern",
+                  "A, B, and accumulator must be rank-2 vectors");
 
   int64_t BM = accTy.getDimSize(0);
   int64_t BN = accTy.getDimSize(1);
   int64_t BK = aTy.getDimSize(1);
   if (BM < microM || BM % microM != 0 || aTy.getDimSize(0) != BM ||
       bTy.getDimSize(0) != BK || bTy.getDimSize(1) != BN)
-    return reject("matrix tile shape is incompatible with microM schedule");
+    return reject("unsupported_pattern",
+                  "matrix tile shape is incompatible with microM schedule");
 
   // This fused schedule only materializes the accumulator result.  The block
   // pointer loop results in the matmul kernel are dead; if a future pattern
   // uses them, fall back to the conservative double-buffer path.
   for (unsigned i = 0; i < forOp.getNumResults(); ++i)
     if (i != accIdx && !forOp.getResult(i).use_empty())
-      return reject("non-accumulator loop result is used");
+      return reject("no_bounded_lifetime",
+                    "non-accumulator loop result is used");
 
   auto memRefTyA = cast<MemRefType>(loadA.readOp.getBase().getType());
   auto memRefTyB = cast<MemRefType>(loadB.readOp.getBase().getType());
@@ -870,7 +966,8 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   if (!getStaticStrides(memRefTyA, stridesA) ||
       !getStaticStrides(memRefTyB, stridesB) ||
       stridesA.size() < 2 || stridesB.size() < 2)
-    return reject("A/B memrefs require static rank-2 strides");
+    return reject("dynamic_shape_or_stride",
+                  "A/B memrefs require static rank-2 strides");
 
   unsigned elemBytesA = memRefTyA.getElementType().getIntOrFloatBitWidth() / 8;
   unsigned elemBytesB = memRefTyB.getElementType().getIntOrFloatBitWidth() / 8;
@@ -895,7 +992,9 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   auto allocAcc = spmLayout.alloc(accBytes, /*alignment=*/1,
                                   SPMSpaceManager::Lifetime::Loop);
   if (!allocBWindow || !allocAMicro || !allocAcc)
-    return reject("SPM capacity cannot fit B window, A micro tile, and accumulator");
+    return reject(
+        "spm_capacity_overflow",
+        "SPM capacity cannot fit B window, A micro tile, and accumulator");
 
   int64_t addrBWindow = allocBWindow->address;
   int64_t addrAMicro = allocAMicro->address;
@@ -909,7 +1008,8 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   Value dramAddrB = computePrologueDramAddr(b, loc, loadB.readOp, forOp);
   if (!dramAddrA || !dramAddrB) {
     guard.cleanup();
-    return reject("failed to compute prologue DRAM address");
+    return reject("dynamic_shape_or_stride",
+                  "failed to compute prologue DRAM address");
   }
 
   if (report) {
@@ -1530,7 +1630,25 @@ struct ConvertMemoryToSPM
                                          microM, windowK, report))
           transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
       } else if (dotLoads.empty() && enableReductions) {
-        transformReductionLoop(forOp, nonDotLoads, spmBase, spmSize);
+        bool transformed =
+            transformReductionLoop(forOp, nonDotLoads, spmBase, spmSize);
+        if (!transformed && promotionReport && !nonDotLoads.empty()) {
+          auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
+          if (funcOp)
+            reports[funcOp.getOperation()].rejections.push_back(
+                makePromotionRejection(
+                    "reduction_streaming", "unsupported_pattern",
+                    "reduction/streaming loop did not match the current SPM "
+                    "lowering guards"));
+        }
+      } else if (promotionReport && dotLoads.empty() && !nonDotLoads.empty()) {
+        auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
+        if (funcOp)
+          reports[funcOp.getOperation()].rejections.push_back(
+              makePromotionRejection(
+                  "reduction_streaming", "policy_disabled",
+                  "reduction/streaming SPM promotion is disabled by default; "
+                  "leave the candidate on the cache path"));
       }
       // Otherwise: leave unchanged (cache path).
     }
