@@ -474,6 +474,112 @@ static SmallVector<TiledLoadInfo> findTiledLoads(scf::ForOp forOp) {
   return results;
 }
 
+enum class ReductionProducerPass {
+  FillOnFirstPass,
+  ProducerStore,
+  DmaPrefetch,
+};
+
+enum class ReductionBufferRole {
+  ResidentRow,
+  PingPongChunk,
+  TempVector,
+  OutputTile,
+};
+
+enum class ReductionRotationPolicy {
+  None,
+  DoubleBuffer,
+  Ring,
+};
+
+enum class ReductionCopyInMode {
+  CpuDirect,
+  Dma,
+};
+
+static StringRef stringifyProducerPass(ReductionProducerPass pass) {
+  switch (pass) {
+  case ReductionProducerPass::FillOnFirstPass:
+    return "fill_on_first_pass";
+  case ReductionProducerPass::ProducerStore:
+    return "producer_store";
+  case ReductionProducerPass::DmaPrefetch:
+    return "dma_prefetch";
+  }
+  llvm_unreachable("unknown reduction producer pass");
+}
+
+static StringRef stringifyBufferRole(ReductionBufferRole role) {
+  switch (role) {
+  case ReductionBufferRole::ResidentRow:
+    return "resident_row";
+  case ReductionBufferRole::PingPongChunk:
+    return "ping_pong_chunk";
+  case ReductionBufferRole::TempVector:
+    return "temp_vector";
+  case ReductionBufferRole::OutputTile:
+    return "output_tile";
+  }
+  llvm_unreachable("unknown reduction buffer role");
+}
+
+static StringRef stringifyRotationPolicy(ReductionRotationPolicy policy) {
+  switch (policy) {
+  case ReductionRotationPolicy::None:
+    return "none";
+  case ReductionRotationPolicy::DoubleBuffer:
+    return "double_buffer";
+  case ReductionRotationPolicy::Ring:
+    return "ring_N";
+  }
+  llvm_unreachable("unknown reduction rotation policy");
+}
+
+static StringRef stringifyCopyInMode(ReductionCopyInMode mode) {
+  switch (mode) {
+  case ReductionCopyInMode::CpuDirect:
+    return "cpu_direct";
+  case ReductionCopyInMode::Dma:
+    return "dma";
+  }
+  llvm_unreachable("unknown reduction copy-in mode");
+}
+
+struct ReductionLoopResidencyUse {
+  std::string passName;
+  scf::ForOp forOp;
+  TiledLoadInfo xLoad;
+};
+
+struct ReductionResidencyPlan {
+  std::string pattern = "row_resident_reduction";
+  std::string source;
+  std::string scope = "program-row";
+  BlockArgument sourceArg;
+  ReductionLoopResidencyUse producer;
+  SmallVector<ReductionLoopResidencyUse, 2> consumers;
+  SmallVector<scf::ForOp, 3> loops;
+  SmallVector<int64_t, 2> shape;
+  int64_t trips = 0;
+  int64_t bytes = 0;
+  unsigned elemBytes = 0;
+  int64_t uses = 0;
+  int64_t requiredSpmSlots = 1;
+  ReductionProducerPass producerPass =
+      ReductionProducerPass::FillOnFirstPass;
+  ReductionBufferRole bufferRole = ReductionBufferRole::ResidentRow;
+  ReductionRotationPolicy rotationPolicy =
+      ReductionRotationPolicy::None;
+  ReductionCopyInMode copyInMode = ReductionCopyInMode::CpuDirect;
+  std::string copyIn = "CPU/vector store";
+  std::string copyOut = "none";
+  std::string overhead;
+  std::string benefit;
+  SmallVector<std::string, 4> expectedMarkers;
+  bool hasLowering = false;
+};
+
 static bool isGemmContract(vector::ContractionOp op) {
   auto iterTypes = op.getIteratorTypes().getValue();
   if (iterTypes.size() != 3)
@@ -567,6 +673,17 @@ struct SPMProfitabilityEvidence {
   int64_t uses = 0;
 };
 
+struct SPMResidencyPlanEvidence {
+  bool present = false;
+  std::string producerPass;
+  SmallVector<std::string, 4> consumerPasses;
+  std::string bufferRole;
+  std::string rotationPolicy;
+  std::string copyInMode;
+  int64_t requiredSpmSlots = 0;
+  SmallVector<std::string, 4> expectedMarkers;
+};
+
 struct SPMPromotionRecord {
   std::string status = "accepted";
   std::string source;
@@ -582,6 +699,7 @@ struct SPMPromotionRecord {
   std::string reasonCode = "accepted_existing_schedule";
   std::string reason =
       "accepted by the existing fused SPM schedule; D1 report only";
+  SPMResidencyPlanEvidence residencyPlan;
   SPMProfitabilityEvidence profitability;
 };
 
@@ -597,6 +715,7 @@ struct SPMPromotionRejection {
   int64_t bytes = 0;
   std::string reasonCode;
   std::string reason;
+  SPMResidencyPlanEvidence residencyPlan;
   SPMProfitabilityEvidence profitability;
 };
 
@@ -630,6 +749,22 @@ static void attachD3Profitability(SPMPromotionRecord &record,
 static void attachD3Profitability(SPMPromotionRejection &rejection,
                                   SPMProfitabilityEvidence evidence) {
   rejection.profitability = std::move(evidence);
+}
+
+static SPMResidencyPlanEvidence
+makeResidencyPlanEvidence(const ReductionResidencyPlan &plan) {
+  SPMResidencyPlanEvidence evidence;
+  evidence.present = true;
+  evidence.producerPass = stringifyProducerPass(plan.producerPass).str();
+  evidence.bufferRole = stringifyBufferRole(plan.bufferRole).str();
+  evidence.rotationPolicy = stringifyRotationPolicy(plan.rotationPolicy).str();
+  evidence.copyInMode = stringifyCopyInMode(plan.copyInMode).str();
+  evidence.requiredSpmSlots = plan.requiredSpmSlots;
+  for (const ReductionLoopResidencyUse &use : plan.consumers)
+    evidence.consumerPasses.push_back(use.passName);
+  evidence.expectedMarkers.append(plan.expectedMarkers.begin(),
+                                  plan.expectedMarkers.end());
+  return evidence;
 }
 
 struct SPMPromotionReport {
@@ -679,6 +814,17 @@ static void writeJsonShape(llvm::raw_ostream &os, ArrayRef<int64_t> shape) {
   os << "]";
 }
 
+static void writeJsonStringArray(llvm::raw_ostream &os,
+                                 ArrayRef<std::string> values) {
+  os << "[";
+  for (auto [index, value] : llvm::enumerate(values)) {
+    if (index)
+      os << ", ";
+    writeJsonString(os, value);
+  }
+  os << "]";
+}
+
 static void writePromotionFieldKinds(llvm::raw_ostream &os,
                                      StringRef indent) {
   os << indent << "\"field_kinds\": {\n";
@@ -724,6 +870,33 @@ static void writeProfitabilityEvidence(llvm::raw_ostream &os,
   os << indent << "}";
 }
 
+static void writeResidencyPlanEvidence(
+    llvm::raw_ostream &os, const SPMResidencyPlanEvidence &evidence,
+    StringRef indent) {
+  os << indent << "\"residency_plan\": {\n";
+  os << indent << "  \"producer_pass\": ";
+  writeJsonString(os, evidence.producerPass);
+  os << ",\n";
+  os << indent << "  \"consumer_passes\": ";
+  writeJsonStringArray(os, evidence.consumerPasses);
+  os << ",\n";
+  os << indent << "  \"buffer_role\": ";
+  writeJsonString(os, evidence.bufferRole);
+  os << ",\n";
+  os << indent << "  \"rotation_policy\": ";
+  writeJsonString(os, evidence.rotationPolicy);
+  os << ",\n";
+  os << indent << "  \"copy_in_mode\": ";
+  writeJsonString(os, evidence.copyInMode);
+  os << ",\n";
+  os << indent << "  \"required_spm_slots\": "
+     << evidence.requiredSpmSlots << ",\n";
+  os << indent << "  \"expected_markers\": ";
+  writeJsonStringArray(os, evidence.expectedMarkers);
+  os << "\n";
+  os << indent << "}";
+}
+
 static SPMPromotionRejection makePromotionRejection(StringRef pattern,
                                                     StringRef reasonCode,
                                                     StringRef reason) {
@@ -736,27 +909,24 @@ static SPMPromotionRejection makePromotionRejection(StringRef pattern,
   return rejection;
 }
 
-static SPMPromotionRecord makeRowResidentRecord(VectorType chunkTy,
-                                                int64_t chunks,
-                                                int64_t bytes,
-                                                int64_t spmAddress) {
+static SPMPromotionRecord makeReductionResidencyRecord(
+    const ReductionResidencyPlan &plan, int64_t spmAddress) {
   SPMPromotionRecord record;
-  record.source = "LayerNorm x row";
-  record.scope = "program-row";
-  record.shape.push_back(chunks * chunkTy.getNumElements());
-  record.uses = 3;
-  record.copyIn = "CPU/vector store";
-  record.copyOut = "none";
-  record.bytes = bytes;
+  record.source = plan.source;
+  record.scope = plan.scope;
+  record.shape.append(plan.shape.begin(), plan.shape.end());
+  record.uses = plan.uses;
+  record.copyIn = plan.copyIn;
+  record.copyOut = plan.copyOut;
+  record.bytes = plan.bytes;
   record.spmAddress = spmAddress;
-  record.overhead =
-      "first reduction pass writes each loaded x chunk into SPM; no DMA wait";
-  record.benefit =
-      "x[row, :] is materialized once and reused by variance and normalize";
+  record.overhead = plan.overhead;
+  record.benefit = plan.benefit;
   record.reasonCode = "accepted_fill_on_first_pass_row_resident";
   record.reason =
       "accepted by the opt-in fill-on-first-pass row-resident reduction "
       "prototype";
+  record.residencyPlan = makeResidencyPlanEvidence(plan);
   return record;
 }
 
@@ -773,6 +943,22 @@ static SPMPromotionRejection makeRowResidentRejection(
   rejection.copyOut = "none";
   rejection.bytes = bytes;
   rejection.shape.append(shape.begin(), shape.end());
+  return rejection;
+}
+
+static SPMPromotionRejection makeReductionResidencyRejection(
+    const ReductionResidencyPlan &plan, StringRef reasonCode,
+    StringRef reason) {
+  SPMPromotionRejection rejection =
+      makePromotionRejection(plan.pattern, reasonCode, reason);
+  rejection.source = plan.source;
+  rejection.scope = plan.scope + " candidate";
+  rejection.uses = plan.uses;
+  rejection.copyIn = plan.copyIn;
+  rejection.copyOut = plan.copyOut;
+  rejection.bytes = plan.bytes;
+  rejection.shape.append(plan.shape.begin(), plan.shape.end());
+  rejection.residencyPlan = makeResidencyPlanEvidence(plan);
   return rejection;
 }
 
@@ -837,6 +1023,10 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
     writeJsonString(os, record.reason);
     os << ",\n";
     writePromotionFieldKinds(os, "      ");
+    if (record.residencyPlan.present) {
+      os << ",\n";
+      writeResidencyPlanEvidence(os, record.residencyPlan, "      ");
+    }
     if (record.profitability.present) {
       os << ",\n";
       writeProfitabilityEvidence(os, record.profitability, "      ");
@@ -890,6 +1080,10 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
     os << "        \"uses\": \"exact-if-known\",\n";
     os << "        \"bytes\": \"exact-if-known\"\n";
     os << "      }";
+    if (rejection.residencyPlan.present) {
+      os << ",\n";
+      writeResidencyPlanEvidence(os, rejection.residencyPlan, "      ");
+    }
     if (rejection.profitability.present) {
       os << ",\n";
       writeProfitabilityEvidence(os, rejection.profitability, "      ");
@@ -952,21 +1146,6 @@ static BlockArgument traceFunctionArgument(Value value,
   return nullptr;
 }
 
-struct RowResidentLoopInfo {
-  scf::ForOp forOp;
-  TiledLoadInfo xLoad;
-};
-
-struct RowResidentCandidate {
-  RowResidentLoopInfo mean;
-  RowResidentLoopInfo variance;
-  RowResidentLoopInfo normalize;
-  BlockArgument xArg;
-  int64_t trips = 0;
-  int64_t rowBytes = 0;
-  unsigned elemBytes = 0;
-};
-
 static bool sameStaticLoopShape(scf::ForOp lhs, scf::ForOp rhs) {
   auto lhsLb = getConstantIntValue(lhs.getLowerBound());
   auto lhsUb = getConstantIntValue(lhs.getUpperBound());
@@ -1007,11 +1186,11 @@ static bool isSupportedRowResidentXLoad(TiledLoadInfo load,
          canComputePrologueDramAddr(load.readOp, forOp);
 }
 
-static std::optional<RowResidentCandidate>
-matchRowResidentCandidate(ArrayRef<scf::ForOp> loops,
-                          FunctionOpInterface funcOp,
-                          std::string &rejectReasonCode,
-                          std::string &rejectReason) {
+static std::optional<ReductionResidencyPlan>
+matchLayerNormResidencyPlan(ArrayRef<scf::ForOp> loops,
+                            FunctionOpInterface funcOp,
+                            std::string &rejectReasonCode,
+                            std::string &rejectReason) {
   if (loops.size() < 3) {
     rejectReasonCode = "unsupported_pattern";
     rejectReason = "expected three top-level LayerNorm row loops";
@@ -1030,7 +1209,7 @@ matchRowResidentCandidate(ArrayRef<scf::ForOp> loops,
     SmallVector<TiledLoadInfo> varLoads = findTiledLoads(varLoop);
     SmallVector<TiledLoadInfo> normLoads = findTiledLoads(normLoop);
     if (meanLoads.size() != 1 || varLoads.size() != 1 ||
-        normLoads.empty())
+        normLoads.size() < 3)
       continue;
 
     BlockArgument meanArg =
@@ -1082,15 +1261,40 @@ matchRowResidentCandidate(ArrayRef<scf::ForOp> loops,
     }
 
     int64_t rowBytes = trips * meanLoads[0].tileBytes;
-    RowResidentCandidate candidate;
-    candidate.mean = RowResidentLoopInfo{meanLoop, meanLoads[0]};
-    candidate.variance = RowResidentLoopInfo{varLoop, varLoads[0]};
-    candidate.normalize = RowResidentLoopInfo{normLoop, *normXLoad};
-    candidate.xArg = meanArg;
-    candidate.trips = trips;
-    candidate.rowBytes = rowBytes;
-    candidate.elemBytes = elemBytes;
-    return candidate;
+    int64_t rowElements = trips * meanLoads[0].vecTy.getNumElements();
+    ReductionResidencyPlan plan;
+    plan.source = "LayerNorm x row";
+    plan.sourceArg = meanArg;
+    plan.producer =
+        ReductionLoopResidencyUse{"mean", meanLoop, meanLoads[0]};
+    plan.consumers.push_back(
+        ReductionLoopResidencyUse{"variance", varLoop, varLoads[0]});
+    plan.consumers.push_back(
+        ReductionLoopResidencyUse{"normalize", normLoop, *normXLoad});
+    plan.loops.push_back(meanLoop);
+    plan.loops.push_back(varLoop);
+    plan.loops.push_back(normLoop);
+    plan.shape.push_back(rowElements);
+    plan.trips = trips;
+    plan.bytes = rowBytes;
+    plan.elemBytes = elemBytes;
+    plan.uses = 3;
+    plan.requiredSpmSlots = 1;
+    plan.producerPass = ReductionProducerPass::FillOnFirstPass;
+    plan.bufferRole = ReductionBufferRole::ResidentRow;
+    plan.rotationPolicy = ReductionRotationPolicy::None;
+    plan.copyInMode = ReductionCopyInMode::CpuDirect;
+    plan.copyIn = "CPU/vector store";
+    plan.copyOut = "none";
+    plan.overhead =
+        "first reduction pass writes each loaded x chunk into SPM; no DMA wait";
+    plan.benefit =
+        "x[row, :] is materialized once and reused by variance and normalize";
+    plan.expectedMarkers.push_back("addrspace(3)");
+    plan.expectedMarkers.push_back("no_dma_descriptors");
+    plan.expectedMarkers.push_back("no_fence_iorw");
+    plan.hasLowering = true;
+    return plan;
   }
 
   rejectReasonCode = "unsupported_pattern";
@@ -1098,22 +1302,147 @@ matchRowResidentCandidate(ArrayRef<scf::ForOp> loops,
   return std::nullopt;
 }
 
+static bool loopContainsTransferWrite(scf::ForOp forOp) {
+  bool found = false;
+  forOp.getBody()->walk([&](vector::TransferWriteOp) {
+    found = true;
+    return WalkResult::interrupt();
+  });
+  return found;
+}
+
+static std::optional<ReductionResidencyPlan>
+matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
+                          FunctionOpInterface funcOp,
+                          std::string &rejectReasonCode,
+                          std::string &rejectReason) {
+  if (loops.size() < 3) {
+    rejectReasonCode = "unsupported_pattern";
+    rejectReason = "expected three top-level Softmax row loops";
+    return std::nullopt;
+  }
+
+  for (size_t i = 0; i + 2 < loops.size(); ++i) {
+    scf::ForOp maxLoop = loops[i];
+    scf::ForOp sumLoop = loops[i + 1];
+    scf::ForOp normLoop = loops[i + 2];
+    if (!sameStaticLoopShape(maxLoop, sumLoop) ||
+        !sameStaticLoopShape(maxLoop, normLoop))
+      continue;
+
+    SmallVector<TiledLoadInfo> maxLoads = findTiledLoads(maxLoop);
+    SmallVector<TiledLoadInfo> sumLoads = findTiledLoads(sumLoop);
+    SmallVector<TiledLoadInfo> normLoads = findTiledLoads(normLoop);
+    if (maxLoads.size() != 1 || sumLoads.size() != 1 ||
+        normLoads.empty() || !loopContainsTransferWrite(normLoop))
+      continue;
+
+    BlockArgument maxArg =
+        traceFunctionArgument(maxLoads[0].readOp.getBase(), funcOp);
+    BlockArgument sumArg =
+        traceFunctionArgument(sumLoads[0].readOp.getBase(), funcOp);
+    if (!maxArg || !sumArg || maxArg != sumArg)
+      continue;
+
+    std::optional<TiledLoadInfo> normXLoad;
+    for (TiledLoadInfo load : normLoads) {
+      if (traceFunctionArgument(load.readOp.getBase(), funcOp) == maxArg) {
+        normXLoad = load;
+        break;
+      }
+    }
+    if (!normXLoad)
+      continue;
+
+    unsigned elemBytes = 0;
+    unsigned elemBytesSum = 0;
+    unsigned elemBytesNorm = 0;
+    if (!isSupportedRowResidentXLoad(maxLoads[0], maxLoop, elemBytes) ||
+        !isSupportedRowResidentXLoad(sumLoads[0], sumLoop, elemBytesSum) ||
+        !isSupportedRowResidentXLoad(*normXLoad, normLoop, elemBytesNorm) ||
+        elemBytes != elemBytesSum || elemBytes != elemBytesNorm) {
+      rejectReasonCode = "unsupported_pattern";
+      rejectReason =
+          "candidate requires rank-1 contiguous fp32 x loads with static "
+          "BLOCK_N-sized loop steps";
+      return std::nullopt;
+    }
+
+    auto lbCst = getConstantIntValue(maxLoop.getLowerBound());
+    auto ubCst = getConstantIntValue(maxLoop.getUpperBound());
+    auto stepCst = getConstantIntValue(maxLoop.getStep());
+    if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
+        (*ubCst - *lbCst) % *stepCst != 0) {
+      rejectReasonCode = "dynamic_shape_or_stride";
+      rejectReason = "loop bounds/step are not static with exact trip count";
+      return std::nullopt;
+    }
+
+    int64_t trips = (*ubCst - *lbCst) / *stepCst;
+    if (trips <= 0) {
+      rejectReasonCode = "unsupported_pattern";
+      rejectReason = "loop trip count must be positive";
+      return std::nullopt;
+    }
+
+    int64_t rowBytes = trips * maxLoads[0].tileBytes;
+    int64_t rowElements = trips * maxLoads[0].vecTy.getNumElements();
+    ReductionResidencyPlan plan;
+    plan.source = "Softmax x row";
+    plan.sourceArg = maxArg;
+    plan.producer =
+        ReductionLoopResidencyUse{"max", maxLoop, maxLoads[0]};
+    plan.consumers.push_back(
+        ReductionLoopResidencyUse{"exp_sum", sumLoop, sumLoads[0]});
+    plan.consumers.push_back(
+        ReductionLoopResidencyUse{"normalize_store", normLoop, *normXLoad});
+    plan.loops.push_back(maxLoop);
+    plan.loops.push_back(sumLoop);
+    plan.loops.push_back(normLoop);
+    plan.shape.push_back(rowElements);
+    plan.trips = trips;
+    plan.bytes = rowBytes;
+    plan.elemBytes = elemBytes;
+    plan.uses = 3;
+    plan.requiredSpmSlots = 1;
+    plan.producerPass = ReductionProducerPass::FillOnFirstPass;
+    plan.bufferRole = ReductionBufferRole::ResidentRow;
+    plan.rotationPolicy = ReductionRotationPolicy::None;
+    plan.copyInMode = ReductionCopyInMode::CpuDirect;
+    plan.copyIn = "CPU/vector store";
+    plan.copyOut = "none";
+    plan.overhead =
+        "first pass would materialize each x chunk into SPM; no Softmax "
+        "lowering template exists yet";
+    plan.benefit =
+        "x[row, :] would be reused by exp/sum and normalize/store passes";
+    plan.expectedMarkers.push_back("addrspace(3)");
+    plan.expectedMarkers.push_back("no_dma_descriptors");
+    plan.expectedMarkers.push_back("no_fence_iorw");
+    plan.hasLowering = false;
+    return plan;
+  }
+
+  rejectReasonCode = "unsupported_pattern";
+  rejectReason = "no Softmax-style row-resident candidate matched";
+  return std::nullopt;
+}
+
 static SPMProfitabilityEvidence
-evaluateD3RowResidentProfitability(const RowResidentCandidate &candidate,
+evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
                                    int64_t spmSize) {
-  int64_t rowElements =
-      candidate.trips * candidate.mean.xLoad.vecTy.getNumElements();
   int64_t rowResidentDescriptors = 0;
   int64_t rowResidentWaits = 0;
-  int64_t avoidedBytes = candidate.rowBytes * 2;
+  int64_t avoidedBytes = plan.bytes * std::max<int64_t>(0, plan.uses - 1);
+  int64_t rowElements = plan.shape.empty() ? 0 : plan.shape.front();
 
-  if (candidate.rowBytes > spmSize) {
+  if (plan.bytes > spmSize) {
     return makeD3ProfitabilityEvidence(
         "reject", "spm_capacity_overflow",
         "D3 static model rejects row residency because one row exceeds SPM "
         "capacity",
-        rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
-        avoidedBytes, candidate.rowBytes, /*uses=*/3);
+        rowResidentDescriptors, rowResidentWaits, plan.bytes,
+        avoidedBytes, plan.bytes, plan.uses);
   }
 
   if (rowElements < 512) {
@@ -1122,8 +1451,8 @@ evaluateD3RowResidentProfitability(const RowResidentCandidate &candidate,
         "D3 static model rejects small rows until fill-on-first-pass "
         "row-resident measurements prove the SPM store/read overhead is "
         "amortized",
-        rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
-        avoidedBytes, candidate.rowBytes, /*uses=*/3);
+        rowResidentDescriptors, rowResidentWaits, plan.bytes,
+        avoidedBytes, plan.bytes, plan.uses);
   }
 
   return makeD3ProfitabilityEvidence(
@@ -1131,8 +1460,8 @@ evaluateD3RowResidentProfitability(const RowResidentCandidate &candidate,
       "D3 static model accepts fill-on-first-pass row residency for rows with "
       "enough vector work: no DMA descriptors or waits, bounded row lifetime, "
       "and x is reused after the first pass",
-      rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
-      avoidedBytes, candidate.rowBytes, /*uses=*/3);
+      rowResidentDescriptors, rowResidentWaits, plan.bytes,
+      avoidedBytes, plan.bytes, plan.uses);
 }
 
 static SPMProfitabilityEvidence
@@ -1163,14 +1492,10 @@ evaluateD3StreamingReductionProfitability(scf::ForOp forOp,
 }
 
 static SPMPromotionRejection makeD3RowResidentProfitabilityRejection(
-    const RowResidentCandidate &candidate,
+    const ReductionResidencyPlan &plan,
     SPMProfitabilityEvidence evidence) {
-  SmallVector<int64_t> shape;
-  shape.push_back(candidate.trips *
-                  candidate.mean.xLoad.vecTy.getNumElements());
-  SPMPromotionRejection rejection = makeRowResidentRejection(
-      evidence.reasonCode, evidence.reason, shape, /*uses=*/3,
-      candidate.rowBytes);
+  SPMPromotionRejection rejection = makeReductionResidencyRejection(
+      plan, evidence.reasonCode, evidence.reason);
   attachD3Profitability(rejection, std::move(evidence));
   return rejection;
 }
@@ -1191,7 +1516,7 @@ static SPMPromotionRejection makeD3StreamingReductionRejection(
   return rejection;
 }
 
-static scf::ForOp cloneLoopWithRowResidentX(RowResidentLoopInfo loopInfo,
+static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
                                             int64_t rowSpmAddress,
                                             unsigned elemBytes,
                                             bool fillSpmFromOriginalRead) {
@@ -1260,77 +1585,78 @@ static scf::ForOp cloneLoopWithRowResidentX(RowResidentLoopInfo loopInfo,
   return newForOp;
 }
 
-static bool transformRowResidentCandidate(
-    RowResidentCandidate &candidate, int64_t spmBase, int64_t spmSize,
+static void markResidencyPlanLoopsHandled(
+    const ReductionResidencyPlan &plan,
+    llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
+  for (scf::ForOp forOp : plan.loops)
+    rowResidentHandledLoops.insert(forOp.getOperation());
+}
+
+static bool transformReductionResidencyPlan(
+    ReductionResidencyPlan &plan, int64_t spmBase, int64_t spmSize,
     int64_t rowResidentMaxBytes, bool enablePromotionProfitability,
     SPMPromotionReport *report,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
   auto reject = [&](StringRef reasonCode, StringRef reason) {
-    if (report) {
-      SmallVector<int64_t> shape;
-      if (candidate.trips > 0)
-        shape.push_back(candidate.trips *
-                        candidate.mean.xLoad.vecTy.getNumElements());
-      report->rejections.push_back(makeRowResidentRejection(
-          reasonCode, reason, shape, /*uses=*/3, candidate.rowBytes));
-    }
-    rowResidentHandledLoops.insert(candidate.mean.forOp.getOperation());
-    rowResidentHandledLoops.insert(candidate.variance.forOp.getOperation());
-    rowResidentHandledLoops.insert(candidate.normalize.forOp.getOperation());
+    if (report)
+      report->rejections.push_back(
+          makeReductionResidencyRejection(plan, reasonCode, reason));
+    markResidencyPlanLoopsHandled(plan, rowResidentHandledLoops);
     return false;
   };
 
+  if (!plan.hasLowering)
+    return reject("unsupported_reduction_residency_plan",
+                  "row/block-resident reduction plan was detected, but no "
+                  "lowering template exists yet; leave cache-path IR");
   if (rowResidentMaxBytes <= 0)
     return reject("unsupported_config",
                   "row-resident max bytes must be positive");
-  if (candidate.rowBytes > rowResidentMaxBytes)
+  if (plan.bytes > rowResidentMaxBytes)
     return reject("spm_capacity_overflow",
                   "row bytes exceed the D2 row-resident prototype budget");
   if (enablePromotionProfitability) {
     SPMProfitabilityEvidence evidence =
-        evaluateD3RowResidentProfitability(candidate, spmSize);
+        evaluateD3RowResidentProfitability(plan, spmSize);
     if (evidence.decision != "accept") {
       if (report)
         report->rejections.push_back(
-            makeD3RowResidentProfitabilityRejection(candidate,
+            makeD3RowResidentProfitabilityRejection(plan,
                                                     std::move(evidence)));
-      rowResidentHandledLoops.insert(candidate.mean.forOp.getOperation());
-      rowResidentHandledLoops.insert(candidate.variance.forOp.getOperation());
-      rowResidentHandledLoops.insert(candidate.normalize.forOp.getOperation());
+      markResidencyPlanLoopsHandled(plan, rowResidentHandledLoops);
       return false;
     }
   }
 
   SPMSpaceManager spmLayout(spmBase, spmSize);
-  auto allocRow = spmLayout.alloc(candidate.rowBytes, /*alignment=*/1,
+  auto allocRow = spmLayout.alloc(plan.bytes, /*alignment=*/1,
                                   SPMSpaceManager::Lifetime::Loop);
   if (!allocRow)
     return reject("spm_capacity_overflow",
                   "SPM capacity cannot fit one resident x row");
 
   scf::ForOp newMean =
-      cloneLoopWithRowResidentX(candidate.mean, allocRow->address,
-                                candidate.elemBytes,
+      cloneLoopWithRowResidentX(plan.producer, allocRow->address,
+                                plan.elemBytes,
                                 /*fillSpmFromOriginalRead=*/true);
   scf::ForOp newVariance =
-      cloneLoopWithRowResidentX(candidate.variance, allocRow->address,
-                                candidate.elemBytes,
+      cloneLoopWithRowResidentX(plan.consumers[0], allocRow->address,
+                                plan.elemBytes,
                                 /*fillSpmFromOriginalRead=*/false);
   scf::ForOp newNormalize =
-      cloneLoopWithRowResidentX(candidate.normalize, allocRow->address,
-                                candidate.elemBytes,
+      cloneLoopWithRowResidentX(plan.consumers[1], allocRow->address,
+                                plan.elemBytes,
                                 /*fillSpmFromOriginalRead=*/false);
   rowResidentHandledLoops.insert(newMean.getOperation());
   rowResidentHandledLoops.insert(newVariance.getOperation());
   rowResidentHandledLoops.insert(newNormalize.getOperation());
 
   if (report) {
-    SPMPromotionRecord record = makeRowResidentRecord(
-        candidate.mean.xLoad.vecTy, candidate.trips, candidate.rowBytes,
-        allocRow->address);
+    SPMPromotionRecord record =
+        makeReductionResidencyRecord(plan, allocRow->address);
     if (enablePromotionProfitability) {
       SPMProfitabilityEvidence evidence =
-          evaluateD3RowResidentProfitability(candidate, spmSize);
+          evaluateD3RowResidentProfitability(plan, spmSize);
       attachD3Profitability(record, std::move(evidence));
     }
     report->records.push_back(std::move(record));
@@ -2221,19 +2547,24 @@ struct ConvertMemoryToSPM
 
         std::string rejectReasonCode;
         std::string rejectReason;
-        auto candidate = matchRowResidentCandidate(
+        auto plan = matchLayerNormResidencyPlan(
             topLevelLoops, funcOp, rejectReasonCode, rejectReason);
-        if (!candidate) {
-          if (report && !rejectReasonCode.empty())
+        if (!plan) {
+          plan = matchSoftmaxResidencyPlan(topLevelLoops, funcOp,
+                                           rejectReasonCode, rejectReason);
+        }
+        if (!plan) {
+          if (report && !rejectReasonCode.empty()) {
             report->rejections.push_back(makeRowResidentRejection(
                 rejectReasonCode, rejectReason));
+          }
           return;
         }
 
-        transformRowResidentCandidate(*candidate, spmBase, spmSize,
-                                      rowResidentMaxBytes,
-                                      enablePromotionProfitability, report,
-                                      rowResidentHandledLoops);
+        transformReductionResidencyPlan(*plan, spmBase, spmSize,
+                                        rowResidentMaxBytes,
+                                        enablePromotionProfitability, report,
+                                        rowResidentHandledLoops);
       });
     }
 
