@@ -13,6 +13,7 @@
 // RUN: rm -rf %t.softmax && mkdir -p %t.softmax
 // RUN: env KERNEL_AUX_FILE_DIR=%t.softmax triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=8192 promotion-report=1" | FileCheck %s --check-prefix=SOFTMAXIR
 // RUN: cat %t.softmax/softmax_row_resident_plan_promotions.json | FileCheck %s --check-prefix=SOFTMAXREPORT
+// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=4096 row-resident-producer-pass=producer_store" | FileCheck %s --check-prefix=PRODUCER
 
 // ROW-LABEL: @layer_norm_row_resident
 // ROW:      scf.for
@@ -101,25 +102,27 @@
 // D3REPORT:      "uses": 3
 
 // SOFTMAXIR-LABEL: @softmax_row_resident_plan
-// SOFTMAXIR-NOT:   memref<64xf32, strided<[1]>, 3>
 // SOFTMAXIR-NOT:   triton_cpu.dma_enqueue_2d
-// SOFTMAXIR:       vector.transfer_read {{.*}} memref<1024xf32, strided<[1]>>
+// SOFTMAXIR:       scf.for
+// SOFTMAXIR:         vector.transfer_read {{.*}} memref<1024xf32, strided<[1]>>
+// SOFTMAXIR:         vector.transfer_write {{.*}} memref<64xf32, strided<[1]>, 3>
+// SOFTMAXIR:       scf.for
+// SOFTMAXIR:         vector.transfer_read {{.*}} memref<64xf32, strided<[1]>, 3>
+// SOFTMAXIR:       scf.for
+// SOFTMAXIR:         vector.transfer_read {{.*}} memref<64xf32, strided<[1]>, 3>
 // SOFTMAXIR:       vector.transfer_write {{.*}} memref<1024xf32, strided<[1]>>
 // SOFTMAXIR:       tt.return
 
 // SOFTMAXREPORT:      "kernel": "softmax_row_resident_plan"
-// SOFTMAXREPORT:      "promotions": [
-// SOFTMAXREPORT-NEXT:   ],
-// SOFTMAXREPORT:      "status": "rejected"
-// SOFTMAXREPORT:      "pattern": "row_resident_reduction"
+// SOFTMAXREPORT:      "status": "accepted"
 // SOFTMAXREPORT:      "source": "Softmax x row"
-// SOFTMAXREPORT:      "scope": "program-row candidate"
+// SOFTMAXREPORT:      "scope": "program-row"
 // SOFTMAXREPORT:      "shape": [1024]
 // SOFTMAXREPORT:      "uses": 3
 // SOFTMAXREPORT:      "copy_in": "CPU/vector store"
 // SOFTMAXREPORT:      "copy_out": "none"
 // SOFTMAXREPORT:      "bytes": 4096
-// SOFTMAXREPORT:      "reason_code": "unsupported_reduction_residency_plan"
+// SOFTMAXREPORT:      "reason_code": "accepted_fill_on_first_pass_row_resident"
 // SOFTMAXREPORT:      "residency_plan": {
 // SOFTMAXREPORT:      "producer_pass": "fill_on_first_pass"
 // SOFTMAXREPORT:      "consumer_passes": ["exp_sum", "normalize_store"]
@@ -127,6 +130,20 @@
 // SOFTMAXREPORT:      "rotation_policy": "none"
 // SOFTMAXREPORT:      "copy_in_mode": "cpu_direct"
 // SOFTMAXREPORT:      "required_spm_slots": 1
+
+// PRODUCER-LABEL: @layer_norm_row_resident
+// PRODUCER:      scf.for
+// PRODUCER:        vector.transfer_read {{.*}} memref<64xf32, strided<[1]>>
+// PRODUCER-NOT:    memref<8xf32, strided<[1]>, 3>
+// PRODUCER:      scf.for
+// PRODUCER:        vector.transfer_read {{.*}} memref<64xf32, strided<[1]>>
+// PRODUCER:        vector.transfer_write {{.*}} memref<8xf32, strided<[1]>, 3>
+// PRODUCER:      scf.for
+// PRODUCER:        vector.transfer_read {{.*}} memref<8xf32, strided<[1]>, 3>
+// PRODUCER:        vector.transfer_read {{.*}} memref<64xf32, strided<[1]>
+// PRODUCER:        vector.transfer_read {{.*}} memref<64xf32, strided<[1]>
+// PRODUCER-NOT:  triton_cpu.dma_enqueue_2d
+// PRODUCER:      tt.return
 
 module {
   tt.func public @layer_norm_row_resident(

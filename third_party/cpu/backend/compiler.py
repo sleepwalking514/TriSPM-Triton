@@ -239,6 +239,9 @@ class CPUBackend(BaseBackend):
                     "TRITON_ENABLE_SPM_ROW_RESIDENT_REDUCTIONS", False)
                 row_resident_max_bytes = int(
                     os.getenv("TRITON_SPM_ROW_RESIDENT_MAX_BYTES", "4096"), 0)
+                row_resident_producer_pass = os.getenv(
+                    "TRITON_SPM_ROW_RESIDENT_PRODUCER_PASS",
+                    "fill_on_first_pass")
                 enable_promotion_profitability = env_bool(
                     "TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY", False)
                 promotion_report = env_bool("TRITON_SPM_PROMOTION_REPORT", False)
@@ -249,7 +252,8 @@ class CPUBackend(BaseBackend):
                 cpu.passes.ttcpuir.add_convert_memory_to_spm(
                     pm, spm_base, spm_size, micro_m, window_k,
                     enable_reductions, enable_row_resident_reductions,
-                    row_resident_max_bytes, enable_promotion_profitability,
+                    row_resident_max_bytes, row_resident_producer_pass,
+                    enable_promotion_profitability,
                     promotion_report)
 
                 # Split large vector.contract into register-friendly

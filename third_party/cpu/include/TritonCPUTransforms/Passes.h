@@ -68,6 +68,7 @@ createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
                          bool enableReductions,
                          bool enableRowResidentReductions,
                          int64_t rowResidentMaxBytes,
+                         StringRef rowResidentProducerPass,
                          bool enablePromotionProfitability,
                          bool promotionReport);
 
