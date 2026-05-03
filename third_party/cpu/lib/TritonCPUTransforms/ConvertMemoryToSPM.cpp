@@ -589,6 +589,8 @@ static ReductionProducerPass parseReductionProducerPass(StringRef mode) {
   if (mode == "producer_store" || mode == "second" ||
       mode == "second_pass" || mode == "consumer_store")
     return ReductionProducerPass::ProducerStore;
+  if (mode == "dma_prefetch" || mode == "dma" || mode == "prefetch")
+    return ReductionProducerPass::DmaPrefetch;
   return ReductionProducerPass::FillOnFirstPass;
 }
 
@@ -596,18 +598,38 @@ static void applyConfiguredProducerPass(ReductionResidencyPlan &plan,
                                         StringRef producerPassMode) {
   ReductionProducerPass producerPass =
       parseReductionProducerPass(producerPassMode);
-  if (producerPass != ReductionProducerPass::ProducerStore ||
-      plan.consumers.empty())
+  if (producerPass == ReductionProducerPass::FillOnFirstPass)
     return;
 
-  plan.producerPass = ReductionProducerPass::ProducerStore;
-  plan.copyIn = "CPU/vector store from " + plan.consumers.front().passName;
+  if (producerPass == ReductionProducerPass::ProducerStore) {
+    if (plan.consumers.empty())
+      return;
+    plan.producerPass = ReductionProducerPass::ProducerStore;
+    plan.copyIn = "CPU/vector store from " + plan.consumers.front().passName;
+    plan.overhead =
+        "first reduction pass stays on the original path; the next pass writes "
+        "each loaded x chunk into SPM for later reuse";
+    plan.benefit =
+        "avoids one SPM read from the fill-on-first-pass schedule while still "
+        "using SPM for the final x reuse pass";
+    return;
+  }
+
+  plan.producerPass = ReductionProducerPass::DmaPrefetch;
+  plan.bufferRole = ReductionBufferRole::ResidentRow;
+  plan.rotationPolicy = ReductionRotationPolicy::DoubleBuffer;
+  plan.copyInMode = ReductionCopyInMode::Dma;
+  plan.copyIn = "DMA prefetch";
   plan.overhead =
-      "first reduction pass stays on the original path; the next pass writes "
-      "each loaded x chunk into SPM for later reuse";
+      "producer pass waits for each DMA-filled x chunk and prefetches the next "
+      "chunk while computing the current reduction chunk";
   plan.benefit =
-      "avoids one SPM read from the fill-on-first-pass schedule while still "
-      "using SPM for the final x reuse pass";
+      "x[row, :] is materialized through DMA into SPM and reused by every "
+      "reduction pass";
+  plan.expectedMarkers.clear();
+  plan.expectedMarkers.push_back("addrspace(3)");
+  plan.expectedMarkers.push_back("dma_descriptors");
+  plan.expectedMarkers.push_back("fence_iorw");
 }
 
 static bool isGemmContract(vector::ContractionOp op) {
@@ -957,6 +979,10 @@ static SPMPromotionRecord makeReductionResidencyRecord(
     record.reason =
         "accepted by the opt-in producer-store row-resident reduction "
         "prototype";
+  } else if (plan.producerPass == ReductionProducerPass::DmaPrefetch) {
+    record.reasonCode = "accepted_dma_prefetch_row_resident";
+    record.reason =
+        "accepted by the opt-in DMA-prefetch row-resident reduction prototype";
   } else {
     record.reasonCode = "accepted_fill_on_first_pass_row_resident";
     record.reason =
@@ -1640,6 +1666,107 @@ static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
   return newForOp;
 }
 
+static bool lowerDmaPrefetchRowResidentX(
+    ReductionLoopResidencyUse loopInfo, int64_t rowSpmAddress,
+    unsigned elemBytes) {
+  scf::ForOp forOp = loopInfo.forOp;
+  vector::TransferReadOp xRead = loopInfo.xLoad.readOp;
+  auto memRefTy = dyn_cast<MemRefType>(xRead.getBase().getType());
+  if (!memRefTy)
+    return false;
+
+  auto stepBytes = getLoopStepBytes(xRead, forOp, /*requireLoopIv=*/true);
+  if (!stepBytes)
+    return false;
+
+  Location loc = forOp.getLoc();
+  InsertedBeforeGuard guard(forOp.getOperation());
+  OpBuilder b(forOp);
+
+  Value dramAddr = computePrologueDramAddr(b, loc, xRead, forOp);
+  if (!dramAddr) {
+    guard.cleanup();
+    return false;
+  }
+
+  emitDmaEnqueue(b, loc, i64Cst(b, loc, rowSpmAddress), dramAddr,
+                 loopInfo.xLoad.vecTy, memRefTy);
+
+  auto newForOp = scf::ForOp::create(
+      b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
+      forOp.getInitArgs());
+
+  Block *newBody = newForOp.getBody();
+  Block *oldBody = forOp.getBody();
+
+  IRMapping mapping;
+  mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  unsigned numOldArgs = forOp.getRegionIterArgs().size();
+  for (unsigned i = 0; i < numOldArgs; ++i)
+    mapping.map(forOp.getRegionIterArgs()[i], newForOp.getRegionIterArgs()[i]);
+
+  b.setInsertionPointToStart(newBody);
+  if (!newBody->empty() && newBody->mightHaveTerminator())
+    newBody->getTerminator()->erase();
+
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  Value iv = newForOp.getInductionVar();
+  Value step = newForOp.getStep();
+  Value ub = newForOp.getUpperBound();
+  Value nextIv = arith::AddIOp::create(b, loc, iv, step);
+  Value hasNext = arith::CmpIOp::create(
+      b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+
+  Value lbInLoop = newForOp.getLowerBound();
+  Value currentOff = arith::SubIOp::create(b, loc, iv, lbInLoop);
+  Value currentOffI64 = toI64(b, loc, currentOff);
+  Value currentByteOff = arith::MulIOp::create(
+      b, loc, currentOffI64, i64Cst(b, loc, elemBytes));
+  Value residentSpmAddr = arith::AddIOp::create(
+      b, loc, i64Cst(b, loc, rowSpmAddress), currentByteOff);
+
+  Value nextOff = arith::SubIOp::create(b, loc, nextIv, lbInLoop);
+  Value nextOffI64 = toI64(b, loc, nextOff);
+  auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
+  b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  Value nextByteOff = arith::MulIOp::create(
+      b, loc, nextOffI64, i64Cst(b, loc, *stepBytes));
+  Value nextDram = arith::AddIOp::create(b, loc, dramAddr, nextByteOff);
+  Value nextSpmAddr = arith::AddIOp::create(
+      b, loc, i64Cst(b, loc, rowSpmAddress),
+      arith::MulIOp::create(b, loc, nextOffI64, i64Cst(b, loc, elemBytes)));
+  emitDmaEnqueue(b, loc, nextSpmAddr, nextDram, loopInfo.xLoad.vecTy,
+                 memRefTy);
+  b.setInsertionPointAfter(ifOp);
+
+  for (auto &op : oldBody->getOperations()) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+
+    if (&op == xRead.getOperation()) {
+      Value spmVal = emitSpmRead(b, loc, residentSpmAddr,
+                                 loopInfo.xLoad.vecTy);
+      mapping.map(xRead.getResult(), spmVal);
+      continue;
+    }
+
+    b.clone(op, mapping);
+  }
+
+  auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
+  SmallVector<Value> yieldVals;
+  for (Value val : oldYield.getOperands())
+    yieldVals.push_back(mapping.lookupOrDefault(val));
+  scf::YieldOp::create(b, loc, yieldVals);
+
+  for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+    forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
+  guard.commit();
+  forOp.erase();
+  return true;
+}
+
 static void markResidencyPlanLoopsHandled(
     const ReductionResidencyPlan &plan,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
@@ -1688,7 +1815,7 @@ static bool transformReductionResidencyPlan(
                                   SPMSpaceManager::Lifetime::Loop);
   if (!allocRow)
     return reject("spm_capacity_overflow",
-                  "SPM capacity cannot fit one resident x row");
+                  "SPM capacity cannot fit the resident x row schedule");
 
   if (plan.producerPass == ReductionProducerPass::FillOnFirstPass) {
     scf::ForOp newProducer =
@@ -1718,6 +1845,19 @@ static bool transformReductionResidencyPlan(
       scf::ForOp newConsumer =
           cloneLoopWithRowResidentX(consumer, allocRow->address,
                                     plan.elemBytes,
+                                    /*fillSpmFromOriginalRead=*/false);
+          rowResidentHandledLoops.insert(newConsumer.getOperation());
+      }
+  } else if (plan.producerPass == ReductionProducerPass::DmaPrefetch) {
+    if (!lowerDmaPrefetchRowResidentX(plan.producer, allocRow->address,
+                                      plan.elemBytes))
+      return reject("unsupported_reduction_residency_plan",
+                    "DMA-prefetch row residency could not lower the producer "
+                    "loop");
+    rowResidentHandledLoops.insert(plan.producer.forOp.getOperation());
+    for (const ReductionLoopResidencyUse &consumer : plan.consumers) {
+      scf::ForOp newConsumer =
+          cloneLoopWithRowResidentX(consumer, allocRow->address, plan.elemBytes,
                                     /*fillSpmFromOriginalRead=*/false);
       rowResidentHandledLoops.insert(newConsumer.getOperation());
     }

@@ -280,7 +280,7 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
                "Maximum row bytes accepted by the row-resident reduction prototype.">,
         Option<"rowResidentProducerPass", "row-resident-producer-pass",
                "std::string", /*default*/"\"fill_on_first_pass\"",
-               "Row-resident reduction producer schedule: fill_on_first_pass or producer_store.">,
+               "Row-resident reduction producer schedule: fill_on_first_pass, producer_store, or dma_prefetch.">,
         Option<"enablePromotionProfitability", "enable-promotion-profitability",
                "bool", /*default*/"false",
                "Enable the D3 conservative promotion profitability model.">,
