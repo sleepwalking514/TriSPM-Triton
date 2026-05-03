@@ -247,6 +247,36 @@ static Value computePrologueDramAddr(OpBuilder &b, Location loc,
   return arith::AddIOp::create(b, loc, ptrI64, byteOff);
 }
 
+/// Compute the DRAM byte address represented by a tensor pointer value.
+static Value computeTensorPtrDramAddr(OpBuilder &b, Location loc,
+                                      Value tensorPtr,
+                                      MemRefType memRefTy) {
+  unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides))
+    return nullptr;
+
+  Value memRef = triton::cpu::ExtractMemRefOp::create(
+      b, loc, memRefTy, tensorPtr);
+  auto indicesOp = triton::cpu::ExtractIndicesOp::create(b, loc, tensorPtr);
+  if (indicesOp.getNumResults() != strides.size())
+    return nullptr;
+
+  Value ptrIdx = memref::ExtractAlignedPointerAsIndexOp::create(
+      b, loc, memRef);
+  Value ptrI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), ptrIdx);
+
+  Value byteOff = i64Cst(b, loc, 0);
+  for (auto [idx, stride] : llvm::zip_equal(indicesOp.getResults(), strides)) {
+    Value idxI64 = toI64(b, loc, idx);
+    Value contrib = arith::MulIOp::create(
+        b, loc, idxI64, i64Cst(b, loc, stride * elemBytes));
+    byteOff = arith::AddIOp::create(b, loc, byteOff, contrib);
+  }
+  return arith::AddIOp::create(b, loc, ptrI64, byteOff);
+}
+
 static bool isLoopBlockPtrTransfer(vector::TransferReadOp readOp,
                                    scf::ForOp forOp) {
   auto *baseDefOp = readOp.getBase().getDefiningOp();
@@ -332,6 +362,55 @@ static void emitDmaEnqueue(OpBuilder &b, Location loc,
       i64Cst(b, loc, cols * elemBytes));   // dst_stride (packed)
 }
 
+static bool hasColMajorRowBlockDmaLayout(VectorType vecTy, MemRefType memRefTy) {
+  if (vecTy.getRank() != 2)
+    return false;
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides) || strides.size() < 2)
+    return false;
+  return strides[0] == 1 && strides[1] > vecTy.getShape()[0];
+}
+
+static void emitRowBlockDmaEnqueue(OpBuilder &b, Location loc,
+                                   Value spmAddr, Value dramAddr,
+                                   VectorType vecTy, MemRefType memRefTy) {
+  unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+  auto shape = vecTy.getShape();
+  if (!hasColMajorRowBlockDmaLayout(vecTy, memRefTy)) {
+    emitDmaEnqueue(b, loc, spmAddr, dramAddr, vecTy, memRefTy);
+    return;
+  }
+
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  (void)memRefTy.getStridesAndOffset(strides, offset);
+  int64_t columns = shape[0];
+  int64_t rows = shape[1];
+  triton::cpu::DmaEnqueue2DOp::create(
+      b, loc,
+      spmAddr, dramAddr,
+      i64Cst(b, loc, columns * elemBytes),      // width: one row chunk
+      i64Cst(b, loc, rows),                     // height: row block
+      i64Cst(b, loc, strides[1] * elemBytes),   // source row stride
+      i64Cst(b, loc, columns * elemBytes));     // packed SPM row stride
+}
+
+static SmallVector<int64_t, 2>
+getDefaultSpmMemStrides(VectorType vecTy) {
+  auto shape = vecTy.getShape();
+  int64_t cols = (shape.size() >= 2) ? shape[1] : shape[0];
+  if (vecTy.getRank() == 1)
+    return SmallVector<int64_t, 2>{1};
+  return SmallVector<int64_t, 2>{cols, 1};
+}
+
+static SmallVector<int64_t, 2>
+getRowBlockDmaSpmMemStrides(VectorType vecTy, MemRefType memRefTy) {
+  if (!hasColMajorRowBlockDmaLayout(vecTy, memRefTy))
+    return getDefaultSpmMemStrides(vecTy);
+  return SmallVector<int64_t, 2>{1, vecTy.getShape()[0]};
+}
+
 /// Create a memref in SPM address space (3) via reinterpret_cast, and
 /// emit a vector.transfer_read from it.
 ///
@@ -339,20 +418,14 @@ static void emitDmaEnqueue(OpBuilder &b, Location loc,
 /// using unrealized_conversion_cast (i64 → memref), then reinterpret_cast
 /// it to the desired shape.  The LLVM lowering will turn this into an
 /// inttoptr + load from address space 3.
-static Value emitSpmRead(OpBuilder &b, Location loc,
-                         Value spmAddr, VectorType vecTy) {
+static Value emitSpmReadWithStrides(OpBuilder &b, Location loc,
+                                    Value spmAddr, VectorType vecTy,
+                                    ArrayRef<int64_t> memStrides) {
   auto shape = vecTy.getShape();
-  int64_t cols = (shape.size() >= 2) ? shape[1] : shape[0];
   auto elemTy = vecTy.getElementType();
 
   // Build the target SPM memref type: packed layout, address space 3.
   SmallVector<int64_t> memShape(shape.begin(), shape.end());
-  SmallVector<int64_t> memStrides;
-  if (vecTy.getRank() == 1) {
-    memStrides = {1};
-  } else {
-    memStrides = {cols, 1};
-  }
   auto layout = StridedLayoutAttr::get(b.getContext(), 0, memStrides);
   auto spmMemRefTy = MemRefType::get(
       memShape, elemTy, layout,
@@ -387,21 +460,21 @@ static Value emitSpmRead(OpBuilder &b, Location loc,
       SmallVector<bool>(vecTy.getRank(), true));
 }
 
+static Value emitSpmRead(OpBuilder &b, Location loc,
+                         Value spmAddr, VectorType vecTy) {
+  return emitSpmReadWithStrides(b, loc, spmAddr, vecTy,
+                                getDefaultSpmMemStrides(vecTy));
+}
+
 /// Emit a vector.transfer_write to an SPM address.
-static void emitSpmWrite(OpBuilder &b, Location loc,
-                         Value spmAddr, Value value) {
+static void emitSpmWriteWithStrides(OpBuilder &b, Location loc,
+                                    Value spmAddr, Value value,
+                                    ArrayRef<int64_t> memStrides) {
   auto vecTy = cast<VectorType>(value.getType());
   auto shape = vecTy.getShape();
-  int64_t cols = (shape.size() >= 2) ? shape[1] : shape[0];
   auto elemTy = vecTy.getElementType();
 
   SmallVector<int64_t> memShape(shape.begin(), shape.end());
-  SmallVector<int64_t> memStrides;
-  if (vecTy.getRank() == 1) {
-    memStrides = {1};
-  } else {
-    memStrides = {cols, 1};
-  }
   auto layout = StridedLayoutAttr::get(b.getContext(), 0, memStrides);
   auto spmMemRefTy = MemRefType::get(
       memShape, elemTy, layout,
@@ -428,6 +501,13 @@ static void emitSpmWrite(OpBuilder &b, Location loc,
   vector::TransferWriteOp::create(
       b, loc, value, spmView, zeroIndices,
       SmallVector<bool>(vecTy.getRank(), true));
+}
+
+static void emitSpmWrite(OpBuilder &b, Location loc,
+                         Value spmAddr, Value value) {
+  auto vecTy = cast<VectorType>(value.getType());
+  emitSpmWriteWithStrides(b, loc, spmAddr, value,
+                          getDefaultSpmMemStrides(vecTy));
 }
 
 //===----------------------------------------------------------------------===//
@@ -482,6 +562,7 @@ enum class ReductionProducerPass {
 
 enum class ReductionBufferRole {
   ResidentRow,
+  ResidentRowBlock,
   PingPongChunk,
   TempVector,
   OutputTile,
@@ -514,6 +595,8 @@ static StringRef stringifyBufferRole(ReductionBufferRole role) {
   switch (role) {
   case ReductionBufferRole::ResidentRow:
     return "resident_row";
+  case ReductionBufferRole::ResidentRowBlock:
+    return "resident_row_block";
   case ReductionBufferRole::PingPongChunk:
     return "ping_pong_chunk";
   case ReductionBufferRole::TempVector:
@@ -557,11 +640,13 @@ struct ReductionResidencyPlan {
   std::string source;
   std::string scope = "program-row";
   BlockArgument sourceArg;
+  scf::ForOp rowBlockGroupLoop;
   ReductionLoopResidencyUse producer;
   SmallVector<ReductionLoopResidencyUse, 2> consumers;
   SmallVector<scf::ForOp, 3> loops;
   SmallVector<int64_t, 2> shape;
   int64_t trips = 0;
+  int64_t rowBlockGroupTrips = 0;
   int64_t bytes = 0;
   unsigned elemBytes = 0;
   int64_t uses = 0;
@@ -580,6 +665,11 @@ struct ReductionResidencyPlan {
   bool hasLowering = false;
 };
 
+static bool isRowBlockDmaProducerPassMode(StringRef mode) {
+  return mode == "row_block_dma" || mode == "dma_row_block" ||
+         mode == "row_block_dma_prefetch";
+}
+
 static ReductionProducerPass parseReductionProducerPass(StringRef mode) {
   if (mode.empty())
     return ReductionProducerPass::FillOnFirstPass;
@@ -590,6 +680,8 @@ static ReductionProducerPass parseReductionProducerPass(StringRef mode) {
       mode == "second_pass" || mode == "consumer_store")
     return ReductionProducerPass::ProducerStore;
   if (mode == "dma_prefetch" || mode == "dma" || mode == "prefetch")
+    return ReductionProducerPass::DmaPrefetch;
+  if (isRowBlockDmaProducerPassMode(mode))
     return ReductionProducerPass::DmaPrefetch;
   return ReductionProducerPass::FillOnFirstPass;
 }
@@ -615,17 +707,29 @@ static void applyConfiguredProducerPass(ReductionResidencyPlan &plan,
     return;
   }
 
+  bool preferRowBlock = isRowBlockDmaProducerPassMode(producerPassMode);
   plan.producerPass = ReductionProducerPass::DmaPrefetch;
-  plan.bufferRole = ReductionBufferRole::ResidentRow;
+  plan.bufferRole = preferRowBlock ? ReductionBufferRole::ResidentRowBlock
+                                   : ReductionBufferRole::ResidentRow;
   plan.rotationPolicy = ReductionRotationPolicy::DoubleBuffer;
   plan.copyInMode = ReductionCopyInMode::Dma;
-  plan.copyIn = "DMA prefetch";
-  plan.overhead =
-      "producer pass waits for each DMA-filled x chunk and prefetches the next "
-      "chunk while computing the current reduction chunk";
-  plan.benefit =
-      "x[row, :] is materialized through DMA into SPM and reused by every "
-      "reduction pass";
+  if (preferRowBlock) {
+    plan.copyIn = "row-block DMA prefetch";
+    plan.overhead =
+        "producer pass waits for each DMA-filled row-block chunk and "
+        "prefetches the next chunk while computing the current reduction chunk";
+    plan.benefit =
+        "x[row_block, :] is materialized through DMA into SPM and reused by "
+        "every reduction pass";
+  } else {
+    plan.copyIn = "DMA prefetch";
+    plan.overhead =
+        "producer pass waits for each DMA-filled x chunk and prefetches the "
+        "next chunk while computing the current reduction chunk";
+    plan.benefit =
+        "x[row, :] is materialized through DMA into SPM and reused by every "
+        "reduction pass";
+  }
   plan.expectedMarkers.clear();
   plan.expectedMarkers.push_back("addrspace(3)");
   plan.expectedMarkers.push_back("dma_descriptors");
@@ -1249,6 +1353,32 @@ static bool isSupportedRowResidentXLoad(TiledLoadInfo load,
          canComputePrologueDramAddr(load.readOp, forOp);
 }
 
+static bool isSupportedSoftmaxRowBlockXLoad(TiledLoadInfo load,
+                                            scf::ForOp forOp,
+                                            unsigned &elemBytes) {
+  vector::TransferReadOp readOp = load.readOp;
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!memRefTy || load.vecTy.getRank() != 2 ||
+      memRefTy.getRank() != 2 ||
+      !memRefTy.getElementType().isF32())
+    return false;
+
+  auto stepCst = getConstantIntValue(forOp.getStep());
+  if (!stepCst || *stepCst != load.vecTy.getShape()[0])
+    return false;
+
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides) || strides.size() < 2 ||
+      strides[0] != 1 || strides[1] <= load.vecTy.getShape()[0])
+    return false;
+
+  auto stepBytes =
+      getLoopStepBytes(readOp, forOp, /*requireLoopIv=*/true);
+  elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+  return stepBytes && *stepBytes == static_cast<int64_t>(elemBytes) &&
+         canComputePrologueDramAddr(readOp, forOp);
+}
+
 static std::optional<ReductionResidencyPlan>
 matchLayerNormResidencyPlan(ArrayRef<scf::ForOp> loops,
                             FunctionOpInterface funcOp,
@@ -1420,17 +1550,32 @@ matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
     if (!normXLoad)
       continue;
 
+    bool rowBlockPlan = isRowBlockDmaProducerPassMode(producerPassMode);
     unsigned elemBytes = 0;
     unsigned elemBytesSum = 0;
     unsigned elemBytesNorm = 0;
-    if (!isSupportedRowResidentXLoad(maxLoads[0], maxLoop, elemBytes) ||
-        !isSupportedRowResidentXLoad(sumLoads[0], sumLoop, elemBytesSum) ||
-        !isSupportedRowResidentXLoad(*normXLoad, normLoop, elemBytesNorm) ||
+    bool supportedLoads =
+        rowBlockPlan
+            ? (isSupportedSoftmaxRowBlockXLoad(maxLoads[0], maxLoop,
+                                               elemBytes) &&
+               isSupportedSoftmaxRowBlockXLoad(sumLoads[0], sumLoop,
+                                               elemBytesSum) &&
+               isSupportedSoftmaxRowBlockXLoad(*normXLoad, normLoop,
+                                               elemBytesNorm))
+            : (isSupportedRowResidentXLoad(maxLoads[0], maxLoop, elemBytes) &&
+               isSupportedRowResidentXLoad(sumLoads[0], sumLoop,
+                                           elemBytesSum) &&
+               isSupportedRowResidentXLoad(*normXLoad, normLoop,
+                                           elemBytesNorm));
+    if (!supportedLoads ||
         elemBytes != elemBytesSum || elemBytes != elemBytesNorm) {
       rejectReasonCode = "unsupported_pattern";
-      rejectReason =
-          "candidate requires rank-1 contiguous fp32 x loads with static "
-          "BLOCK_N-sized loop steps";
+      rejectReason = rowBlockPlan
+                         ? "row-block DMA candidate requires rank-2 "
+                           "col-major fp32 x tiles with static "
+                           "BLOCK_N-sized column steps"
+                         : "candidate requires rank-1 contiguous fp32 x "
+                           "loads with static BLOCK_N-sized loop steps";
       return std::nullopt;
     }
 
@@ -1454,7 +1599,7 @@ matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
     int64_t rowBytes = trips * maxLoads[0].tileBytes;
     int64_t rowElements = trips * maxLoads[0].vecTy.getNumElements();
     ReductionResidencyPlan plan;
-    plan.source = "Softmax x row";
+    plan.source = rowBlockPlan ? "Softmax x row block" : "Softmax x row";
     plan.sourceArg = maxArg;
     plan.producer =
         ReductionLoopResidencyUse{"max", maxLoop, maxLoads[0]};
@@ -1465,7 +1610,13 @@ matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
     plan.loops.push_back(maxLoop);
     plan.loops.push_back(sumLoop);
     plan.loops.push_back(normLoop);
-    plan.shape.push_back(rowElements);
+    if (rowBlockPlan) {
+      plan.scope = "program-row-block";
+      plan.shape.push_back(trips * maxLoads[0].vecTy.getShape()[0]);
+      plan.shape.push_back(maxLoads[0].vecTy.getShape()[1]);
+    } else {
+      plan.shape.push_back(rowElements);
+    }
     plan.trips = trips;
     plan.bytes = rowBytes;
     plan.elemBytes = elemBytes;
@@ -1492,6 +1643,83 @@ matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
 
   rejectReasonCode = "unsupported_pattern";
   rejectReason = "no Softmax-style row-resident candidate matched";
+  return std::nullopt;
+}
+
+static SmallVector<scf::ForOp, 3> collectDirectChildLoops(scf::ForOp outer) {
+  SmallVector<scf::ForOp, 3> loops;
+  for (Operation &op : outer.getBody()->without_terminator()) {
+    if (auto forOp = dyn_cast<scf::ForOp>(&op))
+      loops.push_back(forOp);
+  }
+  return loops;
+}
+
+static void rejectUnsupportedRowBlockGroup(std::string &rejectReasonCode,
+                                           std::string &rejectReason) {
+  rejectReasonCode = "unsupported_pattern";
+  rejectReason =
+      "row-block DMA group candidate requires one outer row-block loop "
+      "containing max/sum/normalize Softmax loops";
+}
+
+static std::optional<ReductionResidencyPlan>
+matchSoftmaxRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
+                                       FunctionOpInterface funcOp,
+                                       std::string &rejectReasonCode,
+                                       std::string &rejectReason,
+                                       StringRef producerPassMode) {
+  if (!isRowBlockDmaProducerPassMode(producerPassMode))
+    return std::nullopt;
+
+  for (scf::ForOp outerLoop : topLevelLoops) {
+    SmallVector<scf::ForOp, 3> childLoops = collectDirectChildLoops(outerLoop);
+    if (childLoops.size() < 3)
+      continue;
+
+    std::string childRejectCode;
+    std::string childRejectReason;
+    auto plan = matchSoftmaxResidencyPlan(childLoops, funcOp, childRejectCode,
+                                          childRejectReason,
+                                          producerPassMode);
+    if (!plan)
+      continue;
+
+    auto lbCst = getConstantIntValue(outerLoop.getLowerBound());
+    auto ubCst = getConstantIntValue(outerLoop.getUpperBound());
+    auto stepCst = getConstantIntValue(outerLoop.getStep());
+    if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
+        (*ubCst - *lbCst) % *stepCst != 0) {
+      rejectReasonCode = "dynamic_shape_or_stride";
+      rejectReason = "outer row-block loop bounds/step are not static with "
+                     "exact trip count";
+      return std::nullopt;
+    }
+
+    int64_t outerTrips = (*ubCst - *lbCst) / *stepCst;
+    if (outerTrips <= 1) {
+      rejectReasonCode = "unsupported_pattern";
+      rejectReason =
+          "outer row-block loop needs at least two trips for A/B DMA "
+          "double-buffering";
+      return std::nullopt;
+    }
+
+    plan->rowBlockGroupLoop = outerLoop;
+    plan->rowBlockGroupTrips = outerTrips;
+    plan->scope = "program-row-block-group";
+    plan->requiredSpmSlots = 2;
+    plan->overhead =
+        "row-block group schedule waits for the current DMA-filled row block "
+        "and prefetches the next row block into the alternate SPM slot while "
+        "max/sum/normalize compute consumes the current slot";
+    plan->benefit =
+        "x[row_block, :] is DMA-filled once per row block and reused by all "
+        "Softmax passes while the next row block is in flight";
+    return plan;
+  }
+
+  rejectUnsupportedRowBlockGroup(rejectReasonCode, rejectReason);
   return std::nullopt;
 }
 
@@ -1600,11 +1828,23 @@ static SPMPromotionRejection makeD3StreamingReductionRejection(
 static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
                                             int64_t rowSpmAddress,
                                             unsigned elemBytes,
-                                            bool fillSpmFromOriginalRead) {
+                                            bool fillSpmFromOriginalRead,
+                                            bool useRowBlockDmaLayout = false) {
   scf::ForOp forOp = loopInfo.forOp;
   vector::TransferReadOp xRead = loopInfo.xLoad.readOp;
   Location loc = forOp.getLoc();
   OpBuilder b(forOp);
+  auto memRefTy = dyn_cast<MemRefType>(xRead.getBase().getType());
+  bool rowBlockLayout =
+      useRowBlockDmaLayout && memRefTy &&
+      hasColMajorRowBlockDmaLayout(loopInfo.xLoad.vecTy, memRefTy);
+  SmallVector<int64_t, 2> spmMemStrides =
+      rowBlockLayout
+          ? getRowBlockDmaSpmMemStrides(loopInfo.xLoad.vecTy, memRefTy)
+          : getDefaultSpmMemStrides(loopInfo.xLoad.vecTy);
+  int64_t spmStepBytes = elemBytes;
+  if (rowBlockLayout)
+    spmStepBytes *= loopInfo.xLoad.vecTy.getShape()[1];
 
   auto newForOp = scf::ForOp::create(
       b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
@@ -1628,7 +1868,7 @@ static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
       b, loc, toI64(b, loc, newForOp.getInductionVar()),
       toI64(b, loc, newForOp.getLowerBound()));
   Value byteOffset = arith::MulIOp::create(
-      b, loc, elemOffset, i64Cst(b, loc, elemBytes));
+      b, loc, elemOffset, i64Cst(b, loc, spmStepBytes));
   Value xSpmAddr = arith::AddIOp::create(
       b, loc, i64Cst(b, loc, rowSpmAddress), byteOffset);
 
@@ -1640,12 +1880,15 @@ static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
       if (fillSpmFromOriginalRead) {
         Operation *cloned = b.clone(op, mapping);
         auto clonedRead = cast<vector::TransferReadOp>(cloned);
-        emitSpmWrite(b, loc, xSpmAddr, clonedRead.getResult());
+        emitSpmWriteWithStrides(b, loc, xSpmAddr, clonedRead.getResult(),
+                                spmMemStrides);
         mapping.map(xRead.getResult(), clonedRead.getResult());
         continue;
       }
 
-      Value spmVal = emitSpmRead(b, loc, xSpmAddr, loopInfo.xLoad.vecTy);
+      Value spmVal = emitSpmReadWithStrides(b, loc, xSpmAddr,
+                                            loopInfo.xLoad.vecTy,
+                                            spmMemStrides);
       mapping.map(xRead.getResult(), spmVal);
       continue;
     }
@@ -1668,12 +1911,22 @@ static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
 
 static bool lowerDmaPrefetchRowResidentX(
     ReductionLoopResidencyUse loopInfo, int64_t rowSpmAddress,
-    unsigned elemBytes) {
+    unsigned elemBytes, bool useRowBlockDmaLayout = false) {
   scf::ForOp forOp = loopInfo.forOp;
   vector::TransferReadOp xRead = loopInfo.xLoad.readOp;
   auto memRefTy = dyn_cast<MemRefType>(xRead.getBase().getType());
   if (!memRefTy)
     return false;
+  bool rowBlockLayout =
+      useRowBlockDmaLayout &&
+      hasColMajorRowBlockDmaLayout(loopInfo.xLoad.vecTy, memRefTy);
+  SmallVector<int64_t, 2> spmMemStrides =
+      rowBlockLayout
+          ? getRowBlockDmaSpmMemStrides(loopInfo.xLoad.vecTy, memRefTy)
+          : getDefaultSpmMemStrides(loopInfo.xLoad.vecTy);
+  int64_t spmStepBytes = elemBytes;
+  if (rowBlockLayout)
+    spmStepBytes *= loopInfo.xLoad.vecTy.getShape()[1];
 
   auto stepBytes = getLoopStepBytes(xRead, forOp, /*requireLoopIv=*/true);
   if (!stepBytes)
@@ -1689,8 +1942,12 @@ static bool lowerDmaPrefetchRowResidentX(
     return false;
   }
 
-  emitDmaEnqueue(b, loc, i64Cst(b, loc, rowSpmAddress), dramAddr,
-                 loopInfo.xLoad.vecTy, memRefTy);
+  if (rowBlockLayout)
+    emitRowBlockDmaEnqueue(b, loc, i64Cst(b, loc, rowSpmAddress), dramAddr,
+                           loopInfo.xLoad.vecTy, memRefTy);
+  else
+    emitDmaEnqueue(b, loc, i64Cst(b, loc, rowSpmAddress), dramAddr,
+                   loopInfo.xLoad.vecTy, memRefTy);
 
   auto newForOp = scf::ForOp::create(
       b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
@@ -1722,7 +1979,7 @@ static bool lowerDmaPrefetchRowResidentX(
   Value currentOff = arith::SubIOp::create(b, loc, iv, lbInLoop);
   Value currentOffI64 = toI64(b, loc, currentOff);
   Value currentByteOff = arith::MulIOp::create(
-      b, loc, currentOffI64, i64Cst(b, loc, elemBytes));
+      b, loc, currentOffI64, i64Cst(b, loc, spmStepBytes));
   Value residentSpmAddr = arith::AddIOp::create(
       b, loc, i64Cst(b, loc, rowSpmAddress), currentByteOff);
 
@@ -1735,9 +1992,14 @@ static bool lowerDmaPrefetchRowResidentX(
   Value nextDram = arith::AddIOp::create(b, loc, dramAddr, nextByteOff);
   Value nextSpmAddr = arith::AddIOp::create(
       b, loc, i64Cst(b, loc, rowSpmAddress),
-      arith::MulIOp::create(b, loc, nextOffI64, i64Cst(b, loc, elemBytes)));
-  emitDmaEnqueue(b, loc, nextSpmAddr, nextDram, loopInfo.xLoad.vecTy,
-                 memRefTy);
+      arith::MulIOp::create(b, loc, nextOffI64,
+                            i64Cst(b, loc, spmStepBytes)));
+  if (rowBlockLayout)
+    emitRowBlockDmaEnqueue(b, loc, nextSpmAddr, nextDram,
+                           loopInfo.xLoad.vecTy, memRefTy);
+  else
+    emitDmaEnqueue(b, loc, nextSpmAddr, nextDram, loopInfo.xLoad.vecTy,
+                   memRefTy);
   b.setInsertionPointAfter(ifOp);
 
   for (auto &op : oldBody->getOperations()) {
@@ -1745,8 +2007,9 @@ static bool lowerDmaPrefetchRowResidentX(
       continue;
 
     if (&op == xRead.getOperation()) {
-      Value spmVal = emitSpmRead(b, loc, residentSpmAddr,
-                                 loopInfo.xLoad.vecTy);
+      Value spmVal = emitSpmReadWithStrides(b, loc, residentSpmAddr,
+                                            loopInfo.xLoad.vecTy,
+                                            spmMemStrides);
       mapping.map(xRead.getResult(), spmVal);
       continue;
     }
@@ -1767,9 +2030,286 @@ static bool lowerDmaPrefetchRowResidentX(
   return true;
 }
 
+static Value mapOrDefault(IRMapping &mapping, Value value) {
+  if (mapping.contains(value))
+    return mapping.lookup(value);
+  return value;
+}
+
+static bool cloneLoopBodyWithRowBlockSpm(
+    OpBuilder &b, Location loc, scf::ForOp oldLoop, scf::ForOp newLoop,
+    TiledLoadInfo xLoad, Value rowSpmBase, unsigned elemBytes,
+    int64_t spmStepBytes, ArrayRef<int64_t> spmMemStrides,
+    IRMapping &mapping) {
+  Block *oldBody = oldLoop.getBody();
+  Block *newBody = newLoop.getBody();
+  mapping.map(oldLoop.getInductionVar(), newLoop.getInductionVar());
+  for (auto [oldArg, newArg] :
+       llvm::zip_equal(oldLoop.getRegionIterArgs(),
+                       newLoop.getRegionIterArgs()))
+    mapping.map(oldArg, newArg);
+
+  b.setInsertionPointToStart(newBody);
+  if (!newBody->empty() && newBody->mightHaveTerminator())
+    newBody->getTerminator()->erase();
+
+  Value elemOffset = arith::SubIOp::create(
+      b, loc, toI64(b, loc, newLoop.getInductionVar()),
+      toI64(b, loc, newLoop.getLowerBound()));
+  Value byteOffset = arith::MulIOp::create(
+      b, loc, elemOffset, i64Cst(b, loc, spmStepBytes));
+  Value xSpmAddr = arith::AddIOp::create(b, loc, rowSpmBase, byteOffset);
+
+  for (auto &op : oldBody->getOperations()) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+
+    if (&op == xLoad.readOp.getOperation()) {
+      Value spmVal = emitSpmReadWithStrides(b, loc, xSpmAddr, xLoad.vecTy,
+                                            spmMemStrides);
+      mapping.map(xLoad.readOp.getResult(), spmVal);
+      continue;
+    }
+
+    b.clone(op, mapping);
+  }
+
+  auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
+  SmallVector<Value> yieldVals;
+  for (Value val : oldYield.getOperands())
+    yieldVals.push_back(mapOrDefault(mapping, val));
+  scf::YieldOp::create(b, loc, yieldVals);
+
+  return true;
+}
+
+static bool emitFullRowBlockDma(OpBuilder &b, Location loc,
+                                Value rowSpmAddr, Value firstDramAddr,
+                                VectorType vecTy, MemRefType memRefTy,
+                                int64_t trips) {
+  if (!hasColMajorRowBlockDmaLayout(vecTy, memRefTy) || trips <= 0)
+    return false;
+
+  unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+  int64_t columns = trips * vecTy.getShape()[0];
+  int64_t rows = vecTy.getShape()[1];
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides) || strides.size() < 2)
+    return false;
+
+  triton::cpu::DmaEnqueue2DOp::create(
+      b, loc, rowSpmAddr, firstDramAddr,
+      i64Cst(b, loc, columns * elemBytes),
+      i64Cst(b, loc, rows),
+      i64Cst(b, loc, strides[1] * elemBytes),
+      i64Cst(b, loc, columns * elemBytes));
+  return true;
+}
+
+static Operation *cloneBlockPrefixThrough(OpBuilder &b, Operation *target,
+                                          IRMapping &mapping) {
+  Block *block = target->getBlock();
+  Operation *clonedTarget = nullptr;
+  for (Operation &op : block->without_terminator()) {
+    Operation *cloned = b.clone(op, mapping);
+    if (&op == target) {
+      clonedTarget = cloned;
+      break;
+    }
+  }
+  return clonedTarget;
+}
+
+static bool lowerSoftmaxRowBlockGroupDma(
+    ReductionResidencyPlan &plan, int64_t rowSpmAddress0,
+    int64_t rowSpmAddress1,
+    llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
+  scf::ForOp outerLoop = plan.rowBlockGroupLoop;
+  if (!outerLoop)
+    return false;
+
+  vector::TransferReadOp xRead = plan.producer.xLoad.readOp;
+  auto memRefTy = dyn_cast<MemRefType>(xRead.getBase().getType());
+  if (!memRefTy ||
+      !hasColMajorRowBlockDmaLayout(plan.producer.xLoad.vecTy, memRefTy))
+    return false;
+
+  auto makeTensorPtr =
+      plan.producer.forOp.getTiedLoopInit(
+                              plan.producer.forOp.getRegionIterArgs().front())
+          ->get()
+          .template getDefiningOp<triton::MakeTensorPtrOp>();
+  if (!makeTensorPtr)
+    return false;
+
+  Location loc = outerLoop.getLoc();
+  InsertedBeforeGuard guard(outerLoop.getOperation());
+  OpBuilder b(outerLoop);
+
+  IRMapping firstPtrMapping;
+  firstPtrMapping.map(outerLoop.getInductionVar(),
+                      outerLoop.getLowerBound());
+  for (auto [iterArg, initArg] :
+       llvm::zip_equal(outerLoop.getRegionIterArgs(),
+                       outerLoop.getInitArgs()))
+    firstPtrMapping.map(iterArg, initArg);
+  Operation *firstTensorPtrOp =
+      cloneBlockPrefixThrough(b, makeTensorPtr.getOperation(),
+                              firstPtrMapping);
+  if (!firstTensorPtrOp) {
+    guard.cleanup();
+    return false;
+  }
+  Value firstDramAddr = computeTensorPtrDramAddr(
+      b, loc, firstTensorPtrOp->getResult(0), memRefTy);
+  if (!firstDramAddr) {
+    guard.cleanup();
+    return false;
+  }
+  if (!emitFullRowBlockDma(b, loc, i64Cst(b, loc, rowSpmAddress0),
+                           firstDramAddr, plan.producer.xLoad.vecTy,
+                           memRefTy, plan.trips)) {
+    guard.cleanup();
+    return false;
+  }
+
+  SmallVector<Value> outerInitArgs(outerLoop.getInitArgs());
+  outerInitArgs.push_back(i64Cst(b, loc, 0));
+  auto newOuter = scf::ForOp::create(
+      b, loc, outerLoop.getLowerBound(), outerLoop.getUpperBound(),
+      outerLoop.getStep(), outerInitArgs);
+
+  Block *oldOuterBody = outerLoop.getBody();
+  Block *newOuterBody = newOuter.getBody();
+  IRMapping outerMapping;
+  outerMapping.map(outerLoop.getInductionVar(), newOuter.getInductionVar());
+  unsigned oldOuterArgs = outerLoop.getRegionIterArgs().size();
+  for (unsigned i = 0; i < oldOuterArgs; ++i)
+    outerMapping.map(outerLoop.getRegionIterArgs()[i],
+                     newOuter.getRegionIterArgs()[i]);
+  Value bufIdx = newOuter.getRegionIterArgs()[oldOuterArgs];
+
+  b.setInsertionPointToStart(newOuterBody);
+  if (!newOuterBody->empty() && newOuterBody->mightHaveTerminator())
+    newOuterBody->getTerminator()->erase();
+
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  Value zero = i64Cst(b, loc, 0);
+  Value isZero = arith::CmpIOp::create(
+      b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
+  Value spmBuf0 = i64Cst(b, loc, rowSpmAddress0);
+  Value spmBuf1 = i64Cst(b, loc, rowSpmAddress1);
+  Value currentSpm =
+      arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
+  Value nextSpm =
+      arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
+
+  Value iv = newOuter.getInductionVar();
+  Value step = newOuter.getStep();
+  Value ub = newOuter.getUpperBound();
+  Value nextIv = arith::AddIOp::create(b, loc, iv, step);
+  Value hasNext = arith::CmpIOp::create(
+      b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+
+  auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
+  b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  IRMapping nextPtrMapping;
+  nextPtrMapping.map(outerLoop.getInductionVar(), nextIv);
+  for (auto [iterArg, newIterArg] :
+       llvm::zip_equal(outerLoop.getRegionIterArgs(),
+                       newOuter.getRegionIterArgs().take_front(oldOuterArgs)))
+    nextPtrMapping.map(iterArg, newIterArg);
+  Operation *nextTensorPtrOp =
+      cloneBlockPrefixThrough(b, makeTensorPtr.getOperation(),
+                              nextPtrMapping);
+  if (!nextTensorPtrOp) {
+    guard.cleanup();
+    return false;
+  }
+  Value nextDramAddr = computeTensorPtrDramAddr(
+      b, loc, nextTensorPtrOp->getResult(0), memRefTy);
+  if (!nextDramAddr) {
+    guard.cleanup();
+    return false;
+  }
+  if (!emitFullRowBlockDma(b, loc, nextSpm, nextDramAddr,
+                           plan.producer.xLoad.vecTy, memRefTy,
+                           plan.trips)) {
+    guard.cleanup();
+    return false;
+  }
+  b.setInsertionPointAfter(ifOp);
+
+  SmallVector<int64_t, 2> spmMemStrides{
+      1, plan.trips * plan.producer.xLoad.vecTy.getShape()[0]};
+  int64_t spmStepBytes = plan.elemBytes;
+
+  for (Operation &op : oldOuterBody->getOperations()) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+    if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
+      std::optional<ReductionLoopResidencyUse> loopUse;
+      if (forOp == plan.producer.forOp)
+        loopUse = plan.producer;
+      else {
+        for (const ReductionLoopResidencyUse &consumer : plan.consumers) {
+          if (forOp == consumer.forOp) {
+            loopUse = consumer;
+            break;
+          }
+        }
+      }
+
+      if (loopUse) {
+        SmallVector<Value> initArgs;
+        initArgs.reserve(forOp.getInitArgs().size());
+        for (Value initArg : forOp.getInitArgs())
+          initArgs.push_back(mapOrDefault(outerMapping, initArg));
+        auto newLoop = scf::ForOp::create(
+            b, loc, mapOrDefault(outerMapping, forOp.getLowerBound()),
+            mapOrDefault(outerMapping, forOp.getUpperBound()),
+            mapOrDefault(outerMapping, forOp.getStep()), initArgs);
+        cloneLoopBodyWithRowBlockSpm(
+            b, loc, forOp, newLoop, loopUse->xLoad, currentSpm,
+            plan.elemBytes, spmStepBytes, spmMemStrides, outerMapping);
+        b.setInsertionPointAfter(newLoop);
+        for (auto [oldResult, newResult] :
+             llvm::zip_equal(forOp.getResults(), newLoop.getResults()))
+          outerMapping.map(oldResult, newResult);
+        continue;
+      }
+    }
+
+    b.clone(op, outerMapping);
+  }
+
+  auto oldYield = cast<scf::YieldOp>(oldOuterBody->getTerminator());
+  SmallVector<Value> yieldVals;
+  for (Value val : oldYield.getOperands())
+    yieldVals.push_back(mapOrDefault(outerMapping, val));
+  Value one = i64Cst(b, loc, 1);
+  Value flipped = arith::SubIOp::create(b, loc, one, bufIdx);
+  yieldVals.push_back(flipped);
+  scf::YieldOp::create(b, loc, yieldVals);
+
+  for (unsigned i = 0; i < outerLoop.getNumResults(); ++i)
+    outerLoop.getResult(i).replaceAllUsesWith(newOuter.getResult(i));
+  rowResidentHandledLoops.insert(newOuter.getOperation());
+  rowResidentHandledLoops.insert(outerLoop.getOperation());
+  for (scf::ForOp loop : plan.loops)
+    rowResidentHandledLoops.insert(loop.getOperation());
+
+  guard.commit();
+  outerLoop.erase();
+  return true;
+}
+
 static void markResidencyPlanLoopsHandled(
     const ReductionResidencyPlan &plan,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
+  if (scf::ForOp groupLoop = plan.rowBlockGroupLoop)
+    rowResidentHandledLoops.insert(groupLoop.getOperation());
   for (scf::ForOp forOp : plan.loops)
     rowResidentHandledLoops.insert(forOp.getOperation());
 }
@@ -1817,7 +2357,26 @@ static bool transformReductionResidencyPlan(
     return reject("spm_capacity_overflow",
                   "SPM capacity cannot fit the resident x row schedule");
 
-  if (plan.producerPass == ReductionProducerPass::FillOnFirstPass) {
+  bool useRowBlockDmaLayout =
+      plan.producerPass == ReductionProducerPass::DmaPrefetch &&
+      plan.bufferRole == ReductionBufferRole::ResidentRowBlock;
+
+  if (plan.rowBlockGroupLoop) {
+    if (!useRowBlockDmaLayout)
+      return reject("unsupported_reduction_residency_plan",
+                    "row-block group residency currently requires "
+                    "row-block DMA producer mode");
+    auto allocRow1 = spmLayout.alloc(plan.bytes, /*alignment=*/1,
+                                     SPMSpaceManager::Lifetime::Loop);
+    if (!allocRow1)
+      return reject("spm_capacity_overflow",
+                    "SPM capacity cannot fit both row-block DMA buffers");
+    if (!lowerSoftmaxRowBlockGroupDma(plan, allocRow->address,
+                                      allocRow1->address,
+                                      rowResidentHandledLoops))
+      return reject("unsupported_reduction_residency_plan",
+                    "row-block group DMA double-buffer lowering failed");
+  } else if (plan.producerPass == ReductionProducerPass::FillOnFirstPass) {
     scf::ForOp newProducer =
         cloneLoopWithRowResidentX(plan.producer, allocRow->address,
                                   plan.elemBytes,
@@ -1850,7 +2409,8 @@ static bool transformReductionResidencyPlan(
       }
   } else if (plan.producerPass == ReductionProducerPass::DmaPrefetch) {
     if (!lowerDmaPrefetchRowResidentX(plan.producer, allocRow->address,
-                                      plan.elemBytes))
+                                      plan.elemBytes,
+                                      useRowBlockDmaLayout))
       return reject("unsupported_reduction_residency_plan",
                     "DMA-prefetch row residency could not lower the producer "
                     "loop");
@@ -1858,7 +2418,8 @@ static bool transformReductionResidencyPlan(
     for (const ReductionLoopResidencyUse &consumer : plan.consumers) {
       scf::ForOp newConsumer =
           cloneLoopWithRowResidentX(consumer, allocRow->address, plan.elemBytes,
-                                    /*fillSpmFromOriginalRead=*/false);
+                                    /*fillSpmFromOriginalRead=*/false,
+                                    useRowBlockDmaLayout);
       rowResidentHandledLoops.insert(newConsumer.getOperation());
     }
   } else {
@@ -2764,9 +3325,14 @@ struct ConvertMemoryToSPM
 
         std::string rejectReasonCode;
         std::string rejectReason;
-        auto plan = matchLayerNormResidencyPlan(
+        auto plan = matchSoftmaxRowBlockGroupResidencyPlan(
             topLevelLoops, funcOp, rejectReasonCode, rejectReason,
             rowResidentProducerPass);
+        if (!plan) {
+          plan = matchLayerNormResidencyPlan(
+              topLevelLoops, funcOp, rejectReasonCode, rejectReason,
+              rowResidentProducerPass);
+        }
         if (!plan) {
           plan = matchSoftmaxResidencyPlan(topLevelLoops, funcOp,
                                            rejectReasonCode, rejectReason,
