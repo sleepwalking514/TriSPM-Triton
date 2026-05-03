@@ -12,11 +12,9 @@
 // RUN: cat %t.d3/layer_norm_row_resident_promotions.json | FileCheck %s --check-prefix=D3REPORT
 
 // ROW-LABEL: @layer_norm_row_resident
-// ROW:       triton_cpu.dma_enqueue_2d
-// ROW-NEXT: triton_cpu.dma_wait
-// ROW-NOT:  triton_cpu.dma_enqueue_2d
 // ROW:      scf.for
-// ROW:        vector.transfer_read {{.*}} memref<8xf32, strided<[1]>, 3>
+// ROW:        vector.transfer_read {{.*}} memref<64xf32, strided<[1]>>
+// ROW:        vector.transfer_write {{.*}} memref<8xf32, strided<[1]>, 3>
 // ROW:      scf.for
 // ROW:        vector.transfer_read {{.*}} memref<8xf32, strided<[1]>, 3>
 // ROW:      scf.for
@@ -40,10 +38,10 @@
 // REPORT:      "scope": "program-row"
 // REPORT:      "shape": [64]
 // REPORT:      "uses": 3
-// REPORT:      "copy_in": "DMA"
+// REPORT:      "copy_in": "CPU/vector store"
 // REPORT:      "copy_out": "none"
 // REPORT:      "bytes": 256
-// REPORT:      "reason_code": "accepted_d2_opt_in_row_resident"
+// REPORT:      "reason_code": "accepted_fill_on_first_pass_row_resident"
 
 // REJECT:      "kernel": "layer_norm_row_resident"
 // REJECT:      "promotions": [
@@ -54,7 +52,7 @@
 // REJECT:      "scope": "program-row candidate"
 // REJECT:      "shape": [64]
 // REJECT:      "uses": 3
-// REJECT:      "copy_in": "DMA"
+// REJECT:      "copy_in": "CPU/vector store"
 // REJECT:      "copy_out": "none"
 // REJECT:      "bytes": 256
 // REJECT:      "reason_code": "spm_capacity_overflow"
@@ -74,10 +72,10 @@
 // D3REPORT:      "profitability": {
 // D3REPORT:      "model": "d3_static_conservative_v1"
 // D3REPORT:      "decision": "reject"
-// D3REPORT:      "dma_descriptors": 1
-// D3REPORT:      "mmio_stores": 4
-// D3REPORT:      "waits": 1
-// D3REPORT:      "fences": 1
+// D3REPORT:      "dma_descriptors": 0
+// D3REPORT:      "mmio_stores": 0
+// D3REPORT:      "waits": 0
+// D3REPORT:      "fences": 0
 // D3REPORT:      "copy_bytes": 256
 // D3REPORT:      "avoided_repeated_read_bytes": 512
 // D3REPORT:      "live_spm_bytes": 256

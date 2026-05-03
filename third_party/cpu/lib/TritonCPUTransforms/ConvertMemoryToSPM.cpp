@@ -745,16 +745,18 @@ static SPMPromotionRecord makeRowResidentRecord(VectorType chunkTy,
   record.scope = "program-row";
   record.shape.push_back(chunks * chunkTy.getNumElements());
   record.uses = 3;
-  record.copyIn = "DMA";
+  record.copyIn = "CPU/vector store";
   record.copyOut = "none";
   record.bytes = bytes;
   record.spmAddress = spmAddress;
-  record.overhead = "one row DMA descriptor and one wait per program row";
+  record.overhead =
+      "first reduction pass writes each loaded x chunk into SPM; no DMA wait";
   record.benefit =
-      "x[row, :] is copied once and reused by mean, variance, and normalize";
-  record.reasonCode = "accepted_d2_opt_in_row_resident";
+      "x[row, :] is materialized once and reused by variance and normalize";
+  record.reasonCode = "accepted_fill_on_first_pass_row_resident";
   record.reason =
-      "accepted by the D2 opt-in row-resident reduction prototype";
+      "accepted by the opt-in fill-on-first-pass row-resident reduction "
+      "prototype";
   return record;
 }
 
@@ -767,7 +769,7 @@ static SPMPromotionRejection makeRowResidentRejection(
   rejection.source = "LayerNorm x row";
   rejection.scope = "program-row candidate";
   rejection.uses = uses;
-  rejection.copyIn = "DMA";
+  rejection.copyIn = "CPU/vector store";
   rejection.copyOut = "none";
   rejection.bytes = bytes;
   rejection.shape.append(shape.begin(), shape.end());
@@ -1101,8 +1103,8 @@ evaluateD3RowResidentProfitability(const RowResidentCandidate &candidate,
                                    int64_t spmSize) {
   int64_t rowElements =
       candidate.trips * candidate.mean.xLoad.vecTy.getNumElements();
-  int64_t rowResidentDescriptors = 1;
-  int64_t rowResidentWaits = 1;
+  int64_t rowResidentDescriptors = 0;
+  int64_t rowResidentWaits = 0;
   int64_t avoidedBytes = candidate.rowBytes * 2;
 
   if (candidate.rowBytes > spmSize) {
@@ -1117,25 +1119,18 @@ evaluateD3RowResidentProfitability(const RowResidentCandidate &candidate,
   if (rowElements < 512) {
     return makeD3ProfitabilityEvidence(
         "reject", "insufficient_row_work",
-        "D3 static model rejects small rows because one row DMA/wait/fence "
-        "does not have enough vector work to amortize descriptor overhead",
-        rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
-        avoidedBytes, candidate.rowBytes, /*uses=*/3);
-  }
-
-  if (candidate.rowBytes <= 4096) {
-    return makeD3ProfitabilityEvidence(
-        "reject", "measured_layer_norm_regression",
-        "D3 static model keeps LayerNorm row residency off by default: D2 "
-        "measurements were slower than cache at 32x64 and 512x1024",
+        "D3 static model rejects small rows until fill-on-first-pass "
+        "row-resident measurements prove the SPM store/read overhead is "
+        "amortized",
         rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
         avoidedBytes, candidate.rowBytes, /*uses=*/3);
   }
 
   return makeD3ProfitabilityEvidence(
-      "reject", "unmodeled_large_row",
-      "D3 static model rejects large rows until descriptor, wait, and cache "
-      "fallback constants are fitted from gem5 stats",
+      "accept", "accepted_fill_on_first_pass_row_resident",
+      "D3 static model accepts fill-on-first-pass row residency for rows with "
+      "enough vector work: no DMA descriptors or waits, bounded row lifetime, "
+      "and x is reused after the first pass",
       rowResidentDescriptors, rowResidentWaits, candidate.rowBytes,
       avoidedBytes, candidate.rowBytes, /*uses=*/3);
 }
@@ -1198,7 +1193,8 @@ static SPMPromotionRejection makeD3StreamingReductionRejection(
 
 static scf::ForOp cloneLoopWithRowResidentX(RowResidentLoopInfo loopInfo,
                                             int64_t rowSpmAddress,
-                                            unsigned elemBytes) {
+                                            unsigned elemBytes,
+                                            bool fillSpmFromOriginalRead) {
   scf::ForOp forOp = loopInfo.forOp;
   vector::TransferReadOp xRead = loopInfo.xLoad.readOp;
   Location loc = forOp.getLoc();
@@ -1235,6 +1231,14 @@ static scf::ForOp cloneLoopWithRowResidentX(RowResidentLoopInfo loopInfo,
       continue;
 
     if (&op == xRead.getOperation()) {
+      if (fillSpmFromOriginalRead) {
+        Operation *cloned = b.clone(op, mapping);
+        auto clonedRead = cast<vector::TransferReadOp>(cloned);
+        emitSpmWrite(b, loc, xSpmAddr, clonedRead.getResult());
+        mapping.map(xRead.getResult(), clonedRead.getResult());
+        continue;
+      }
+
       Value spmVal = emitSpmRead(b, loc, xSpmAddr, loopInfo.xLoad.vecTy);
       mapping.map(xRead.getResult(), spmVal);
       continue;
@@ -1304,37 +1308,18 @@ static bool transformRowResidentCandidate(
     return reject("spm_capacity_overflow",
                   "SPM capacity cannot fit one resident x row");
 
-  Location loc = candidate.mean.forOp.getLoc();
-  InsertedBeforeGuard guard(candidate.mean.forOp.getOperation());
-  OpBuilder b(candidate.mean.forOp);
-
-  Value dramAddr =
-      computePrologueDramAddr(b, loc, candidate.mean.xLoad.readOp,
-                              candidate.mean.forOp);
-  if (!dramAddr) {
-    guard.cleanup();
-    return reject("dynamic_shape_or_stride",
-                  "failed to compute row prologue DRAM address");
-  }
-
-  auto rowVecTy = VectorType::get(
-      {candidate.trips * candidate.mean.xLoad.vecTy.getNumElements()},
-      candidate.mean.xLoad.vecTy.getElementType());
-  auto memRefTy = cast<MemRefType>(
-      candidate.mean.xLoad.readOp.getBase().getType());
-  emitDmaEnqueue(b, loc, i64Cst(b, loc, allocRow->address), dramAddr,
-                 rowVecTy, memRefTy);
-  triton::cpu::DmaWaitOp::create(b, loc);
-
   scf::ForOp newMean =
       cloneLoopWithRowResidentX(candidate.mean, allocRow->address,
-                                candidate.elemBytes);
+                                candidate.elemBytes,
+                                /*fillSpmFromOriginalRead=*/true);
   scf::ForOp newVariance =
       cloneLoopWithRowResidentX(candidate.variance, allocRow->address,
-                                candidate.elemBytes);
+                                candidate.elemBytes,
+                                /*fillSpmFromOriginalRead=*/false);
   scf::ForOp newNormalize =
       cloneLoopWithRowResidentX(candidate.normalize, allocRow->address,
-                                candidate.elemBytes);
+                                candidate.elemBytes,
+                                /*fillSpmFromOriginalRead=*/false);
   rowResidentHandledLoops.insert(newMean.getOperation());
   rowResidentHandledLoops.insert(newVariance.getOperation());
   rowResidentHandledLoops.insert(newNormalize.getOperation());
@@ -1351,7 +1336,6 @@ static bool transformRowResidentCandidate(
     report->records.push_back(std::move(record));
   }
 
-  guard.commit();
   return true;
 }
 
