@@ -25,6 +25,7 @@
 #include "cpu/include/TritonCPUTransforms/SPMSpaceManager.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -100,8 +101,31 @@ static Value i64Cst(OpBuilder &b, Location loc, int64_t val) {
   return arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(val));
 }
 
+static Value i32Cst(OpBuilder &b, Location loc, int32_t val) {
+  return arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(val));
+}
+
 static Value idxCst(OpBuilder &b, Location loc, int64_t val) {
   return arith::ConstantIndexOp::create(b, loc, val);
+}
+
+static int64_t getEnvInt64(StringRef name, int64_t defaultValue) {
+  if (const char *value = std::getenv(name.str().c_str())) {
+    char *end = nullptr;
+    long parsed = std::strtol(value, &end, 0);
+    if (end && *end == '\0')
+      return parsed;
+  }
+  return defaultValue;
+}
+
+static bool getEnvBool(StringRef name, bool defaultValue = false) {
+  if (const char *value = std::getenv(name.str().c_str())) {
+    StringRef text(value);
+    return !(text.empty() || text == "0" || text.equals_insensitive("false") ||
+             text.equals_insensitive("no") || text.equals_insensitive("off"));
+  }
+  return defaultValue;
 }
 
 /// Cast a value to i64.  Handles index, i64 (no-op), and narrower integers.
@@ -1653,6 +1677,328 @@ static SmallVector<scf::ForOp, 3> collectDirectChildLoops(scf::ForOp outer) {
       loops.push_back(forOp);
   }
   return loops;
+}
+
+static Value constantVector(OpBuilder &b, Location loc, VectorType ty,
+                            double value) {
+  auto elemTy = ty.getElementType();
+  Attribute elemAttr;
+  if (auto floatTy = dyn_cast<FloatType>(elemTy))
+    elemAttr = b.getFloatAttr(floatTy, value);
+  else
+    elemAttr = b.getZeroAttr(elemTy);
+  return arith::ConstantOp::create(b, loc, ty,
+                                   DenseElementsAttr::get(ty, elemAttr));
+}
+
+static triton::MakeTensorPtrOp findLoopInitMakeTensorPtr(scf::ForOp forOp) {
+  if (forOp.getInitArgs().empty())
+    return {};
+  return forOp.getInitArgs().front()
+      .getDefiningOp<triton::MakeTensorPtrOp>();
+}
+
+static std::optional<int64_t> firstStaticDim(ValueRange values) {
+  if (values.empty())
+    return std::nullopt;
+  return getConstantIntValue(values.front());
+}
+
+static Value emitTensorPtrTransferRead(OpBuilder &b, Location loc,
+                                       Value tensorPtr, MemRefType memRefTy,
+                                       VectorType vecTy) {
+  Value memRef = triton::cpu::ExtractMemRefOp::create(
+      b, loc, memRefTy, tensorPtr);
+  auto indices = triton::cpu::ExtractIndicesOp::create(b, loc, tensorPtr);
+  if (indices.getNumResults() != static_cast<unsigned>(vecTy.getRank()))
+    return {};
+  SmallVector<Value> indexVals(indices.getResults().begin(),
+                               indices.getResults().end());
+  auto padVal = arith::ConstantOp::create(
+      b, loc, vecTy.getElementType(), b.getZeroAttr(vecTy.getElementType()));
+  return vector::TransferReadOp::create(
+      b, loc, vecTy, memRef, indexVals, padVal,
+      SmallVector<bool>(vecTy.getRank(), true));
+}
+
+static bool emitTensorPtrTransferWrite(OpBuilder &b, Location loc,
+                                       Value tensorPtr, MemRefType memRefTy,
+                                       Value value) {
+  auto vecTy = dyn_cast<VectorType>(value.getType());
+  if (!vecTy)
+    return false;
+  Value memRef = triton::cpu::ExtractMemRefOp::create(
+      b, loc, memRefTy, tensorPtr);
+  auto indices = triton::cpu::ExtractIndicesOp::create(b, loc, tensorPtr);
+  if (indices.getNumResults() != static_cast<unsigned>(vecTy.getRank()))
+    return false;
+  SmallVector<Value> indexVals(indices.getResults().begin(),
+                               indices.getResults().end());
+  vector::TransferWriteOp::create(
+      b, loc, value, memRef, indexVals,
+      SmallVector<bool>(vecTy.getRank(), true));
+  return true;
+}
+
+static Value emitLeadingDimReduction(OpBuilder &b, Location loc, Value input,
+                                     vector::CombiningKind kind) {
+  auto vecTy = dyn_cast<VectorType>(input.getType());
+  if (!vecTy || vecTy.getRank() != 2)
+    return {};
+
+  Value result;
+  for (int64_t i = 0; i < vecTy.getShape()[0]; ++i) {
+    Value row = vector::ExtractOp::create(b, loc, input, i);
+    if (!result) {
+      result = row;
+      continue;
+    }
+    switch (kind) {
+    case vector::CombiningKind::ADD:
+      result = arith::AddFOp::create(b, loc, result, row);
+      break;
+    case vector::CombiningKind::MAXNUMF:
+      result = arith::MaxNumFOp::create(b, loc, result, row);
+      break;
+    default:
+      return {};
+    }
+  }
+  return result;
+}
+
+static Value emitTensorPtrAdvance(OpBuilder &b, Location loc, Value ptr,
+                                  Value colStep, Value rowStep) {
+  SmallVector<Value, 2> offsets{colStep, rowStep};
+  return triton::AdvanceOp::create(b, loc, ptr.getType(), ptr, offsets)
+      .getResult();
+}
+
+static bool eraseContiguousOps(Operation *start, Operation *end) {
+  SmallVector<Operation *> eraseOps;
+  for (Operation *op = start; op;) {
+    Operation *next = op->getNextNode();
+    eraseOps.push_back(op);
+    if (op == end)
+      break;
+    op = next;
+  }
+  if (eraseOps.empty() || eraseOps.back() != end)
+    return false;
+  for (Operation *op : llvm::reverse(eraseOps))
+    op->erase();
+  return true;
+}
+
+static Operation *setInsertionPointBeforeTerminator(OpBuilder &b, Block *body) {
+  Operation *terminator = body->mightHaveTerminator()
+                              ? body->getTerminator()
+                              : nullptr;
+  if (terminator)
+    b.setInsertionPoint(terminator);
+  else
+    b.setInsertionPointToEnd(body);
+  return terminator;
+}
+
+static bool lowerCanonicalSoftmaxToRowBlockGroup(
+    ArrayRef<scf::ForOp> topLevelLoops, FunctionOpInterface funcOp,
+    int64_t rowBlock, int64_t rowGroupBlocks) {
+  if (rowBlock <= 1 || rowGroupBlocks <= 0 || topLevelLoops.size() < 3)
+    return false;
+
+  std::string rejectCode;
+  std::string rejectReason;
+  auto plan = matchSoftmaxResidencyPlan(topLevelLoops, funcOp, rejectCode,
+                                        rejectReason,
+                                        /*producerPassMode=*/"");
+  if (!plan || plan->producer.xLoad.vecTy.getRank() != 1)
+    return false;
+
+  scf::ForOp maxLoop = plan->producer.forOp;
+  scf::ForOp sumLoop = plan->consumers[0].forOp;
+  scf::ForOp normLoop = plan->consumers[1].forOp;
+  if (maxLoop->getBlock() != sumLoop->getBlock() ||
+      maxLoop->getBlock() != normLoop->getBlock())
+    return false;
+
+  auto xMakeTensorPtr = findLoopInitMakeTensorPtr(maxLoop);
+  if (!xMakeTensorPtr)
+    return false;
+  auto outMakeTensorPtr = normLoop.getInitArgs().size() >= 2
+                              ? normLoop.getInitArgs()[1]
+                                    .getDefiningOp<triton::MakeTensorPtrOp>()
+                              : triton::MakeTensorPtrOp();
+  if (!outMakeTensorPtr)
+    return false;
+
+  auto flatXShape = firstStaticDim(xMakeTensorPtr.getShape());
+  auto flatXStride = firstStaticDim(xMakeTensorPtr.getStrides());
+  auto flatOutShape = firstStaticDim(outMakeTensorPtr.getShape());
+  auto flatOutStride = firstStaticDim(outMakeTensorPtr.getStrides());
+  if (!flatXShape || !flatOutShape || flatXShape != flatOutShape ||
+      !flatXStride || !flatOutStride || *flatXStride != 1 ||
+      *flatOutStride != 1)
+    return false;
+  if (*flatXShape % plan->shape.front() != 0)
+    return false;
+
+  int64_t cols = plan->shape.front();
+  int64_t rows = *flatXShape / cols;
+  if (rows % (rowBlock * rowGroupBlocks) != 0)
+    return false;
+
+  Location loc = maxLoop.getLoc();
+  InsertedBeforeGuard guard(maxLoop.getOperation());
+  OpBuilder b(maxLoop);
+
+  Value c0I32 = i32Cst(b, loc, 0);
+  Value c1I32 = i32Cst(b, loc, 1);
+  Value c0RowStepI32 = i32Cst(b, loc, 0);
+  Value cRowBlockI32 = i32Cst(b, loc, rowBlock);
+  Value cRowGroupBlocksI32 = i32Cst(b, loc, rowGroupBlocks);
+  Value cRowsI64 = i64Cst(b, loc, rows);
+  Value cColsI64 = i64Cst(b, loc, cols);
+  Value c1I64 = i64Cst(b, loc, 1);
+  Value pid = triton::GetProgramIdOp::create(
+      b, loc, triton::ProgramIDDim::X).getResult();
+  Value rowsPerProgram = i32Cst(b, loc, rowBlock * rowGroupBlocks);
+  Value groupRowBase =
+      arith::MulIOp::create(b, loc, pid, rowsPerProgram);
+
+  auto outer = scf::ForOp::create(b, loc, c0I32, cRowGroupBlocksI32, c1I32);
+  Block *outerBody = outer.getBody();
+  Operation *outerTerminator =
+      setInsertionPointBeforeTerminator(b, outerBody);
+
+  Value rbOffset =
+      arith::MulIOp::create(b, loc, outer.getInductionVar(), cRowBlockI32);
+  Value rowBase = arith::AddIOp::create(b, loc, groupRowBase, rbOffset);
+  auto oldVecTy = plan->producer.xLoad.vecTy;
+  auto elemTy = oldVecTy.getElementType();
+  auto rowBlockVecTy =
+      VectorType::get({oldVecTy.getShape()[0], rowBlock}, elemTy);
+  auto rowVecTy = VectorType::get({rowBlock}, elemTy);
+  auto rowBlockMemRefTy = MemRefType::get(
+      {cols, rows}, elemTy,
+      StridedLayoutAttr::get(b.getContext(), 0, {1, cols}));
+
+  SmallVector<Value> shapeVals{cColsI64, cRowsI64};
+  SmallVector<Value> strideVals{c1I64, cColsI64};
+  SmallVector<Value> offsets{c0I32, rowBase};
+  SmallVector<int32_t> tensorShape{static_cast<int32_t>(oldVecTy.getShape()[0]),
+                                  static_cast<int32_t>(rowBlock)};
+  SmallVector<int32_t> order{0, 1};
+  Value xPtr = triton::MakeTensorPtrOp::create(
+      b, loc, xMakeTensorPtr.getBase(), shapeVals, strideVals, offsets,
+      tensorShape, order);
+  Value outPtr = triton::MakeTensorPtrOp::create(
+      b, loc, outMakeTensorPtr.getBase(), shapeVals, strideVals, offsets,
+      tensorShape, order);
+  Value maxInit =
+      constantVector(b, loc, rowVecTy, -3.4028234663852886e38);
+  Value sumInit = constantVector(b, loc, rowVecTy, 0.0);
+
+  auto maxNew = scf::ForOp::create(
+      b, loc, maxLoop.getLowerBound(), maxLoop.getUpperBound(),
+      maxLoop.getStep(), ValueRange{xPtr, maxInit});
+  Operation *maxTerminator =
+      setInsertionPointBeforeTerminator(b, maxNew.getBody());
+  Value maxTile = emitTensorPtrTransferRead(
+      b, loc, maxNew.getRegionIterArgs()[0], rowBlockMemRefTy,
+      rowBlockVecTy);
+  if (!maxTile) {
+    guard.cleanup();
+    return false;
+  }
+  Value tileMax = emitLeadingDimReduction(
+      b, loc, maxTile, vector::CombiningKind::MAXNUMF);
+  if (!tileMax) {
+    guard.cleanup();
+    return false;
+  }
+  Value maxAcc =
+      arith::MaxNumFOp::create(b, loc, maxNew.getRegionIterArgs()[1], tileMax);
+  Value maxPtr = emitTensorPtrAdvance(b, loc, maxNew.getRegionIterArgs()[0],
+                                      maxLoop.getStep(), c0RowStepI32);
+  scf::YieldOp::create(b, loc, ValueRange{maxPtr, maxAcc});
+  if (maxTerminator)
+    maxTerminator->erase();
+  b.setInsertionPointAfter(maxNew);
+
+  Value maxBroadcast =
+      vector::BroadcastOp::create(b, loc, rowBlockVecTy, maxNew.getResult(1));
+
+  auto sumNew = scf::ForOp::create(
+      b, loc, sumLoop.getLowerBound(), sumLoop.getUpperBound(),
+      sumLoop.getStep(), ValueRange{xPtr, sumInit});
+  Operation *sumTerminator =
+      setInsertionPointBeforeTerminator(b, sumNew.getBody());
+  Value sumTile = emitTensorPtrTransferRead(
+      b, loc, sumNew.getRegionIterArgs()[0], rowBlockMemRefTy,
+      rowBlockVecTy);
+  if (!sumTile) {
+    guard.cleanup();
+    return false;
+  }
+  Value centered = arith::SubFOp::create(b, loc, sumTile, maxBroadcast);
+  Value expVals = math::ExpOp::create(b, loc, centered);
+  Value tileSum =
+      emitLeadingDimReduction(b, loc, expVals, vector::CombiningKind::ADD);
+  if (!tileSum) {
+    guard.cleanup();
+    return false;
+  }
+  Value sumAcc =
+      arith::AddFOp::create(b, loc, sumNew.getRegionIterArgs()[1], tileSum);
+  Value sumPtr = emitTensorPtrAdvance(b, loc, sumNew.getRegionIterArgs()[0],
+                                      sumLoop.getStep(), c0RowStepI32);
+  scf::YieldOp::create(b, loc, ValueRange{sumPtr, sumAcc});
+  if (sumTerminator)
+    sumTerminator->erase();
+  b.setInsertionPointAfter(sumNew);
+
+  Value denomBroadcast =
+      vector::BroadcastOp::create(b, loc, rowBlockVecTy, sumNew.getResult(1));
+  auto normNew = scf::ForOp::create(
+      b, loc, normLoop.getLowerBound(), normLoop.getUpperBound(),
+      normLoop.getStep(), ValueRange{xPtr, outPtr});
+  Operation *normTerminator =
+      setInsertionPointBeforeTerminator(b, normNew.getBody());
+  Value normTile = emitTensorPtrTransferRead(
+      b, loc, normNew.getRegionIterArgs()[0], rowBlockMemRefTy,
+      rowBlockVecTy);
+  if (!normTile) {
+    guard.cleanup();
+    return false;
+  }
+  Value normCentered = arith::SubFOp::create(b, loc, normTile, maxBroadcast);
+  Value normExp = math::ExpOp::create(b, loc, normCentered);
+  Value normalized = arith::DivFOp::create(b, loc, normExp, denomBroadcast);
+  if (!emitTensorPtrTransferWrite(b, loc, normNew.getRegionIterArgs()[1],
+                                  rowBlockMemRefTy, normalized)) {
+    guard.cleanup();
+    return false;
+  }
+  Value normXPtr = emitTensorPtrAdvance(b, loc, normNew.getRegionIterArgs()[0],
+                                        normLoop.getStep(), c0RowStepI32);
+  Value normOutPtr = emitTensorPtrAdvance(
+      b, loc, normNew.getRegionIterArgs()[1], normLoop.getStep(),
+      c0RowStepI32);
+  scf::YieldOp::create(b, loc, ValueRange{normXPtr, normOutPtr});
+  if (normTerminator)
+    normTerminator->erase();
+  b.setInsertionPointAfter(normNew);
+  if (!outerTerminator)
+    scf::YieldOp::create(b, loc);
+
+  if (!eraseContiguousOps(maxLoop.getOperation(), normLoop.getOperation())) {
+    guard.cleanup();
+    return false;
+  }
+
+  guard.commit();
+  return true;
 }
 
 static void rejectUnsupportedRowBlockGroup(std::string &rejectReasonCode,
@@ -3322,6 +3668,24 @@ struct ConvertMemoryToSPM
         SPMPromotionReport *report = nullptr;
         if (promotionReport)
           report = &reports[funcOp.getOperation()];
+
+        if (isRowBlockDmaProducerPassMode(rowResidentProducerPass) &&
+            getEnvBool("TRITON_SPM_SOFTMAX_INTERNAL_ROW_BLOCK", false)) {
+          int64_t rowBlock = getEnvInt64(
+              "TRITON_SPM_SOFTMAX_ROW_BLOCK",
+              getEnvInt64("SOFTMAX_SPM_ROW_BLOCK", 2));
+          int64_t rowGroupBlocks = getEnvInt64(
+              "TRITON_SPM_SOFTMAX_ROW_GROUP_BLOCKS",
+              getEnvInt64("SOFTMAX_SPM_ROW_GROUP_BLOCKS", 8));
+          if (lowerCanonicalSoftmaxToRowBlockGroup(
+                  topLevelLoops, funcOp, rowBlock, rowGroupBlocks)) {
+            topLevelLoops.clear();
+            for (Operation &op : entryBlock) {
+              if (auto forOp = dyn_cast<scf::ForOp>(&op))
+                topLevelLoops.push_back(forOp);
+            }
+          }
+        }
 
         std::string rejectReasonCode;
         std::string rejectReason;
