@@ -61,15 +61,20 @@
 // D3GEMM:      "source": "B tile window"
 // D3GEMM:      "reason_code": "accepted_existing_schedule"
 // D3GEMM:      "profitability": {
-// D3GEMM:      "model": "d3_static_conservative_v1"
+// D3GEMM:      "model": "phase35_p3_static_best_baseline_v1"
+// D3GEMM:      "baseline": "best_legal_cache_schedule"
 // D3GEMM:      "decision": "accept"
 // D3GEMM:      "reason_code": "accepted_reused_loop_window"
 // D3GEMM:      "dma_descriptors": 4
 // D3GEMM:      "mmio_stores": 16
 // D3GEMM:      "waits": 1
 // D3GEMM:      "copy_bytes": 4096
+// D3GEMM:      "spm_write_bytes": 4096
+// D3GEMM:      "spm_read_bytes": 4096
 // D3GEMM:      "avoided_repeated_read_bytes": 12288
 // D3GEMM:      "live_spm_bytes": 4096
+// D3GEMM:      "estimated_extra_ops": 4
+// D3GEMM:      "measured_bank_conflicts": 0
 // D3GEMM:      "source": "accumulator tile"
 // D3GEMM:      "reason_code": "accepted_bounded_temporary"
 
@@ -82,13 +87,18 @@
 // D3REDUCE:      "bytes": 256
 // D3REDUCE:      "reason_code": "streaming_reduction_no_residency"
 // D3REDUCE:      "profitability": {
-// D3REDUCE:      "model": "d3_static_conservative_v1"
+// D3REDUCE:      "model": "phase35_p3_static_best_baseline_v1"
+// D3REDUCE:      "baseline": "best_legal_cache_schedule"
 // D3REDUCE:      "decision": "reject"
 // D3REDUCE:      "dma_descriptors": 4
 // D3REDUCE:      "mmio_stores": 16
 // D3REDUCE:      "waits": 4
 // D3REDUCE:      "copy_bytes": 256
+// D3REDUCE:      "spm_write_bytes": 256
+// D3REDUCE:      "spm_read_bytes": 256
 // D3REDUCE:      "avoided_repeated_read_bytes": 0
+// D3REDUCE:      "estimated_extra_ops": 4
+// D3REDUCE:      "measured_bank_conflicts": 0
 // D3REDUCE:      "uses": 1
 
 module {

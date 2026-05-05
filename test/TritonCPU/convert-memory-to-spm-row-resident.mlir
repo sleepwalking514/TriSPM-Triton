@@ -45,7 +45,7 @@
 // REPORT:      "copy_in": "CPU/vector store"
 // REPORT:      "copy_out": "none"
 // REPORT:      "bytes": 256
-// REPORT:      "reason_code": "accepted_fill_on_first_pass_row_resident"
+// REPORT:      "reason_code": "accepted_row_resident_fill_first"
 // REPORT:      "residency_plan": {
 // REPORT:      "producer_pass": "fill_on_first_pass"
 // REPORT:      "consumer_passes": ["variance", "normalize"]
@@ -85,20 +85,25 @@
 // D3REPORT-NEXT:   ],
 // D3REPORT:      "status": "rejected"
 // D3REPORT:      "pattern": "row_resident_reduction"
-// D3REPORT:      "reason_code": "insufficient_row_work"
+// D3REPORT:      "reason_code": "small_row_spm_overhead"
 // D3REPORT:      "residency_plan": {
 // D3REPORT:      "producer_pass": "fill_on_first_pass"
 // D3REPORT:      "consumer_passes": ["variance", "normalize"]
 // D3REPORT:      "profitability": {
-// D3REPORT:      "model": "d3_static_conservative_v1"
+// D3REPORT:      "model": "phase35_p3_static_best_baseline_v1"
+// D3REPORT:      "baseline": "best_legal_cache_schedule"
 // D3REPORT:      "decision": "reject"
 // D3REPORT:      "dma_descriptors": 0
 // D3REPORT:      "mmio_stores": 0
 // D3REPORT:      "waits": 0
 // D3REPORT:      "fences": 0
 // D3REPORT:      "copy_bytes": 256
+// D3REPORT:      "spm_write_bytes": 256
+// D3REPORT:      "spm_read_bytes": 512
 // D3REPORT:      "avoided_repeated_read_bytes": 512
 // D3REPORT:      "live_spm_bytes": 256
+// D3REPORT:      "estimated_extra_ops": 24
+// D3REPORT:      "measured_bank_conflicts": 0
 // D3REPORT:      "uses": 3
 
 // SOFTMAXIR-LABEL: @softmax_row_resident_plan
@@ -122,7 +127,7 @@
 // SOFTMAXREPORT:      "copy_in": "CPU/vector store"
 // SOFTMAXREPORT:      "copy_out": "none"
 // SOFTMAXREPORT:      "bytes": 4096
-// SOFTMAXREPORT:      "reason_code": "accepted_fill_on_first_pass_row_resident"
+// SOFTMAXREPORT:      "reason_code": "accepted_row_resident_fill_first"
 // SOFTMAXREPORT:      "residency_plan": {
 // SOFTMAXREPORT:      "producer_pass": "fill_on_first_pass"
 // SOFTMAXREPORT:      "consumer_passes": ["exp_sum", "normalize_store"]

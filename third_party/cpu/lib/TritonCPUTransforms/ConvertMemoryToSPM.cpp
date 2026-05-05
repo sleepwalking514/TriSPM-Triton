@@ -839,7 +839,8 @@ static int64_t chooseWindowK(int64_t trips, int64_t requestedWindowK) {
 
 struct SPMProfitabilityEvidence {
   bool present = false;
-  std::string model = "d3_static_conservative_v1";
+  std::string model = "phase35_p3_static_best_baseline_v1";
+  std::string baseline = "best_legal_cache_schedule";
   std::string decision;
   std::string reasonCode;
   std::string reason;
@@ -848,8 +849,12 @@ struct SPMProfitabilityEvidence {
   int64_t waits = 0;
   int64_t fences = 0;
   int64_t copyBytes = 0;
+  int64_t spmWriteBytes = 0;
+  int64_t spmReadBytes = 0;
   int64_t avoidedRepeatedReadBytes = 0;
   int64_t liveSpmBytes = 0;
+  int64_t estimatedExtraOps = 0;
+  int64_t measuredBankConflicts = 0;
   int64_t uses = 0;
 };
 
@@ -904,7 +909,9 @@ static constexpr int64_t kDmaMmioStoresPerDescriptor = 4;
 static SPMProfitabilityEvidence makeD3ProfitabilityEvidence(
     StringRef decision, StringRef reasonCode, StringRef reason,
     int64_t dmaDescriptors, int64_t waits, int64_t copyBytes,
-    int64_t avoidedRepeatedReadBytes, int64_t liveSpmBytes, int64_t uses) {
+    int64_t spmWriteBytes, int64_t spmReadBytes,
+    int64_t avoidedRepeatedReadBytes, int64_t liveSpmBytes,
+    int64_t estimatedExtraOps, int64_t measuredBankConflicts, int64_t uses) {
   SPMProfitabilityEvidence evidence;
   evidence.present = true;
   evidence.decision = decision.str();
@@ -915,8 +922,12 @@ static SPMProfitabilityEvidence makeD3ProfitabilityEvidence(
   evidence.waits = waits;
   evidence.fences = waits;
   evidence.copyBytes = copyBytes;
+  evidence.spmWriteBytes = spmWriteBytes;
+  evidence.spmReadBytes = spmReadBytes;
   evidence.avoidedRepeatedReadBytes = avoidedRepeatedReadBytes;
   evidence.liveSpmBytes = liveSpmBytes;
+  evidence.estimatedExtraOps = estimatedExtraOps;
+  evidence.measuredBankConflicts = measuredBankConflicts;
   evidence.uses = uses;
   return evidence;
 }
@@ -1028,6 +1039,9 @@ static void writeProfitabilityEvidence(llvm::raw_ostream &os,
   os << indent << "  \"model\": ";
   writeJsonString(os, evidence.model);
   os << ",\n";
+  os << indent << "  \"baseline\": ";
+  writeJsonString(os, evidence.baseline);
+  os << ",\n";
   os << indent << "  \"decision\": ";
   writeJsonString(os, evidence.decision);
   os << ",\n";
@@ -1043,9 +1057,17 @@ static void writeProfitabilityEvidence(llvm::raw_ostream &os,
   os << indent << "  \"waits\": " << evidence.waits << ",\n";
   os << indent << "  \"fences\": " << evidence.fences << ",\n";
   os << indent << "  \"copy_bytes\": " << evidence.copyBytes << ",\n";
+  os << indent << "  \"spm_write_bytes\": " << evidence.spmWriteBytes
+     << ",\n";
+  os << indent << "  \"spm_read_bytes\": " << evidence.spmReadBytes
+     << ",\n";
   os << indent << "  \"avoided_repeated_read_bytes\": "
      << evidence.avoidedRepeatedReadBytes << ",\n";
   os << indent << "  \"live_spm_bytes\": " << evidence.liveSpmBytes << ",\n";
+  os << indent << "  \"estimated_extra_ops\": "
+     << evidence.estimatedExtraOps << ",\n";
+  os << indent << "  \"measured_bank_conflicts\": "
+     << evidence.measuredBankConflicts << ",\n";
   os << indent << "  \"uses\": " << evidence.uses << "\n";
   os << indent << "}";
 }
@@ -1108,11 +1130,17 @@ static SPMPromotionRecord makeReductionResidencyRecord(
         "accepted by the opt-in producer-store row-resident reduction "
         "prototype";
   } else if (plan.producerPass == ReductionProducerPass::DmaPrefetch) {
-    record.reasonCode = "accepted_dma_prefetch_row_resident";
-    record.reason =
-        "accepted by the opt-in DMA-prefetch row-resident reduction prototype";
+    if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
+      record.reasonCode = "accepted_block_resident_fill_first";
+      record.reason =
+          "accepted by the opt-in row-block resident reduction prototype";
+    } else {
+      record.reasonCode = "accepted_dma_prefetch_row_resident";
+      record.reason =
+          "accepted by the opt-in DMA-prefetch row-resident reduction prototype";
+    }
   } else {
-    record.reasonCode = "accepted_fill_on_first_pass_row_resident";
+    record.reasonCode = "accepted_row_resident_fill_first";
     record.reason =
         "accepted by the opt-in fill-on-first-pass row-resident reduction "
         "prototype";
@@ -2078,45 +2106,91 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
   if (plan.producerPass == ReductionProducerPass::ProducerStore)
     spmConsumerPasses = std::max<int64_t>(
         0, static_cast<int64_t>(plan.consumers.size()) - 1);
-  int64_t avoidedBytes = plan.bytes * spmConsumerPasses;
+  int64_t groupTrips = std::max<int64_t>(1, plan.rowBlockGroupTrips);
+  int64_t copyBytes = plan.copyInMode == ReductionCopyInMode::Dma
+                          ? plan.bytes * groupTrips
+                          : plan.bytes;
+  int64_t spmWriteBytes = plan.bytes;
+  int64_t spmReadBytes = plan.bytes * spmConsumerPasses;
+  int64_t liveSpmBytes = plan.bytes * plan.requiredSpmSlots;
+  int64_t estimatedExtraOps = plan.trips * (1 + spmConsumerPasses);
+  int64_t measuredBankConflicts = 0;
+  if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
+    rowResidentDescriptors = groupTrips;
+    rowResidentWaits = groupTrips;
+    spmWriteBytes = copyBytes;
+    spmReadBytes = plan.bytes * plan.uses * groupTrips;
+    estimatedExtraOps = groupTrips * (plan.trips * plan.uses + 1);
+  }
+  int64_t avoidedBytes = plan.bytes * spmConsumerPasses * groupTrips;
   int64_t rowElements = plan.shape.empty() ? 0 : plan.shape.front();
 
-  if (plan.bytes > spmSize) {
+  if (liveSpmBytes > spmSize) {
     return makeD3ProfitabilityEvidence(
         "reject", "spm_capacity_overflow",
-        "D3 static model rejects row residency because one row exceeds SPM "
-        "capacity",
-        rowResidentDescriptors, rowResidentWaits, plan.bytes,
-        avoidedBytes, plan.bytes, plan.uses);
+        "P3 static model rejects reduction residency because the required "
+        "resident SPM slots exceed SPM capacity",
+        rowResidentDescriptors, rowResidentWaits, copyBytes,
+        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
+        estimatedExtraOps, measuredBankConflicts, plan.uses);
   }
 
   if (rowElements < 512) {
     return makeD3ProfitabilityEvidence(
-        "reject", "insufficient_row_work",
-        "D3 static model rejects small rows until fill-on-first-pass "
-        "row-resident measurements prove the SPM store/read overhead is "
-        "amortized",
-        rowResidentDescriptors, rowResidentWaits, plan.bytes,
-        avoidedBytes, plan.bytes, plan.uses);
+        "reject", "small_row_spm_overhead",
+        "P3 static model rejects small rows because measured Phase 3.5 "
+        "evidence shows SPM store/read overhead is not reliably amortized "
+        "against the best legal cache schedule",
+        rowResidentDescriptors, rowResidentWaits, copyBytes,
+        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
+        estimatedExtraOps, measuredBankConflicts, plan.uses);
+  }
+
+  if (plan.producerPass == ReductionProducerPass::DmaPrefetch &&
+      plan.bufferRole != ReductionBufferRole::ResidentRowBlock) {
+    return makeD3ProfitabilityEvidence(
+        "reject", "chunk_dma_spm_overhead",
+        "P3 static model rejects chunk-DMA row residency because Phase 3.5 "
+        "measurements show per-chunk descriptors, waits, and fences are worse "
+        "than the available CPU-direct or row-block schedules",
+        rowResidentDescriptors, rowResidentWaits, copyBytes,
+        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
+        estimatedExtraOps, measuredBankConflicts, plan.uses);
   }
 
   if (plan.producerPass == ReductionProducerPass::ProducerStore) {
     return makeD3ProfitabilityEvidence(
-        "accept", "accepted_producer_store_row_resident",
-        "D3 static model accepts producer-store row residency for rows with "
-        "enough vector work: no DMA descriptors or waits, bounded row "
-        "lifetime, and the final x reuse reads from SPM",
-        rowResidentDescriptors, rowResidentWaits, plan.bytes,
-        avoidedBytes, plan.bytes, plan.uses);
+        "reject", "producer_store_spm_overhead",
+        "P3 static model rejects producer-store row residency because "
+        "Phase 3.5 measurements show the extra cache-path pass is not "
+        "competitive with fill-on-first-pass against the best legal cache "
+        "schedule",
+        rowResidentDescriptors, rowResidentWaits, copyBytes,
+        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
+        estimatedExtraOps, measuredBankConflicts, plan.uses);
+  }
+
+  if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
+    return makeD3ProfitabilityEvidence(
+        "accept", "accepted_block_resident_fill_first",
+        "P3 static model accepts Softmax block residency only for the "
+        "measured row-block DMA schedule: bounded double-buffered row-block "
+        "lifetime, coarse DMA copies, zero measured bank conflicts, and "
+        "comparison against the best legal cache baseline",
+        rowResidentDescriptors, rowResidentWaits, copyBytes,
+        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
+        estimatedExtraOps, measuredBankConflicts, plan.uses);
   }
 
   return makeD3ProfitabilityEvidence(
-      "accept", "accepted_fill_on_first_pass_row_resident",
-      "D3 static model accepts fill-on-first-pass row residency for rows with "
-      "enough vector work: no DMA descriptors or waits, bounded row lifetime, "
-      "and x is reused after the first pass",
-      rowResidentDescriptors, rowResidentWaits, plan.bytes,
-      avoidedBytes, plan.bytes, plan.uses);
+      "accept", "accepted_row_resident_fill_first",
+      "P3 static model accepts fill-on-first-pass row residency as opt-in "
+      "evidence for large rows: no DMA descriptors or waits, bounded row "
+      "lifetime, and measured Phase 3.5 data is at least near parity or better "
+      "against the best legal cache baseline",
+      rowResidentDescriptors, rowResidentWaits, copyBytes,
+      spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
+      estimatedExtraOps, measuredBankConflicts, plan.uses);
 }
 
 static SPMProfitabilityEvidence
@@ -2138,12 +2212,14 @@ evaluateD3StreamingReductionProfitability(scf::ForOp forOp,
 
   return makeD3ProfitabilityEvidence(
       "reject", "streaming_reduction_no_residency",
-      "D3 static model rejects streaming reductions by default because each "
+      "P3 static model rejects streaming reductions by default because each "
       "chunk has one compute use and no bounded SPM residency; keep the cache "
       "path unless an explicit row/block-resident schedule is selected",
       descriptors, descriptors, copyBytes,
+      /*spmWriteBytes=*/copyBytes, /*spmReadBytes=*/copyBytes,
       /*avoidedRepeatedReadBytes=*/0, std::min(copyBytes, spmSize),
-      /*uses=*/1);
+      /*estimatedExtraOps=*/descriptors,
+      /*measuredBankConflicts=*/0, /*uses=*/1);
 }
 
 static SPMPromotionRejection makeD3RowResidentProfitabilityRejection(
@@ -2730,6 +2806,18 @@ static bool transformReductionResidencyPlan(
     int64_t rowResidentMaxBytes, bool enablePromotionProfitability,
     SPMPromotionReport *report,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
+  bool useSoftmaxExpCache =
+      getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP", false) &&
+      plan.bufferRole == ReductionBufferRole::ResidentRowBlock &&
+      plan.source == "Softmax x row block";
+  if (useSoftmaxExpCache) {
+    plan.requiredSpmSlots = std::max<int64_t>(plan.requiredSpmSlots, 3);
+    plan.overhead +=
+        "; exp-cache adds one resident SPM buffer for exp(x - max) values";
+    plan.benefit +=
+        "; normalize/store reads cached exp values instead of recomputing exp";
+  }
+
   auto reject = [&](StringRef reasonCode, StringRef reason) {
     if (report)
       report->rejections.push_back(
@@ -2783,11 +2871,13 @@ static bool transformReductionResidencyPlan(
       return reject("spm_capacity_overflow",
                     "SPM capacity cannot fit both row-block DMA buffers");
     int64_t expSpmAddress = -1;
-    if (getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP", false)) {
+    if (useSoftmaxExpCache) {
       auto allocExp = spmLayout.alloc(plan.bytes, /*alignment=*/1,
                                       SPMSpaceManager::Lifetime::Loop);
-      if (allocExp)
-        expSpmAddress = allocExp->address;
+      if (!allocExp)
+        return reject("spm_capacity_overflow",
+                      "SPM capacity cannot fit the row-block exp-cache buffer");
+      expSpmAddress = allocExp->address;
     }
     if (!lowerSoftmaxRowBlockGroupDma(plan, allocRow->address,
                                       allocRow1->address,
@@ -2969,9 +3059,10 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
                   "D3 static model accepts the existing fused matmul B window: "
                   "bounded loop-window lifetime and reuse across microM slices",
                   window, /*waits=*/1, bytes,
+                  /*spmWriteBytes=*/bytes, /*spmReadBytes=*/bytes,
                   (bytes / window) * std::max<int64_t>(0, uses - window),
-                  bytes,
-                  uses));
+                  bytes, /*estimatedExtraOps=*/window,
+                  /*measuredBankConflicts=*/0, uses));
         return record;
       };
 
@@ -2999,7 +3090,11 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
                   "D3 static model accepts the accumulator tile as a bounded "
                   "loop-window temporary in the existing fused matmul schedule",
                   /*dmaDescriptors=*/0, /*waits=*/0, /*copyBytes=*/0,
-                  bytes * std::max<int64_t>(0, uses - 1), bytes, uses));
+                  /*spmWriteBytes=*/bytes * std::max<int64_t>(0, uses - 1),
+                  /*spmReadBytes=*/bytes * std::max<int64_t>(0, uses - 1),
+                  bytes * std::max<int64_t>(0, uses - 1), bytes,
+                  /*estimatedExtraOps=*/uses,
+                  /*measuredBankConflicts=*/0, uses));
         return record;
       };
 
