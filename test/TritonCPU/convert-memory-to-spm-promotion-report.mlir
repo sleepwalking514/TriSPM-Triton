@@ -30,7 +30,9 @@
 // REPORT:      "scope": "single-iteration"
 // REPORT:      "shape": [8, 16]
 // REPORT:      "uses": 1
-// REPORT:      "bytes": 512
+// REPORT:      "bytes": 1024
+// REPORT:      "overhead": "two SPM buffers, one DMA descriptor per microM/K step, and one wait-at-top per step"
+// REPORT:      "benefit": "pipelines A micro-tile staging while limiting A to the rows consumed by the current microM contract"
 // REPORT:      "status": "accepted"
 // REPORT:      "source": "accumulator tile"
 // REPORT:      "scope": "loop-window temporary"

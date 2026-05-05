@@ -2935,9 +2935,10 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
           int64_t spmAddress) {
         return makeRecord("A micro tile", "single-iteration", shapeTy, uses,
                           "DMA", "none", bytes, spmAddress,
-                          "one DMA descriptor and one wait per microM/K step",
-                          "limits A staging to the rows consumed by the current "
-                          "microM contract");
+                          "two SPM buffers, one DMA descriptor per microM/K "
+                          "step, and one wait-at-top per step",
+                          "pipelines A micro-tile staging while limiting A to "
+                          "the rows consumed by the current microM contract");
       };
 
   auto lbCst = getConstantIntValue(forOp.getLowerBound());
@@ -3019,17 +3020,20 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   SPMSpaceManager spmLayout(spmBase, spmSize);
   auto allocBWindow = spmLayout.alloc(bWindowBytes, /*alignment=*/1,
                                       SPMSpaceManager::Lifetime::Loop);
-  auto allocAMicro = spmLayout.alloc(microABytes, /*alignment=*/1,
-                                     SPMSpaceManager::Lifetime::Loop);
+  auto allocAMicro0 = spmLayout.alloc(microABytes, /*alignment=*/1,
+                                      SPMSpaceManager::Lifetime::Loop);
+  auto allocAMicro1 = spmLayout.alloc(microABytes, /*alignment=*/1,
+                                      SPMSpaceManager::Lifetime::Loop);
   auto allocAcc = spmLayout.alloc(accBytes, /*alignment=*/1,
                                   SPMSpaceManager::Lifetime::Loop);
-  if (!allocBWindow || !allocAMicro || !allocAcc)
+  if (!allocBWindow || !allocAMicro0 || !allocAMicro1 || !allocAcc)
     return reject(
         "spm_capacity_overflow",
-        "SPM capacity cannot fit B window, A micro tile, and accumulator");
+        "SPM capacity cannot fit B window, A micro double buffer, and accumulator");
 
   int64_t addrBWindow = allocBWindow->address;
-  int64_t addrAMicro = allocAMicro->address;
+  int64_t addrAMicro0 = allocAMicro0->address;
+  int64_t addrAMicro1 = allocAMicro1->address;
   int64_t addrAcc = allocAcc->address;
 
   Location loc = forOp.getLoc();
@@ -3049,7 +3053,7 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
     report->records.push_back(makeBWindowRecord(
         bTy, windowK, microSlices * windowK, bWindowBytes, addrBWindow));
     report->records.push_back(makeAMicroRecord(
-        microATy, /*uses=*/1, microABytes, addrAMicro));
+        microATy, /*uses=*/1, microABytes * 2, addrAMicro0));
     report->records.push_back(makeAccumulatorRecord(
         accTy, microSlices * 2 + 1, accBytes, addrAcc));
   }
@@ -3112,30 +3116,60 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
 
   for (int64_t mOff = 0; mOff < BM; mOff += microM) {
     Value accAddr = i64Cst(b, loc, addrAcc + mOff * accRowBytes);
+    Value aDram0 = arith::AddIOp::create(
+        b, loc, dramAddrA,
+        arith::AddIOp::create(
+            b, loc,
+            arith::MulIOp::create(b, loc, winIter,
+                                  i64Cst(b, loc, stepBytesA)),
+            i64Cst(b, loc, mOff * rowBytesA)));
+    emitDmaEnqueue(b, loc, i64Cst(b, loc, addrAMicro0), aDram0,
+                   microATy, memRefTyA);
     Value microInit = emitSpmRead(b, loc, accAddr, microAccTy);
 
     auto kFor = scf::ForOp::create(
         b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, windowK),
-        i64Cst(b, loc, 1), ValueRange{microInit});
+        i64Cst(b, loc, 1),
+        ValueRange{microInit, i64Cst(b, loc, 0)});
     Block *kBody = kFor.getBody();
     if (!kBody->empty() && kBody->mightHaveTerminator())
       kBody->getTerminator()->erase();
 
     b.setInsertionPointToStart(kBody);
+    triton::cpu::DmaWaitOp::create(b, loc);
+
     Value kLocal = kFor.getInductionVar();
     Value kAbsIter = arith::AddIOp::create(b, loc, winIter, kLocal);
-    Value aDram = arith::AddIOp::create(
+    Value aBufIdx = kFor.getRegionIterArgs()[1];
+    Value zero = i64Cst(b, loc, 0);
+    Value one = i64Cst(b, loc, 1);
+    Value isZero = arith::CmpIOp::create(
+        b, loc, arith::CmpIPredicate::eq, aBufIdx, zero);
+    Value aCur = arith::SelectOp::create(
+        b, loc, isZero, i64Cst(b, loc, addrAMicro0),
+        i64Cst(b, loc, addrAMicro1));
+    Value aNxt = arith::SelectOp::create(
+        b, loc, isZero, i64Cst(b, loc, addrAMicro1),
+        i64Cst(b, loc, addrAMicro0));
+
+    Value nextKLocal = arith::AddIOp::create(b, loc, kLocal, one);
+    Value hasNextA = arith::CmpIOp::create(
+        b, loc, arith::CmpIPredicate::slt, nextKLocal,
+        i64Cst(b, loc, windowK));
+    Value nextKAbsIter = arith::AddIOp::create(b, loc, kAbsIter, one);
+    Value nextADram = arith::AddIOp::create(
         b, loc, dramAddrA,
         arith::AddIOp::create(
             b, loc,
-            arith::MulIOp::create(b, loc, kAbsIter,
+            arith::MulIOp::create(b, loc, nextKAbsIter,
                                   i64Cst(b, loc, stepBytesA)),
             i64Cst(b, loc, mOff * rowBytesA)));
-    emitDmaEnqueue(b, loc, i64Cst(b, loc, addrAMicro), aDram,
-                   microATy, memRefTyA);
-    triton::cpu::DmaWaitOp::create(b, loc);
+    auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNextA, false);
+    b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    emitDmaEnqueue(b, loc, aNxt, nextADram, microATy, memRefTyA);
+    b.setInsertionPointAfter(ifOp);
 
-    Value aVal = emitSpmRead(b, loc, i64Cst(b, loc, addrAMicro), microATy);
+    Value aVal = emitSpmRead(b, loc, aCur, microATy);
     Value bReadAddr = arith::AddIOp::create(
         b, loc, i64Cst(b, loc, addrBWindow),
         arith::MulIOp::create(b, loc, kLocal,
@@ -3144,7 +3178,8 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
     Value microAcc = kFor.getRegionIterArgs()[0];
     Value contracted = vector::ContractionOp::create(
         b, loc, microAccTy, aVal, bVal, microAcc, mapsAttr, iterAttr);
-    scf::YieldOp::create(b, loc, contracted);
+    Value flipped = arith::SubIOp::create(b, loc, one, aBufIdx);
+    scf::YieldOp::create(b, loc, ValueRange{contracted, flipped});
 
     b.setInsertionPointAfter(kFor);
     emitSpmWrite(b, loc, accAddr, kFor.getResult(0));
