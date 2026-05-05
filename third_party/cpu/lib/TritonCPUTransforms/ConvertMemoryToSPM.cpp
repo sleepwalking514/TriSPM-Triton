@@ -2386,7 +2386,8 @@ static bool cloneLoopBodyWithRowBlockSpm(
     OpBuilder &b, Location loc, scf::ForOp oldLoop, scf::ForOp newLoop,
     TiledLoadInfo xLoad, Value rowSpmBase, unsigned elemBytes,
     int64_t spmStepBytes, ArrayRef<int64_t> spmMemStrides,
-    IRMapping &mapping) {
+    IRMapping &mapping, Value expSpmBase = nullptr,
+    bool writeExpToSpm = false, bool readExpFromSpm = false) {
   Block *oldBody = oldLoop.getBody();
   Block *newBody = newLoop.getBody();
   mapping.map(oldLoop.getInductionVar(), newLoop.getInductionVar());
@@ -2406,18 +2407,67 @@ static bool cloneLoopBodyWithRowBlockSpm(
       b, loc, elemOffset, i64Cst(b, loc, spmStepBytes));
   Value xSpmAddr = arith::AddIOp::create(b, loc, rowSpmBase, byteOffset);
 
+  Value expSpmAddr;
+  if (expSpmBase && (writeExpToSpm || readExpFromSpm))
+    expSpmAddr = arith::AddIOp::create(b, loc, expSpmBase, byteOffset);
+
+  // When readExpFromSpm is set, identify the sub+exp chain after the x read
+  // so we can skip them and use the exp buffer value directly.
+  Operation *subOp = nullptr;
+  Operation *expOp = nullptr;
+  if (readExpFromSpm) {
+    for (auto &op : oldBody->getOperations()) {
+      if (&op == xLoad.readOp.getOperation())
+        continue;
+      if (isa<arith::SubFOp>(op) &&
+          op.getOperand(0) == xLoad.readOp.getResult()) {
+        subOp = &op;
+        continue;
+      }
+      if (subOp && isa<math::ExpOp>(op) &&
+          op.getOperand(0) == subOp->getResult(0)) {
+        expOp = &op;
+        break;
+      }
+    }
+  }
+
   for (auto &op : oldBody->getOperations()) {
     if (isa<scf::YieldOp>(op))
       continue;
 
     if (&op == xLoad.readOp.getOperation()) {
+      if (readExpFromSpm && expSpmAddr) {
+        // Skip the x read entirely; the exp value comes from SPM.
+        mapping.map(xLoad.readOp.getResult(), xSpmAddr); // placeholder
+        continue;
+      }
       Value spmVal = emitSpmReadWithStrides(b, loc, xSpmAddr, xLoad.vecTy,
                                             spmMemStrides);
       mapping.map(xLoad.readOp.getResult(), spmVal);
       continue;
     }
 
-    b.clone(op, mapping);
+    if (readExpFromSpm && subOp && &op == subOp) {
+      // Skip sub; it's part of the replaced exp(x - max) chain.
+      continue;
+    }
+
+    if (readExpFromSpm && expOp && &op == expOp) {
+      // Replace exp(x - max) with a read from the exp SPM buffer.
+      Value expVal = emitSpmReadWithStrides(b, loc, expSpmAddr, xLoad.vecTy,
+                                            spmMemStrides);
+      mapping.map(expOp->getResult(0), expVal);
+      continue;
+    }
+
+    Operation *cloned = b.clone(op, mapping);
+
+    if (writeExpToSpm && expSpmAddr && isa<math::ExpOp>(op)) {
+      // Write the exp result to the exp SPM buffer.
+      Value expResult = cloned->getResult(0);
+      emitSpmWriteWithStrides(b, loc, expSpmAddr, expResult, spmMemStrides);
+    }
   }
 
   auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
@@ -2469,7 +2519,8 @@ static Operation *cloneBlockPrefixThrough(OpBuilder &b, Operation *target,
 static bool lowerSoftmaxRowBlockGroupDma(
     ReductionResidencyPlan &plan, int64_t rowSpmAddress0,
     int64_t rowSpmAddress1,
-    llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
+    llvm::DenseSet<Operation *> &rowResidentHandledLoops,
+    int64_t expSpmAddress = -1) {
   scf::ForOp outerLoop = plan.rowBlockGroupLoop;
   if (!outerLoop)
     return false;
@@ -2591,17 +2642,28 @@ static bool lowerSoftmaxRowBlockGroupDma(
       1, plan.trips * plan.producer.xLoad.vecTy.getShape()[0]};
   int64_t spmStepBytes = plan.elemBytes;
 
+  bool cacheExp = expSpmAddress >= 0;
+  Value expSpmBase;
+  if (cacheExp)
+    expSpmBase = i64Cst(b, loc, expSpmAddress);
+
   for (Operation &op : oldOuterBody->getOperations()) {
     if (isa<scf::YieldOp>(op))
       continue;
     if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
       std::optional<ReductionLoopResidencyUse> loopUse;
+      bool isExpSumLoop = false;
+      bool isNormLoop = false;
       if (forOp == plan.producer.forOp)
         loopUse = plan.producer;
       else {
-        for (const ReductionLoopResidencyUse &consumer : plan.consumers) {
-          if (forOp == consumer.forOp) {
-            loopUse = consumer;
+        for (unsigned i = 0; i < plan.consumers.size(); ++i) {
+          if (forOp == plan.consumers[i].forOp) {
+            loopUse = plan.consumers[i];
+            if (i == 0)
+              isExpSumLoop = true;
+            else if (i == 1)
+              isNormLoop = true;
             break;
           }
         }
@@ -2618,7 +2680,10 @@ static bool lowerSoftmaxRowBlockGroupDma(
             mapOrDefault(outerMapping, forOp.getStep()), initArgs);
         cloneLoopBodyWithRowBlockSpm(
             b, loc, forOp, newLoop, loopUse->xLoad, currentSpm,
-            plan.elemBytes, spmStepBytes, spmMemStrides, outerMapping);
+            plan.elemBytes, spmStepBytes, spmMemStrides, outerMapping,
+            cacheExp ? expSpmBase : nullptr,
+            /*writeExpToSpm=*/cacheExp && isExpSumLoop,
+            /*readExpFromSpm=*/cacheExp && isNormLoop);
         b.setInsertionPointAfter(newLoop);
         for (auto [oldResult, newResult] :
              llvm::zip_equal(forOp.getResults(), newLoop.getResults()))
@@ -2717,9 +2782,17 @@ static bool transformReductionResidencyPlan(
     if (!allocRow1)
       return reject("spm_capacity_overflow",
                     "SPM capacity cannot fit both row-block DMA buffers");
+    int64_t expSpmAddress = -1;
+    if (getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP", false)) {
+      auto allocExp = spmLayout.alloc(plan.bytes, /*alignment=*/1,
+                                      SPMSpaceManager::Lifetime::Loop);
+      if (allocExp)
+        expSpmAddress = allocExp->address;
+    }
     if (!lowerSoftmaxRowBlockGroupDma(plan, allocRow->address,
                                       allocRow1->address,
-                                      rowResidentHandledLoops))
+                                      rowResidentHandledLoops,
+                                      expSpmAddress))
       return reject("unsupported_reduction_residency_plan",
                     "row-block group DMA double-buffer lowering failed");
   } else if (plan.producerPass == ReductionProducerPass::FillOnFirstPass) {
