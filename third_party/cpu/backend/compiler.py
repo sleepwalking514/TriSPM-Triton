@@ -231,7 +231,7 @@ class CPUBackend(BaseBackend):
                 spm_base = int(os.getenv("TRITON_SPM_BASE", "0x40000000"), 0)
                 spm_size = int(os.getenv("TRITON_SPM_SIZE", "262144"), 0)
                 micro_m = int(os.getenv("TRITON_MICRO_M", "8"), 0)
-                window_k = int(os.getenv("TRITON_SPM_WINDOW_K", "4"), 0)
+                window_k = int(os.getenv("TRITON_SPM_WINDOW_K", "8"), 0)
                 enable_reductions = (
                     os.getenv("TRITON_ENABLE_SPM_REDUCTIONS", "0") == "1"
                 )

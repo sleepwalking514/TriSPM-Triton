@@ -267,7 +267,7 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
                "int64_t", /*default*/"8",
                "Micro-tile M dimension for fused SPM GEMM lowering.">,
         Option<"windowK", "window-k",
-               "int64_t", /*default*/"4",
+               "int64_t", /*default*/"8",
                "Maximum K-iteration window for resident B tiles.">,
         Option<"enableReductions", "enable-reductions",
                "bool", /*default*/"true",
