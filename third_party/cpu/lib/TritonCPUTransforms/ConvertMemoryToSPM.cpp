@@ -7,7 +7,11 @@
 //   1) GEMM double-buffering: K-loop with two tiled loads feeding a dot
 //      product.  Each load gets two SPM buffers; while the current tiles
 //      are computed, the next tiles are prefetched asynchronously.
-//   2) Reduction/streaming double-buffering: single loop with one or more
+//   2) Attention v2 residency: attention-style QK/PV loops stage the
+//      loop-invariant Q tile once in SPM.  An experimental K/V streaming
+//      schedule can also double-buffer loop-local K/V tiles without unrolling
+//      the original loop.
+//   3) Reduction/streaming double-buffering: single loop with one or more
 //      tiled loads sharing the loop IV.  Each load gets two SPM buffers; the
 //      next chunk is prefetched while the current chunk is consumed.
 //
@@ -17,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -43,6 +48,7 @@
 #include "triton/Dialect/TritonCPU/IR/Dialect.h"
 #include "triton/Dialect/TritonCPU/IR/SPMAttrs.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 
 namespace mlir {
@@ -126,6 +132,117 @@ static bool getEnvBool(StringRef name, bool defaultValue = false) {
              text.equals_insensitive("no") || text.equals_insensitive("off"));
   }
   return defaultValue;
+}
+
+static std::optional<bool> getEnvBoolOverride(StringRef name) {
+  if (std::getenv(name.str().c_str()))
+    return getEnvBool(name);
+  return std::nullopt;
+}
+
+struct SimpleLinearExpr {
+  Value symbol;
+  int64_t coeff = 0;
+  int64_t constant = 0;
+};
+
+static bool combineSimpleLinearExpr(const SimpleLinearExpr &lhs,
+                                    const SimpleLinearExpr &rhs, int64_t sign,
+                                    SimpleLinearExpr &result) {
+  if (lhs.symbol && rhs.symbol && lhs.symbol != rhs.symbol)
+    return false;
+
+  result.symbol = lhs.symbol ? lhs.symbol : rhs.symbol;
+  result.coeff = lhs.coeff + sign * rhs.coeff;
+  result.constant = lhs.constant + sign * rhs.constant;
+  if (result.coeff == 0)
+    result.symbol = Value();
+  return true;
+}
+
+static bool getSimpleLinearExpr(Value value, SimpleLinearExpr &expr) {
+  if (auto constant = getConstantIntValue(value)) {
+    expr = SimpleLinearExpr{/*symbol=*/Value(), /*coeff=*/0, *constant};
+    return true;
+  }
+
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp) {
+    expr = SimpleLinearExpr{/*symbol=*/value, /*coeff=*/1, /*constant=*/0};
+    return true;
+  }
+
+  if (auto castOp = dyn_cast<arith::IndexCastOp>(defOp))
+    return getSimpleLinearExpr(castOp.getIn(), expr);
+  if (auto extOp = dyn_cast<arith::ExtSIOp>(defOp))
+    return getSimpleLinearExpr(extOp.getIn(), expr);
+  if (auto extOp = dyn_cast<arith::ExtUIOp>(defOp))
+    return getSimpleLinearExpr(extOp.getIn(), expr);
+  if (auto truncOp = dyn_cast<arith::TruncIOp>(defOp))
+    return getSimpleLinearExpr(truncOp.getIn(), expr);
+
+  if (auto addOp = dyn_cast<arith::AddIOp>(defOp)) {
+    SimpleLinearExpr lhs, rhs;
+    if (!getSimpleLinearExpr(addOp.getLhs(), lhs) ||
+        !getSimpleLinearExpr(addOp.getRhs(), rhs))
+      return false;
+    return combineSimpleLinearExpr(lhs, rhs, /*sign=*/1, expr);
+  }
+
+  if (auto subOp = dyn_cast<arith::SubIOp>(defOp)) {
+    SimpleLinearExpr lhs, rhs;
+    if (!getSimpleLinearExpr(subOp.getLhs(), lhs) ||
+        !getSimpleLinearExpr(subOp.getRhs(), rhs))
+      return false;
+    return combineSimpleLinearExpr(lhs, rhs, /*sign=*/-1, expr);
+  }
+
+  if (auto mulOp = dyn_cast<arith::MulIOp>(defOp)) {
+    if (auto rhsCst = getConstantIntValue(mulOp.getRhs())) {
+      SimpleLinearExpr lhs;
+      if (!getSimpleLinearExpr(mulOp.getLhs(), lhs))
+        return false;
+      expr = SimpleLinearExpr{lhs.symbol, lhs.coeff * *rhsCst,
+                              lhs.constant * *rhsCst};
+      if (expr.coeff == 0)
+        expr.symbol = Value();
+      return true;
+    }
+    if (auto lhsCst = getConstantIntValue(mulOp.getLhs())) {
+      SimpleLinearExpr rhs;
+      if (!getSimpleLinearExpr(mulOp.getRhs(), rhs))
+        return false;
+      expr = SimpleLinearExpr{rhs.symbol, rhs.coeff * *lhsCst,
+                              rhs.constant * *lhsCst};
+      if (expr.coeff == 0)
+        expr.symbol = Value();
+      return true;
+    }
+    return false;
+  }
+
+  expr = SimpleLinearExpr{/*symbol=*/value, /*coeff=*/1, /*constant=*/0};
+  return true;
+}
+
+static std::optional<int64_t> getExactStaticTripCount(scf::ForOp forOp) {
+  auto stepCst = getConstantIntValue(forOp.getStep());
+  if (!stepCst || *stepCst <= 0)
+    return std::nullopt;
+
+  SimpleLinearExpr lb, ub;
+  if (!getSimpleLinearExpr(forOp.getLowerBound(), lb) ||
+      !getSimpleLinearExpr(forOp.getUpperBound(), ub))
+    return std::nullopt;
+
+  if (lb.symbol != ub.symbol || lb.coeff != ub.coeff)
+    return std::nullopt;
+
+  int64_t distance = ub.constant - lb.constant;
+  if (distance < 0 || distance % *stepCst != 0)
+    return std::nullopt;
+
+  return distance / *stepCst;
 }
 
 /// Cast a value to i64.  Handles index, i64 (no-op), and narrower integers.
@@ -213,8 +330,8 @@ static Value computePrologueDramAddr(OpBuilder &b, Location loc,
     return nullptr;
 
   auto *baseDefOp = base.getDefiningOp();
-  bool isBlockPtr = baseDefOp &&
-                    baseDefOp->getParentRegion() == &forOp.getRegion();
+  bool isBlockPtr =
+      baseDefOp && baseDefOp->getParentRegion() == &forOp.getRegion();
 
   Value ptrI64;
   SmallVector<Value> indices;
@@ -234,20 +351,19 @@ static Value computePrologueDramAddr(OpBuilder &b, Location loc,
       return nullptr;
 
     Value initBlockPtr = forOp.getInitArgs()[iterArgIdx];
-    Value initMemRef = triton::cpu::ExtractMemRefOp::create(
-        b, loc, memRefTy, initBlockPtr);
-    auto initIndicesOp = triton::cpu::ExtractIndicesOp::create(
-        b, loc, initBlockPtr);
+    Value initMemRef =
+        triton::cpu::ExtractMemRefOp::create(b, loc, memRefTy, initBlockPtr);
+    auto initIndicesOp =
+        triton::cpu::ExtractIndicesOp::create(b, loc, initBlockPtr);
 
-    Value ptrIdx = memref::ExtractAlignedPointerAsIndexOp::create(
-        b, loc, initMemRef);
+    Value ptrIdx =
+        memref::ExtractAlignedPointerAsIndexOp::create(b, loc, initMemRef);
     ptrI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), ptrIdx);
 
     for (auto r : initIndicesOp.getResults())
       indices.push_back(r);
   } else {
-    Value ptrIdx = memref::ExtractAlignedPointerAsIndexOp::create(
-        b, loc, base);
+    Value ptrIdx = memref::ExtractAlignedPointerAsIndexOp::create(b, loc, base);
     ptrI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), ptrIdx);
 
     Value lb = forOp.getLowerBound();
@@ -262,8 +378,8 @@ static Value computePrologueDramAddr(OpBuilder &b, Location loc,
 
   Value byteOff = i64Cst(b, loc, 0);
   for (unsigned i = 0; i < indices.size(); ++i) {
-    Value idxI64 = arith::IndexCastOp::create(
-        b, loc, b.getI64Type(), indices[i]);
+    Value idxI64 =
+        arith::IndexCastOp::create(b, loc, b.getI64Type(), indices[i]);
     Value contrib = arith::MulIOp::create(
         b, loc, idxI64, i64Cst(b, loc, strides[i] * elemBytes));
     byteOff = arith::AddIOp::create(b, loc, byteOff, contrib);
@@ -273,29 +389,27 @@ static Value computePrologueDramAddr(OpBuilder &b, Location loc,
 
 /// Compute the DRAM byte address represented by a tensor pointer value.
 static Value computeTensorPtrDramAddr(OpBuilder &b, Location loc,
-                                      Value tensorPtr,
-                                      MemRefType memRefTy) {
+                                      Value tensorPtr, MemRefType memRefTy) {
   unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
 
   SmallVector<int64_t> strides;
   if (!getStaticStrides(memRefTy, strides))
     return nullptr;
 
-  Value memRef = triton::cpu::ExtractMemRefOp::create(
-      b, loc, memRefTy, tensorPtr);
+  Value memRef =
+      triton::cpu::ExtractMemRefOp::create(b, loc, memRefTy, tensorPtr);
   auto indicesOp = triton::cpu::ExtractIndicesOp::create(b, loc, tensorPtr);
   if (indicesOp.getNumResults() != strides.size())
     return nullptr;
 
-  Value ptrIdx = memref::ExtractAlignedPointerAsIndexOp::create(
-      b, loc, memRef);
+  Value ptrIdx = memref::ExtractAlignedPointerAsIndexOp::create(b, loc, memRef);
   Value ptrI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), ptrIdx);
 
   Value byteOff = i64Cst(b, loc, 0);
   for (auto [idx, stride] : llvm::zip_equal(indicesOp.getResults(), strides)) {
     Value idxI64 = toI64(b, loc, idx);
-    Value contrib = arith::MulIOp::create(
-        b, loc, idxI64, i64Cst(b, loc, stride * elemBytes));
+    Value contrib = arith::MulIOp::create(b, loc, idxI64,
+                                          i64Cst(b, loc, stride * elemBytes));
     byteOff = arith::AddIOp::create(b, loc, byteOff, contrib);
   }
   return arith::AddIOp::create(b, loc, ptrI64, byteOff);
@@ -335,9 +449,9 @@ static bool canComputePrologueDramAddr(vector::TransferReadOp readOp,
   return true;
 }
 
-static std::optional<int64_t>
-getLoopStepBytes(vector::TransferReadOp readOp, scf::ForOp forOp,
-                 bool requireLoopIv) {
+static std::optional<int64_t> getLoopStepBytes(vector::TransferReadOp readOp,
+                                               scf::ForOp forOp,
+                                               bool requireLoopIv) {
   auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
   if (!memRefTy)
     return std::nullopt;
@@ -363,9 +477,9 @@ getLoopStepBytes(vector::TransferReadOp readOp, scf::ForOp forOp,
 }
 
 /// Emit triton_cpu.dma_enqueue_2d for a 2D tile.
-static void emitDmaEnqueue(OpBuilder &b, Location loc,
-                           Value spmAddr, Value dramAddr,
-                           VectorType vecTy, MemRefType memRefTy) {
+static void emitDmaEnqueue(OpBuilder &b, Location loc, Value spmAddr,
+                           Value dramAddr, VectorType vecTy,
+                           MemRefType memRefTy) {
   unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
   auto shape = vecTy.getShape();
   int64_t rows = (shape.size() >= 2) ? shape[0] : 1;
@@ -374,30 +488,28 @@ static void emitDmaEnqueue(OpBuilder &b, Location loc,
   SmallVector<int64_t> strides;
   int64_t offset;
   (void)memRefTy.getStridesAndOffset(strides, offset);
-  int64_t srcStrideBytes =
-      (shape.size() >= 2 ? strides[0] : cols) * elemBytes;
+  int64_t srcStrideBytes = (shape.size() >= 2 ? strides[0] : cols) * elemBytes;
 
   triton::cpu::DmaEnqueue2DOp::create(
-      b, loc,
-      spmAddr, dramAddr,
-      i64Cst(b, loc, cols * elemBytes),   // width
-      i64Cst(b, loc, rows),               // height
-      i64Cst(b, loc, srcStrideBytes),      // src_stride
-      i64Cst(b, loc, cols * elemBytes));   // dst_stride (packed)
+      b, loc, spmAddr, dramAddr, i64Cst(b, loc, cols * elemBytes), // width
+      i64Cst(b, loc, rows),                                        // height
+      i64Cst(b, loc, srcStrideBytes),                              // src_stride
+      i64Cst(b, loc, cols * elemBytes)); // dst_stride (packed)
 }
 
-static bool hasColMajorRowBlockDmaLayout(VectorType vecTy, MemRefType memRefTy) {
+static bool hasColMajorRowBlockDmaLayout(VectorType vecTy,
+                                         MemRefType memRefTy) {
   if (vecTy.getRank() != 2)
     return false;
   SmallVector<int64_t> strides;
   if (!getStaticStrides(memRefTy, strides) || strides.size() < 2)
     return false;
-  return strides[0] == 1 && strides[1] > vecTy.getShape()[0];
+  return strides[0] == 1 && strides[1] >= vecTy.getShape()[0];
 }
 
-static void emitRowBlockDmaEnqueue(OpBuilder &b, Location loc,
-                                   Value spmAddr, Value dramAddr,
-                                   VectorType vecTy, MemRefType memRefTy) {
+static void emitRowBlockDmaEnqueue(OpBuilder &b, Location loc, Value spmAddr,
+                                   Value dramAddr, VectorType vecTy,
+                                   MemRefType memRefTy) {
   unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
   auto shape = vecTy.getShape();
   if (!hasColMajorRowBlockDmaLayout(vecTy, memRefTy)) {
@@ -411,16 +523,14 @@ static void emitRowBlockDmaEnqueue(OpBuilder &b, Location loc,
   int64_t columns = shape[0];
   int64_t rows = shape[1];
   triton::cpu::DmaEnqueue2DOp::create(
-      b, loc,
-      spmAddr, dramAddr,
-      i64Cst(b, loc, columns * elemBytes),      // width: one row chunk
-      i64Cst(b, loc, rows),                     // height: row block
-      i64Cst(b, loc, strides[1] * elemBytes),   // source row stride
-      i64Cst(b, loc, columns * elemBytes));     // packed SPM row stride
+      b, loc, spmAddr, dramAddr,
+      i64Cst(b, loc, columns * elemBytes),    // width: one row chunk
+      i64Cst(b, loc, rows),                   // height: row block
+      i64Cst(b, loc, strides[1] * elemBytes), // source row stride
+      i64Cst(b, loc, columns * elemBytes));   // packed SPM row stride
 }
 
-static SmallVector<int64_t, 2>
-getDefaultSpmMemStrides(VectorType vecTy) {
+static SmallVector<int64_t, 2> getDefaultSpmMemStrides(VectorType vecTy) {
   auto shape = vecTy.getShape();
   int64_t cols = (shape.size() >= 2) ? shape[1] : shape[0];
   if (vecTy.getRank() == 1)
@@ -435,6 +545,22 @@ getRowBlockDmaSpmMemStrides(VectorType vecTy, MemRefType memRefTy) {
   return SmallVector<int64_t, 2>{1, vecTy.getShape()[0]};
 }
 
+static SmallVector<int64_t, 2> getDmaFilledSpmMemStrides(VectorType vecTy,
+                                                         MemRefType memRefTy) {
+  if (hasColMajorRowBlockDmaLayout(vecTy, memRefTy))
+    return getRowBlockDmaSpmMemStrides(vecTy, memRefTy);
+  return getDefaultSpmMemStrides(vecTy);
+}
+
+static void emitDmaFilledEnqueue(OpBuilder &b, Location loc, Value spmAddr,
+                                 Value dramAddr, VectorType vecTy,
+                                 MemRefType memRefTy) {
+  if (hasColMajorRowBlockDmaLayout(vecTy, memRefTy))
+    emitRowBlockDmaEnqueue(b, loc, spmAddr, dramAddr, vecTy, memRefTy);
+  else
+    emitDmaEnqueue(b, loc, spmAddr, dramAddr, vecTy, memRefTy);
+}
+
 /// Create a memref in SPM address space (3) via reinterpret_cast, and
 /// emit a vector.transfer_read from it.
 ///
@@ -442,8 +568,8 @@ getRowBlockDmaSpmMemStrides(VectorType vecTy, MemRefType memRefTy) {
 /// using unrealized_conversion_cast (i64 → memref), then reinterpret_cast
 /// it to the desired shape.  The LLVM lowering will turn this into an
 /// inttoptr + load from address space 3.
-static Value emitSpmReadWithStrides(OpBuilder &b, Location loc,
-                                    Value spmAddr, VectorType vecTy,
+static Value emitSpmReadWithStrides(OpBuilder &b, Location loc, Value spmAddr,
+                                    VectorType vecTy,
                                     ArrayRef<int64_t> memStrides) {
   auto shape = vecTy.getShape();
   auto elemTy = vecTy.getElementType();
@@ -451,17 +577,16 @@ static Value emitSpmReadWithStrides(OpBuilder &b, Location loc,
   // Build the target SPM memref type: packed layout, address space 3.
   SmallVector<int64_t> memShape(shape.begin(), shape.end());
   auto layout = StridedLayoutAttr::get(b.getContext(), 0, memStrides);
-  auto spmMemRefTy = MemRefType::get(
-      memShape, elemTy, layout,
-      b.getI64IntegerAttr(SPM_ADDR_SPACE));
+  auto spmMemRefTy = MemRefType::get(memShape, elemTy, layout,
+                                     b.getI64IntegerAttr(SPM_ADDR_SPACE));
 
   // Create a 0-d base memref in address space 3 from the i64 address.
   // unrealized_conversion_cast will be resolved during LLVM lowering.
-  auto baseMemRefTy = MemRefType::get(
-      {}, elemTy, /*layout=*/nullptr,
-      b.getI64IntegerAttr(SPM_ADDR_SPACE));
-  Value baseMemRef = UnrealizedConversionCastOp::create(
-      b, loc, baseMemRefTy, spmAddr)->getResult(0);
+  auto baseMemRefTy = MemRefType::get({}, elemTy, /*layout=*/nullptr,
+                                      b.getI64IntegerAttr(SPM_ADDR_SPACE));
+  Value baseMemRef =
+      UnrealizedConversionCastOp::create(b, loc, baseMemRefTy, spmAddr)
+          ->getResult(0);
 
   // Reinterpret to the tiled shape with static offset 0.
   SmallVector<OpFoldResult> sizes;
@@ -477,38 +602,36 @@ static Value emitSpmReadWithStrides(OpBuilder &b, Location loc,
 
   // Read from SPM memref.
   SmallVector<Value> zeroIndices(vecTy.getRank(), idxCst(b, loc, 0));
-  auto padVal = arith::ConstantOp::create(
-      b, loc, elemTy, b.getZeroAttr(elemTy));
+  auto padVal =
+      arith::ConstantOp::create(b, loc, elemTy, b.getZeroAttr(elemTy));
   return vector::TransferReadOp::create(
       b, loc, vecTy, spmView, zeroIndices, padVal,
       SmallVector<bool>(vecTy.getRank(), true));
 }
 
-static Value emitSpmRead(OpBuilder &b, Location loc,
-                         Value spmAddr, VectorType vecTy) {
+static Value emitSpmRead(OpBuilder &b, Location loc, Value spmAddr,
+                         VectorType vecTy) {
   return emitSpmReadWithStrides(b, loc, spmAddr, vecTy,
                                 getDefaultSpmMemStrides(vecTy));
 }
 
 /// Emit a vector.transfer_write to an SPM address.
-static void emitSpmWriteWithStrides(OpBuilder &b, Location loc,
-                                    Value spmAddr, Value value,
-                                    ArrayRef<int64_t> memStrides) {
+static void emitSpmWriteWithStrides(OpBuilder &b, Location loc, Value spmAddr,
+                                    Value value, ArrayRef<int64_t> memStrides) {
   auto vecTy = cast<VectorType>(value.getType());
   auto shape = vecTy.getShape();
   auto elemTy = vecTy.getElementType();
 
   SmallVector<int64_t> memShape(shape.begin(), shape.end());
   auto layout = StridedLayoutAttr::get(b.getContext(), 0, memStrides);
-  auto spmMemRefTy = MemRefType::get(
-      memShape, elemTy, layout,
-      b.getI64IntegerAttr(SPM_ADDR_SPACE));
+  auto spmMemRefTy = MemRefType::get(memShape, elemTy, layout,
+                                     b.getI64IntegerAttr(SPM_ADDR_SPACE));
 
-  auto baseMemRefTy = MemRefType::get(
-      {}, elemTy, /*layout=*/nullptr,
-      b.getI64IntegerAttr(SPM_ADDR_SPACE));
-  Value baseMemRef = UnrealizedConversionCastOp::create(
-      b, loc, baseMemRefTy, spmAddr)->getResult(0);
+  auto baseMemRefTy = MemRefType::get({}, elemTy, /*layout=*/nullptr,
+                                      b.getI64IntegerAttr(SPM_ADDR_SPACE));
+  Value baseMemRef =
+      UnrealizedConversionCastOp::create(b, loc, baseMemRefTy, spmAddr)
+          ->getResult(0);
 
   SmallVector<OpFoldResult> sizes;
   SmallVector<OpFoldResult> stridesFold;
@@ -522,13 +645,12 @@ static void emitSpmWriteWithStrides(OpBuilder &b, Location loc,
       /*offset=*/b.getIndexAttr(0), sizes, stridesFold);
 
   SmallVector<Value> zeroIndices(vecTy.getRank(), idxCst(b, loc, 0));
-  vector::TransferWriteOp::create(
-      b, loc, value, spmView, zeroIndices,
-      SmallVector<bool>(vecTy.getRank(), true));
+  vector::TransferWriteOp::create(b, loc, value, spmView, zeroIndices,
+                                  SmallVector<bool>(vecTy.getRank(), true));
 }
 
-static void emitSpmWrite(OpBuilder &b, Location loc,
-                         Value spmAddr, Value value) {
+static void emitSpmWrite(OpBuilder &b, Location loc, Value spmAddr,
+                         Value value) {
   auto vecTy = cast<VectorType>(value.getType());
   emitSpmWriteWithStrides(b, loc, spmAddr, value,
                           getDefaultSpmMemStrides(vecTy));
@@ -544,14 +666,44 @@ struct TiledLoadInfo {
   bool feedsDot; // true if a user is vector.contract or triton_cpu.dot
 };
 
-/// Check if a transfer_read feeds a dot-like operation.
-static bool readFeedsDot(vector::TransferReadOp readOp) {
-  for (auto *user : readOp->getUsers()) {
-    if (isa<vector::ContractionOp>(user) ||
-        isa<triton::cpu::DotOp>(user))
+static bool isShapePreservingCastLikeOp(Operation *op) {
+  if (!op || op->getNumOperands() != 1 || op->getNumResults() != 1)
+    return false;
+  return isa<arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp,
+             arith::TruncIOp, arith::IndexCastOp, arith::BitcastOp,
+             vector::ShapeCastOp, UnrealizedConversionCastOp>(op);
+}
+
+static bool valueFeedsDot(Value value, unsigned depth = 0) {
+  if (!value || depth > 4)
+    return false;
+  for (auto *user : value.getUsers()) {
+    if (isa<vector::ContractionOp>(user) || isa<triton::cpu::DotOp>(user))
+      return true;
+    if (isShapePreservingCastLikeOp(user) &&
+        valueFeedsDot(user->getResult(0), depth + 1))
       return true;
   }
   return false;
+}
+
+static vector::TransferReadOp
+getTransferReadThroughShapePreservingCasts(Value value, unsigned depth = 0) {
+  if (!value || depth > 4)
+    return {};
+  if (auto readOp = value.getDefiningOp<vector::TransferReadOp>())
+    return readOp;
+  Operation *defOp = value.getDefiningOp();
+  if (!isShapePreservingCastLikeOp(defOp))
+    return {};
+  return getTransferReadThroughShapePreservingCasts(defOp->getOperand(0),
+                                                    depth + 1);
+}
+
+/// Check if a transfer_read feeds a dot-like operation, allowing the common
+/// tl.load(...).to(f32) cast between the read and the contract.
+static bool readFeedsDot(vector::TransferReadOp readOp) {
+  return valueFeedsDot(readOp.getResult());
 }
 
 /// Find eligible tiled loads inside an scf.for body.
@@ -675,11 +827,9 @@ struct ReductionResidencyPlan {
   unsigned elemBytes = 0;
   int64_t uses = 0;
   int64_t requiredSpmSlots = 1;
-  ReductionProducerPass producerPass =
-      ReductionProducerPass::FillOnFirstPass;
+  ReductionProducerPass producerPass = ReductionProducerPass::FillOnFirstPass;
   ReductionBufferRole bufferRole = ReductionBufferRole::ResidentRow;
-  ReductionRotationPolicy rotationPolicy =
-      ReductionRotationPolicy::None;
+  ReductionRotationPolicy rotationPolicy = ReductionRotationPolicy::None;
   ReductionCopyInMode copyInMode = ReductionCopyInMode::CpuDirect;
   std::string copyIn = "CPU/vector store";
   std::string copyOut = "none";
@@ -697,11 +847,10 @@ static bool isRowBlockDmaProducerPassMode(StringRef mode) {
 static ReductionProducerPass parseReductionProducerPass(StringRef mode) {
   if (mode.empty())
     return ReductionProducerPass::FillOnFirstPass;
-  if (mode == "fill_on_first_pass" || mode == "first" ||
-      mode == "first_pass")
+  if (mode == "fill_on_first_pass" || mode == "first" || mode == "first_pass")
     return ReductionProducerPass::FillOnFirstPass;
-  if (mode == "producer_store" || mode == "second" ||
-      mode == "second_pass" || mode == "consumer_store")
+  if (mode == "producer_store" || mode == "second" || mode == "second_pass" ||
+      mode == "consumer_store")
     return ReductionProducerPass::ProducerStore;
   if (mode == "dma_prefetch" || mode == "dma" || mode == "prefetch")
     return ReductionProducerPass::DmaPrefetch;
@@ -768,8 +917,7 @@ static bool isGemmContract(vector::ContractionOp op) {
   auto get = [](Attribute a) {
     return cast<vector::IteratorTypeAttr>(a).getValue();
   };
-  if (get(iterTypes[0]) != IT::parallel ||
-      get(iterTypes[1]) != IT::parallel ||
+  if (get(iterTypes[0]) != IT::parallel || get(iterTypes[1]) != IT::parallel ||
       get(iterTypes[2]) != IT::reduction)
     return false;
   auto maps = op.getIndexingMaps();
@@ -789,8 +937,7 @@ struct GemmContractInfo {
 };
 
 static std::optional<GemmContractInfo>
-analyzeGemmContract(scf::ForOp forOp,
-                    vector::TransferReadOp readA,
+analyzeGemmContract(scf::ForOp forOp, vector::TransferReadOp readA,
                     vector::TransferReadOp readB) {
   vector::ContractionOp contractOp;
   for (auto *user : readA->getUsers()) {
@@ -1016,8 +1163,7 @@ static void writeJsonStringArray(llvm::raw_ostream &os,
   os << "]";
 }
 
-static void writePromotionFieldKinds(llvm::raw_ostream &os,
-                                     StringRef indent) {
+static void writePromotionFieldKinds(llvm::raw_ostream &os, StringRef indent) {
   os << indent << "\"field_kinds\": {\n";
   os << indent << "  \"source\": \"exact\",\n";
   os << indent << "  \"scope\": \"exact\",\n";
@@ -1051,30 +1197,28 @@ static void writeProfitabilityEvidence(llvm::raw_ostream &os,
   os << indent << "  \"reason\": ";
   writeJsonString(os, evidence.reason);
   os << ",\n";
-  os << indent << "  \"dma_descriptors\": " << evidence.dmaDescriptors
-     << ",\n";
+  os << indent << "  \"dma_descriptors\": " << evidence.dmaDescriptors << ",\n";
   os << indent << "  \"mmio_stores\": " << evidence.mmioStores << ",\n";
   os << indent << "  \"waits\": " << evidence.waits << ",\n";
   os << indent << "  \"fences\": " << evidence.fences << ",\n";
   os << indent << "  \"copy_bytes\": " << evidence.copyBytes << ",\n";
-  os << indent << "  \"spm_write_bytes\": " << evidence.spmWriteBytes
-     << ",\n";
-  os << indent << "  \"spm_read_bytes\": " << evidence.spmReadBytes
-     << ",\n";
+  os << indent << "  \"spm_write_bytes\": " << evidence.spmWriteBytes << ",\n";
+  os << indent << "  \"spm_read_bytes\": " << evidence.spmReadBytes << ",\n";
   os << indent << "  \"avoided_repeated_read_bytes\": "
      << evidence.avoidedRepeatedReadBytes << ",\n";
   os << indent << "  \"live_spm_bytes\": " << evidence.liveSpmBytes << ",\n";
-  os << indent << "  \"estimated_extra_ops\": "
-     << evidence.estimatedExtraOps << ",\n";
-  os << indent << "  \"measured_bank_conflicts\": "
-     << evidence.measuredBankConflicts << ",\n";
+  os << indent << "  \"estimated_extra_ops\": " << evidence.estimatedExtraOps
+     << ",\n";
+  os << indent
+     << "  \"measured_bank_conflicts\": " << evidence.measuredBankConflicts
+     << ",\n";
   os << indent << "  \"uses\": " << evidence.uses << "\n";
   os << indent << "}";
 }
 
-static void writeResidencyPlanEvidence(
-    llvm::raw_ostream &os, const SPMResidencyPlanEvidence &evidence,
-    StringRef indent) {
+static void writeResidencyPlanEvidence(llvm::raw_ostream &os,
+                                       const SPMResidencyPlanEvidence &evidence,
+                                       StringRef indent) {
   os << indent << "\"residency_plan\": {\n";
   os << indent << "  \"producer_pass\": ";
   writeJsonString(os, evidence.producerPass);
@@ -1091,8 +1235,8 @@ static void writeResidencyPlanEvidence(
   os << indent << "  \"copy_in_mode\": ";
   writeJsonString(os, evidence.copyInMode);
   os << ",\n";
-  os << indent << "  \"required_spm_slots\": "
-     << evidence.requiredSpmSlots << ",\n";
+  os << indent << "  \"required_spm_slots\": " << evidence.requiredSpmSlots
+     << ",\n";
   os << indent << "  \"expected_markers\": ";
   writeJsonStringArray(os, evidence.expectedMarkers);
   os << "\n";
@@ -1111,8 +1255,9 @@ static SPMPromotionRejection makePromotionRejection(StringRef pattern,
   return rejection;
 }
 
-static SPMPromotionRecord makeReductionResidencyRecord(
-    const ReductionResidencyPlan &plan, int64_t spmAddress) {
+static SPMPromotionRecord
+makeReductionResidencyRecord(const ReductionResidencyPlan &plan,
+                             int64_t spmAddress) {
   SPMPromotionRecord record;
   record.source = plan.source;
   record.scope = plan.scope;
@@ -1136,8 +1281,8 @@ static SPMPromotionRecord makeReductionResidencyRecord(
           "accepted by the opt-in row-block resident reduction prototype";
     } else {
       record.reasonCode = "accepted_dma_prefetch_row_resident";
-      record.reason =
-          "accepted by the opt-in DMA-prefetch row-resident reduction prototype";
+      record.reason = "accepted by the opt-in DMA-prefetch row-resident "
+                      "reduction prototype";
     }
   } else {
     record.reasonCode = "accepted_row_resident_fill_first";
@@ -1149,10 +1294,10 @@ static SPMPromotionRecord makeReductionResidencyRecord(
   return record;
 }
 
-static SPMPromotionRejection makeRowResidentRejection(
-    StringRef reasonCode, StringRef reason,
-    ArrayRef<int64_t> shape = ArrayRef<int64_t>(), int64_t uses = 0,
-    int64_t bytes = 0) {
+static SPMPromotionRejection
+makeRowResidentRejection(StringRef reasonCode, StringRef reason,
+                         ArrayRef<int64_t> shape = ArrayRef<int64_t>(),
+                         int64_t uses = 0, int64_t bytes = 0) {
   SPMPromotionRejection rejection =
       makePromotionRejection("row_resident_reduction", reasonCode, reason);
   rejection.source = "LayerNorm x row";
@@ -1165,9 +1310,9 @@ static SPMPromotionRejection makeRowResidentRejection(
   return rejection;
 }
 
-static SPMPromotionRejection makeReductionResidencyRejection(
-    const ReductionResidencyPlan &plan, StringRef reasonCode,
-    StringRef reason) {
+static SPMPromotionRejection
+makeReductionResidencyRejection(const ReductionResidencyPlan &plan,
+                                StringRef reasonCode, StringRef reason) {
   SPMPromotionRejection rejection =
       makePromotionRejection(plan.pattern, reasonCode, reason);
   rejection.source = plan.source;
@@ -1200,7 +1345,8 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
   os << "{\n";
   os << "  \"schema_version\": 1,\n";
   os << "  \"schema\": \"triton_cpu_spm_promotion_d1\",\n";
-  os << "  \"contract\": \"debug/evidence sidecar; not a graph manifest or durable IR contract\",\n";
+  os << "  \"contract\": \"debug/evidence sidecar; not a graph manifest or "
+        "durable IR contract\",\n";
   os << "  \"kernel\": ";
   writeJsonString(os, funcOp.getName());
   os << ",\n";
@@ -1376,8 +1522,7 @@ static bool sameStaticLoopShape(scf::ForOp lhs, scf::ForOp rhs) {
          *lhsLb == *rhsLb && *lhsUb == *rhsUb && *lhsStep == *rhsStep;
 }
 
-static bool isSupportedRowResidentXLoad(TiledLoadInfo load,
-                                        scf::ForOp forOp,
+static bool isSupportedRowResidentXLoad(TiledLoadInfo load, scf::ForOp forOp,
                                         unsigned &elemBytes) {
   if (load.feedsDot || load.vecTy.getRank() != 1)
     return false;
@@ -1398,8 +1543,7 @@ static bool isSupportedRowResidentXLoad(TiledLoadInfo load,
   if (!stepCst || *stepCst != load.vecTy.getNumElements())
     return false;
 
-  auto stepBytes =
-      getLoopStepBytes(load.readOp, forOp, /*requireLoopIv=*/true);
+  auto stepBytes = getLoopStepBytes(load.readOp, forOp, /*requireLoopIv=*/true);
   elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
   return stepBytes && *stepBytes == static_cast<int64_t>(elemBytes) &&
          canComputePrologueDramAddr(load.readOp, forOp);
@@ -1410,8 +1554,7 @@ static bool isSupportedSoftmaxRowBlockXLoad(TiledLoadInfo load,
                                             unsigned &elemBytes) {
   vector::TransferReadOp readOp = load.readOp;
   auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
-  if (!memRefTy || load.vecTy.getRank() != 2 ||
-      memRefTy.getRank() != 2 ||
+  if (!memRefTy || load.vecTy.getRank() != 2 || memRefTy.getRank() != 2 ||
       !memRefTy.getElementType().isF32())
     return false;
 
@@ -1424,19 +1567,16 @@ static bool isSupportedSoftmaxRowBlockXLoad(TiledLoadInfo load,
       strides[0] != 1 || strides[1] <= load.vecTy.getShape()[0])
     return false;
 
-  auto stepBytes =
-      getLoopStepBytes(readOp, forOp, /*requireLoopIv=*/true);
+  auto stepBytes = getLoopStepBytes(readOp, forOp, /*requireLoopIv=*/true);
   elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
   return stepBytes && *stepBytes == static_cast<int64_t>(elemBytes) &&
          canComputePrologueDramAddr(readOp, forOp);
 }
 
-static std::optional<ReductionResidencyPlan>
-matchLayerNormResidencyPlan(ArrayRef<scf::ForOp> loops,
-                            FunctionOpInterface funcOp,
-                            std::string &rejectReasonCode,
-                            std::string &rejectReason,
-                            StringRef producerPassMode) {
+static std::optional<ReductionResidencyPlan> matchLayerNormResidencyPlan(
+    ArrayRef<scf::ForOp> loops, FunctionOpInterface funcOp,
+    std::string &rejectReasonCode, std::string &rejectReason,
+    StringRef producerPassMode) {
   if (loops.size() < 3) {
     rejectReasonCode = "unsupported_pattern";
     rejectReason = "expected three top-level LayerNorm row loops";
@@ -1454,8 +1594,7 @@ matchLayerNormResidencyPlan(ArrayRef<scf::ForOp> loops,
     SmallVector<TiledLoadInfo> meanLoads = findTiledLoads(meanLoop);
     SmallVector<TiledLoadInfo> varLoads = findTiledLoads(varLoop);
     SmallVector<TiledLoadInfo> normLoads = findTiledLoads(normLoop);
-    if (meanLoads.size() != 1 || varLoads.size() != 1 ||
-        normLoads.size() < 3)
+    if (meanLoads.size() != 1 || varLoads.size() != 1 || normLoads.size() < 3)
       continue;
 
     BlockArgument meanArg =
@@ -1511,8 +1650,7 @@ matchLayerNormResidencyPlan(ArrayRef<scf::ForOp> loops,
     ReductionResidencyPlan plan;
     plan.source = "LayerNorm x row";
     plan.sourceArg = meanArg;
-    plan.producer =
-        ReductionLoopResidencyUse{"mean", meanLoop, meanLoads[0]};
+    plan.producer = ReductionLoopResidencyUse{"mean", meanLoop, meanLoads[0]};
     plan.consumers.push_back(
         ReductionLoopResidencyUse{"variance", varLoop, varLoads[0]});
     plan.consumers.push_back(
@@ -1558,12 +1696,10 @@ static bool loopContainsTransferWrite(scf::ForOp forOp) {
   return found;
 }
 
-static std::optional<ReductionResidencyPlan>
-matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
-                          FunctionOpInterface funcOp,
-                          std::string &rejectReasonCode,
-                          std::string &rejectReason,
-                          StringRef producerPassMode) {
+static std::optional<ReductionResidencyPlan> matchSoftmaxResidencyPlan(
+    ArrayRef<scf::ForOp> loops, FunctionOpInterface funcOp,
+    std::string &rejectReasonCode, std::string &rejectReason,
+    StringRef producerPassMode) {
   if (loops.size() < 3) {
     rejectReasonCode = "unsupported_pattern";
     rejectReason = "expected three top-level Softmax row loops";
@@ -1581,8 +1717,8 @@ matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
     SmallVector<TiledLoadInfo> maxLoads = findTiledLoads(maxLoop);
     SmallVector<TiledLoadInfo> sumLoads = findTiledLoads(sumLoop);
     SmallVector<TiledLoadInfo> normLoads = findTiledLoads(normLoop);
-    if (maxLoads.size() != 1 || sumLoads.size() != 1 ||
-        normLoads.empty() || !loopContainsTransferWrite(normLoop))
+    if (maxLoads.size() != 1 || sumLoads.size() != 1 || normLoads.empty() ||
+        !loopContainsTransferWrite(normLoop))
       continue;
 
     BlockArgument maxArg =
@@ -1619,8 +1755,8 @@ matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
                                            elemBytesSum) &&
                isSupportedRowResidentXLoad(*normXLoad, normLoop,
                                            elemBytesNorm));
-    if (!supportedLoads ||
-        elemBytes != elemBytesSum || elemBytes != elemBytesNorm) {
+    if (!supportedLoads || elemBytes != elemBytesSum ||
+        elemBytes != elemBytesNorm) {
       rejectReasonCode = "unsupported_pattern";
       rejectReason = rowBlockPlan
                          ? "row-block DMA candidate requires rank-2 "
@@ -1653,8 +1789,7 @@ matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
     ReductionResidencyPlan plan;
     plan.source = rowBlockPlan ? "Softmax x row block" : "Softmax x row";
     plan.sourceArg = maxArg;
-    plan.producer =
-        ReductionLoopResidencyUse{"max", maxLoop, maxLoads[0]};
+    plan.producer = ReductionLoopResidencyUse{"max", maxLoop, maxLoads[0]};
     plan.consumers.push_back(
         ReductionLoopResidencyUse{"exp_sum", sumLoop, sumLoads[0]});
     plan.consumers.push_back(
@@ -1682,9 +1817,8 @@ matchSoftmaxResidencyPlan(ArrayRef<scf::ForOp> loops,
     plan.copyOut = "none";
     plan.overhead =
         "first reduction pass writes each loaded x chunk into SPM; no DMA wait";
-    plan.benefit =
-        "x[row, :] is materialized once and reused by exp/sum and "
-        "normalize/store";
+    plan.benefit = "x[row, :] is materialized once and reused by exp/sum and "
+                   "normalize/store";
     plan.expectedMarkers.push_back("addrspace(3)");
     plan.expectedMarkers.push_back("no_dma_descriptors");
     plan.expectedMarkers.push_back("no_fence_iorw");
@@ -1722,8 +1856,7 @@ static Value constantVector(OpBuilder &b, Location loc, VectorType ty,
 static triton::MakeTensorPtrOp findLoopInitMakeTensorPtr(scf::ForOp forOp) {
   if (forOp.getInitArgs().empty())
     return {};
-  return forOp.getInitArgs().front()
-      .getDefiningOp<triton::MakeTensorPtrOp>();
+  return forOp.getInitArgs().front().getDefiningOp<triton::MakeTensorPtrOp>();
 }
 
 static std::optional<int64_t> firstStaticDim(ValueRange values) {
@@ -1735,8 +1868,8 @@ static std::optional<int64_t> firstStaticDim(ValueRange values) {
 static Value emitTensorPtrTransferRead(OpBuilder &b, Location loc,
                                        Value tensorPtr, MemRefType memRefTy,
                                        VectorType vecTy) {
-  Value memRef = triton::cpu::ExtractMemRefOp::create(
-      b, loc, memRefTy, tensorPtr);
+  Value memRef =
+      triton::cpu::ExtractMemRefOp::create(b, loc, memRefTy, tensorPtr);
   auto indices = triton::cpu::ExtractIndicesOp::create(b, loc, tensorPtr);
   if (indices.getNumResults() != static_cast<unsigned>(vecTy.getRank()))
     return {};
@@ -1755,16 +1888,15 @@ static bool emitTensorPtrTransferWrite(OpBuilder &b, Location loc,
   auto vecTy = dyn_cast<VectorType>(value.getType());
   if (!vecTy)
     return false;
-  Value memRef = triton::cpu::ExtractMemRefOp::create(
-      b, loc, memRefTy, tensorPtr);
+  Value memRef =
+      triton::cpu::ExtractMemRefOp::create(b, loc, memRefTy, tensorPtr);
   auto indices = triton::cpu::ExtractIndicesOp::create(b, loc, tensorPtr);
   if (indices.getNumResults() != static_cast<unsigned>(vecTy.getRank()))
     return false;
   SmallVector<Value> indexVals(indices.getResults().begin(),
                                indices.getResults().end());
-  vector::TransferWriteOp::create(
-      b, loc, value, memRef, indexVals,
-      SmallVector<bool>(vecTy.getRank(), true));
+  vector::TransferWriteOp::create(b, loc, value, memRef, indexVals,
+                                  SmallVector<bool>(vecTy.getRank(), true));
   return true;
 }
 
@@ -1819,9 +1951,8 @@ static bool eraseContiguousOps(Operation *start, Operation *end) {
 }
 
 static Operation *setInsertionPointBeforeTerminator(OpBuilder &b, Block *body) {
-  Operation *terminator = body->mightHaveTerminator()
-                              ? body->getTerminator()
-                              : nullptr;
+  Operation *terminator =
+      body->mightHaveTerminator() ? body->getTerminator() : nullptr;
   if (terminator)
     b.setInsertionPoint(terminator);
   else
@@ -1829,17 +1960,18 @@ static Operation *setInsertionPointBeforeTerminator(OpBuilder &b, Block *body) {
   return terminator;
 }
 
-static bool lowerCanonicalSoftmaxToRowBlockGroup(
-    ArrayRef<scf::ForOp> topLevelLoops, FunctionOpInterface funcOp,
-    int64_t rowBlock, int64_t rowGroupBlocks) {
+static bool
+lowerCanonicalSoftmaxToRowBlockGroup(ArrayRef<scf::ForOp> topLevelLoops,
+                                     FunctionOpInterface funcOp,
+                                     int64_t rowBlock, int64_t rowGroupBlocks) {
   if (rowBlock <= 1 || rowGroupBlocks <= 0 || topLevelLoops.size() < 3)
     return false;
 
   std::string rejectCode;
   std::string rejectReason;
-  auto plan = matchSoftmaxResidencyPlan(topLevelLoops, funcOp, rejectCode,
-                                        rejectReason,
-                                        /*producerPassMode=*/"");
+  auto plan =
+      matchSoftmaxResidencyPlan(topLevelLoops, funcOp, rejectCode, rejectReason,
+                                /*producerPassMode=*/"");
   if (!plan || plan->producer.xLoad.vecTy.getRank() != 1)
     return false;
 
@@ -1853,10 +1985,10 @@ static bool lowerCanonicalSoftmaxToRowBlockGroup(
   auto xMakeTensorPtr = findLoopInitMakeTensorPtr(maxLoop);
   if (!xMakeTensorPtr)
     return false;
-  auto outMakeTensorPtr = normLoop.getInitArgs().size() >= 2
-                              ? normLoop.getInitArgs()[1]
-                                    .getDefiningOp<triton::MakeTensorPtrOp>()
-                              : triton::MakeTensorPtrOp();
+  auto outMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 2
+          ? normLoop.getInitArgs()[1].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
   if (!outMakeTensorPtr)
     return false;
 
@@ -1888,16 +2020,14 @@ static bool lowerCanonicalSoftmaxToRowBlockGroup(
   Value cRowsI64 = i64Cst(b, loc, rows);
   Value cColsI64 = i64Cst(b, loc, cols);
   Value c1I64 = i64Cst(b, loc, 1);
-  Value pid = triton::GetProgramIdOp::create(
-      b, loc, triton::ProgramIDDim::X).getResult();
+  Value pid = triton::GetProgramIdOp::create(b, loc, triton::ProgramIDDim::X)
+                  .getResult();
   Value rowsPerProgram = i32Cst(b, loc, rowBlock * rowGroupBlocks);
-  Value groupRowBase =
-      arith::MulIOp::create(b, loc, pid, rowsPerProgram);
+  Value groupRowBase = arith::MulIOp::create(b, loc, pid, rowsPerProgram);
 
   auto outer = scf::ForOp::create(b, loc, c0I32, cRowGroupBlocksI32, c1I32);
   Block *outerBody = outer.getBody();
-  Operation *outerTerminator =
-      setInsertionPointBeforeTerminator(b, outerBody);
+  Operation *outerTerminator = setInsertionPointBeforeTerminator(b, outerBody);
 
   Value rbOffset =
       arith::MulIOp::create(b, loc, outer.getInductionVar(), cRowBlockI32);
@@ -1907,40 +2037,38 @@ static bool lowerCanonicalSoftmaxToRowBlockGroup(
   auto rowBlockVecTy =
       VectorType::get({oldVecTy.getShape()[0], rowBlock}, elemTy);
   auto rowVecTy = VectorType::get({rowBlock}, elemTy);
-  auto rowBlockMemRefTy = MemRefType::get(
-      {cols, rows}, elemTy,
-      StridedLayoutAttr::get(b.getContext(), 0, {1, cols}));
+  auto rowBlockMemRefTy =
+      MemRefType::get({cols, rows}, elemTy,
+                      StridedLayoutAttr::get(b.getContext(), 0, {1, cols}));
 
   SmallVector<Value> shapeVals{cColsI64, cRowsI64};
   SmallVector<Value> strideVals{c1I64, cColsI64};
   SmallVector<Value> offsets{c0I32, rowBase};
   SmallVector<int32_t> tensorShape{static_cast<int32_t>(oldVecTy.getShape()[0]),
-                                  static_cast<int32_t>(rowBlock)};
+                                   static_cast<int32_t>(rowBlock)};
   SmallVector<int32_t> order{0, 1};
-  Value xPtr = triton::MakeTensorPtrOp::create(
-      b, loc, xMakeTensorPtr.getBase(), shapeVals, strideVals, offsets,
-      tensorShape, order);
+  Value xPtr = triton::MakeTensorPtrOp::create(b, loc, xMakeTensorPtr.getBase(),
+                                               shapeVals, strideVals, offsets,
+                                               tensorShape, order);
   Value outPtr = triton::MakeTensorPtrOp::create(
       b, loc, outMakeTensorPtr.getBase(), shapeVals, strideVals, offsets,
       tensorShape, order);
-  Value maxInit =
-      constantVector(b, loc, rowVecTy, -3.4028234663852886e38);
+  Value maxInit = constantVector(b, loc, rowVecTy, -3.4028234663852886e38);
   Value sumInit = constantVector(b, loc, rowVecTy, 0.0);
 
-  auto maxNew = scf::ForOp::create(
-      b, loc, maxLoop.getLowerBound(), maxLoop.getUpperBound(),
-      maxLoop.getStep(), ValueRange{xPtr, maxInit});
+  auto maxNew = scf::ForOp::create(b, loc, maxLoop.getLowerBound(),
+                                   maxLoop.getUpperBound(), maxLoop.getStep(),
+                                   ValueRange{xPtr, maxInit});
   Operation *maxTerminator =
       setInsertionPointBeforeTerminator(b, maxNew.getBody());
   Value maxTile = emitTensorPtrTransferRead(
-      b, loc, maxNew.getRegionIterArgs()[0], rowBlockMemRefTy,
-      rowBlockVecTy);
+      b, loc, maxNew.getRegionIterArgs()[0], rowBlockMemRefTy, rowBlockVecTy);
   if (!maxTile) {
     guard.cleanup();
     return false;
   }
-  Value tileMax = emitLeadingDimReduction(
-      b, loc, maxTile, vector::CombiningKind::MAXNUMF);
+  Value tileMax =
+      emitLeadingDimReduction(b, loc, maxTile, vector::CombiningKind::MAXNUMF);
   if (!tileMax) {
     guard.cleanup();
     return false;
@@ -1957,14 +2085,13 @@ static bool lowerCanonicalSoftmaxToRowBlockGroup(
   Value maxBroadcast =
       vector::BroadcastOp::create(b, loc, rowBlockVecTy, maxNew.getResult(1));
 
-  auto sumNew = scf::ForOp::create(
-      b, loc, sumLoop.getLowerBound(), sumLoop.getUpperBound(),
-      sumLoop.getStep(), ValueRange{xPtr, sumInit});
+  auto sumNew = scf::ForOp::create(b, loc, sumLoop.getLowerBound(),
+                                   sumLoop.getUpperBound(), sumLoop.getStep(),
+                                   ValueRange{xPtr, sumInit});
   Operation *sumTerminator =
       setInsertionPointBeforeTerminator(b, sumNew.getBody());
   Value sumTile = emitTensorPtrTransferRead(
-      b, loc, sumNew.getRegionIterArgs()[0], rowBlockMemRefTy,
-      rowBlockVecTy);
+      b, loc, sumNew.getRegionIterArgs()[0], rowBlockMemRefTy, rowBlockVecTy);
   if (!sumTile) {
     guard.cleanup();
     return false;
@@ -1994,8 +2121,7 @@ static bool lowerCanonicalSoftmaxToRowBlockGroup(
   Operation *normTerminator =
       setInsertionPointBeforeTerminator(b, normNew.getBody());
   Value normTile = emitTensorPtrTransferRead(
-      b, loc, normNew.getRegionIterArgs()[0], rowBlockMemRefTy,
-      rowBlockVecTy);
+      b, loc, normNew.getRegionIterArgs()[0], rowBlockMemRefTy, rowBlockVecTy);
   if (!normTile) {
     guard.cleanup();
     return false;
@@ -2011,8 +2137,7 @@ static bool lowerCanonicalSoftmaxToRowBlockGroup(
   Value normXPtr = emitTensorPtrAdvance(b, loc, normNew.getRegionIterArgs()[0],
                                         normLoop.getStep(), c0RowStepI32);
   Value normOutPtr = emitTensorPtrAdvance(
-      b, loc, normNew.getRegionIterArgs()[1], normLoop.getStep(),
-      c0RowStepI32);
+      b, loc, normNew.getRegionIterArgs()[1], normLoop.getStep(), c0RowStepI32);
   scf::YieldOp::create(b, loc, ValueRange{normXPtr, normOutPtr});
   if (normTerminator)
     normTerminator->erase();
@@ -2054,8 +2179,7 @@ matchSoftmaxRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
     std::string childRejectCode;
     std::string childRejectReason;
     auto plan = matchSoftmaxResidencyPlan(childLoops, funcOp, childRejectCode,
-                                          childRejectReason,
-                                          producerPassMode);
+                                          childRejectReason, producerPassMode);
     if (!plan)
       continue;
 
@@ -2104,8 +2228,8 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
   int64_t rowResidentWaits = 0;
   int64_t spmConsumerPasses = std::max<int64_t>(0, plan.uses - 1);
   if (plan.producerPass == ReductionProducerPass::ProducerStore)
-    spmConsumerPasses = std::max<int64_t>(
-        0, static_cast<int64_t>(plan.consumers.size()) - 1);
+    spmConsumerPasses =
+        std::max<int64_t>(0, static_cast<int64_t>(plan.consumers.size()) - 1);
   int64_t groupTrips = std::max<int64_t>(1, plan.rowBlockGroupTrips);
   int64_t copyBytes = plan.copyInMode == ReductionCopyInMode::Dma
                           ? plan.bytes * groupTrips
@@ -2130,9 +2254,9 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
         "reject", "spm_capacity_overflow",
         "P3 static model rejects reduction residency because the required "
         "resident SPM slots exceed SPM capacity",
-        rowResidentDescriptors, rowResidentWaits, copyBytes,
-        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
-        estimatedExtraOps, measuredBankConflicts, plan.uses);
+        rowResidentDescriptors, rowResidentWaits, copyBytes, spmWriteBytes,
+        spmReadBytes, avoidedBytes, liveSpmBytes, estimatedExtraOps,
+        measuredBankConflicts, plan.uses);
   }
 
   if (rowElements < 512) {
@@ -2141,9 +2265,9 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
         "P3 static model rejects small rows because measured Phase 3.5 "
         "evidence shows SPM store/read overhead is not reliably amortized "
         "against the best legal cache schedule",
-        rowResidentDescriptors, rowResidentWaits, copyBytes,
-        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
-        estimatedExtraOps, measuredBankConflicts, plan.uses);
+        rowResidentDescriptors, rowResidentWaits, copyBytes, spmWriteBytes,
+        spmReadBytes, avoidedBytes, liveSpmBytes, estimatedExtraOps,
+        measuredBankConflicts, plan.uses);
   }
 
   if (plan.producerPass == ReductionProducerPass::DmaPrefetch &&
@@ -2153,9 +2277,9 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
         "P3 static model rejects chunk-DMA row residency because Phase 3.5 "
         "measurements show per-chunk descriptors, waits, and fences are worse "
         "than the available CPU-direct or row-block schedules",
-        rowResidentDescriptors, rowResidentWaits, copyBytes,
-        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
-        estimatedExtraOps, measuredBankConflicts, plan.uses);
+        rowResidentDescriptors, rowResidentWaits, copyBytes, spmWriteBytes,
+        spmReadBytes, avoidedBytes, liveSpmBytes, estimatedExtraOps,
+        measuredBankConflicts, plan.uses);
   }
 
   if (plan.producerPass == ReductionProducerPass::ProducerStore) {
@@ -2165,9 +2289,9 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
         "Phase 3.5 measurements show the extra cache-path pass is not "
         "competitive with fill-on-first-pass against the best legal cache "
         "schedule",
-        rowResidentDescriptors, rowResidentWaits, copyBytes,
-        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
-        estimatedExtraOps, measuredBankConflicts, plan.uses);
+        rowResidentDescriptors, rowResidentWaits, copyBytes, spmWriteBytes,
+        spmReadBytes, avoidedBytes, liveSpmBytes, estimatedExtraOps,
+        measuredBankConflicts, plan.uses);
   }
 
   if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
@@ -2177,9 +2301,9 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
         "measured row-block DMA schedule: bounded double-buffered row-block "
         "lifetime, coarse DMA copies, zero measured bank conflicts, and "
         "comparison against the best legal cache baseline",
-        rowResidentDescriptors, rowResidentWaits, copyBytes,
-        spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
-        estimatedExtraOps, measuredBankConflicts, plan.uses);
+        rowResidentDescriptors, rowResidentWaits, copyBytes, spmWriteBytes,
+        spmReadBytes, avoidedBytes, liveSpmBytes, estimatedExtraOps,
+        measuredBankConflicts, plan.uses);
   }
 
   return makeD3ProfitabilityEvidence(
@@ -2188,15 +2312,13 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
       "evidence for large rows: no DMA descriptors or waits, bounded row "
       "lifetime, and measured Phase 3.5 data is at least near parity or better "
       "against the best legal cache baseline",
-      rowResidentDescriptors, rowResidentWaits, copyBytes,
-      spmWriteBytes, spmReadBytes, avoidedBytes, liveSpmBytes,
-      estimatedExtraOps, measuredBankConflicts, plan.uses);
+      rowResidentDescriptors, rowResidentWaits, copyBytes, spmWriteBytes,
+      spmReadBytes, avoidedBytes, liveSpmBytes, estimatedExtraOps,
+      measuredBankConflicts, plan.uses);
 }
 
-static SPMProfitabilityEvidence
-evaluateD3StreamingReductionProfitability(scf::ForOp forOp,
-                                          ArrayRef<TiledLoadInfo> loads,
-                                          int64_t spmSize) {
+static SPMProfitabilityEvidence evaluateD3StreamingReductionProfitability(
+    scf::ForOp forOp, ArrayRef<TiledLoadInfo> loads, int64_t spmSize) {
   auto lbCst = getConstantIntValue(forOp.getLowerBound());
   auto ubCst = getConstantIntValue(forOp.getUpperBound());
   auto stepCst = getConstantIntValue(forOp.getStep());
@@ -2222,18 +2344,19 @@ evaluateD3StreamingReductionProfitability(scf::ForOp forOp,
       /*measuredBankConflicts=*/0, /*uses=*/1);
 }
 
-static SPMPromotionRejection makeD3RowResidentProfitabilityRejection(
-    const ReductionResidencyPlan &plan,
-    SPMProfitabilityEvidence evidence) {
+static SPMPromotionRejection
+makeD3RowResidentProfitabilityRejection(const ReductionResidencyPlan &plan,
+                                        SPMProfitabilityEvidence evidence) {
   SPMPromotionRejection rejection = makeReductionResidencyRejection(
       plan, evidence.reasonCode, evidence.reason);
   attachD3Profitability(rejection, std::move(evidence));
   return rejection;
 }
 
-static SPMPromotionRejection makeD3StreamingReductionRejection(
-    scf::ForOp forOp, ArrayRef<TiledLoadInfo> loads,
-    SPMProfitabilityEvidence evidence) {
+static SPMPromotionRejection
+makeD3StreamingReductionRejection(scf::ForOp forOp,
+                                  ArrayRef<TiledLoadInfo> loads,
+                                  SPMProfitabilityEvidence evidence) {
   SPMPromotionRejection rejection = makePromotionRejection(
       "reduction_streaming", evidence.reasonCode, evidence.reason);
   rejection.uses = 1;
@@ -2268,9 +2391,9 @@ static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
   if (rowBlockLayout)
     spmStepBytes *= loopInfo.xLoad.vecTy.getShape()[1];
 
-  auto newForOp = scf::ForOp::create(
-      b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
-      forOp.getInitArgs());
+  auto newForOp =
+      scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                         forOp.getStep(), forOp.getInitArgs());
 
   Block *newBody = newForOp.getBody();
   Block *oldBody = forOp.getBody();
@@ -2278,21 +2401,20 @@ static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
   IRMapping mapping;
   mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
   for (auto [oldArg, newArg] :
-       llvm::zip_equal(forOp.getRegionIterArgs(),
-                       newForOp.getRegionIterArgs()))
+       llvm::zip_equal(forOp.getRegionIterArgs(), newForOp.getRegionIterArgs()))
     mapping.map(oldArg, newArg);
 
   if (!newBody->empty() && newBody->mightHaveTerminator())
     newBody->getTerminator()->erase();
   b.setInsertionPointToStart(newBody);
 
-  Value elemOffset = arith::SubIOp::create(
-      b, loc, toI64(b, loc, newForOp.getInductionVar()),
-      toI64(b, loc, newForOp.getLowerBound()));
-  Value byteOffset = arith::MulIOp::create(
-      b, loc, elemOffset, i64Cst(b, loc, spmStepBytes));
-  Value xSpmAddr = arith::AddIOp::create(
-      b, loc, i64Cst(b, loc, rowSpmAddress), byteOffset);
+  Value elemOffset =
+      arith::SubIOp::create(b, loc, toI64(b, loc, newForOp.getInductionVar()),
+                            toI64(b, loc, newForOp.getLowerBound()));
+  Value byteOffset =
+      arith::MulIOp::create(b, loc, elemOffset, i64Cst(b, loc, spmStepBytes));
+  Value xSpmAddr =
+      arith::AddIOp::create(b, loc, i64Cst(b, loc, rowSpmAddress), byteOffset);
 
   for (auto &op : oldBody->getOperations()) {
     if (isa<scf::YieldOp>(op))
@@ -2308,9 +2430,8 @@ static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
         continue;
       }
 
-      Value spmVal = emitSpmReadWithStrides(b, loc, xSpmAddr,
-                                            loopInfo.xLoad.vecTy,
-                                            spmMemStrides);
+      Value spmVal = emitSpmReadWithStrides(
+          b, loc, xSpmAddr, loopInfo.xLoad.vecTy, spmMemStrides);
       mapping.map(xRead.getResult(), spmVal);
       continue;
     }
@@ -2331,9 +2452,10 @@ static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
   return newForOp;
 }
 
-static bool lowerDmaPrefetchRowResidentX(
-    ReductionLoopResidencyUse loopInfo, int64_t rowSpmAddress,
-    unsigned elemBytes, bool useRowBlockDmaLayout = false) {
+static bool lowerDmaPrefetchRowResidentX(ReductionLoopResidencyUse loopInfo,
+                                         int64_t rowSpmAddress,
+                                         unsigned elemBytes,
+                                         bool useRowBlockDmaLayout = false) {
   scf::ForOp forOp = loopInfo.forOp;
   vector::TransferReadOp xRead = loopInfo.xLoad.readOp;
   auto memRefTy = dyn_cast<MemRefType>(xRead.getBase().getType());
@@ -2371,9 +2493,9 @@ static bool lowerDmaPrefetchRowResidentX(
     emitDmaEnqueue(b, loc, i64Cst(b, loc, rowSpmAddress), dramAddr,
                    loopInfo.xLoad.vecTy, memRefTy);
 
-  auto newForOp = scf::ForOp::create(
-      b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
-      forOp.getInitArgs());
+  auto newForOp =
+      scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                         forOp.getStep(), forOp.getInitArgs());
 
   Block *newBody = newForOp.getBody();
   Block *oldBody = forOp.getBody();
@@ -2394,14 +2516,14 @@ static bool lowerDmaPrefetchRowResidentX(
   Value step = newForOp.getStep();
   Value ub = newForOp.getUpperBound();
   Value nextIv = arith::AddIOp::create(b, loc, iv, step);
-  Value hasNext = arith::CmpIOp::create(
-      b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+  Value hasNext =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, nextIv, ub);
 
   Value lbInLoop = newForOp.getLowerBound();
   Value currentOff = arith::SubIOp::create(b, loc, iv, lbInLoop);
   Value currentOffI64 = toI64(b, loc, currentOff);
-  Value currentByteOff = arith::MulIOp::create(
-      b, loc, currentOffI64, i64Cst(b, loc, spmStepBytes));
+  Value currentByteOff = arith::MulIOp::create(b, loc, currentOffI64,
+                                               i64Cst(b, loc, spmStepBytes));
   Value residentSpmAddr = arith::AddIOp::create(
       b, loc, i64Cst(b, loc, rowSpmAddress), currentByteOff);
 
@@ -2409,16 +2531,15 @@ static bool lowerDmaPrefetchRowResidentX(
   Value nextOffI64 = toI64(b, loc, nextOff);
   auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
   b.setInsertionPointToStart(&ifOp.getThenRegion().front());
-  Value nextByteOff = arith::MulIOp::create(
-      b, loc, nextOffI64, i64Cst(b, loc, *stepBytes));
+  Value nextByteOff =
+      arith::MulIOp::create(b, loc, nextOffI64, i64Cst(b, loc, *stepBytes));
   Value nextDram = arith::AddIOp::create(b, loc, dramAddr, nextByteOff);
   Value nextSpmAddr = arith::AddIOp::create(
       b, loc, i64Cst(b, loc, rowSpmAddress),
-      arith::MulIOp::create(b, loc, nextOffI64,
-                            i64Cst(b, loc, spmStepBytes)));
+      arith::MulIOp::create(b, loc, nextOffI64, i64Cst(b, loc, spmStepBytes)));
   if (rowBlockLayout)
-    emitRowBlockDmaEnqueue(b, loc, nextSpmAddr, nextDram,
-                           loopInfo.xLoad.vecTy, memRefTy);
+    emitRowBlockDmaEnqueue(b, loc, nextSpmAddr, nextDram, loopInfo.xLoad.vecTy,
+                           memRefTy);
   else
     emitDmaEnqueue(b, loc, nextSpmAddr, nextDram, loopInfo.xLoad.vecTy,
                    memRefTy);
@@ -2429,9 +2550,8 @@ static bool lowerDmaPrefetchRowResidentX(
       continue;
 
     if (&op == xRead.getOperation()) {
-      Value spmVal = emitSpmReadWithStrides(b, loc, residentSpmAddr,
-                                            loopInfo.xLoad.vecTy,
-                                            spmMemStrides);
+      Value spmVal = emitSpmReadWithStrides(
+          b, loc, residentSpmAddr, loopInfo.xLoad.vecTy, spmMemStrides);
       mapping.map(xRead.getResult(), spmVal);
       continue;
     }
@@ -2461,26 +2581,25 @@ static Value mapOrDefault(IRMapping &mapping, Value value) {
 static bool cloneLoopBodyWithRowBlockSpm(
     OpBuilder &b, Location loc, scf::ForOp oldLoop, scf::ForOp newLoop,
     TiledLoadInfo xLoad, Value rowSpmBase, unsigned elemBytes,
-    int64_t spmStepBytes, ArrayRef<int64_t> spmMemStrides,
-    IRMapping &mapping, Value expSpmBase = nullptr,
-    bool writeExpToSpm = false, bool readExpFromSpm = false) {
+    int64_t spmStepBytes, ArrayRef<int64_t> spmMemStrides, IRMapping &mapping,
+    Value expSpmBase = nullptr, bool writeExpToSpm = false,
+    bool readExpFromSpm = false) {
   Block *oldBody = oldLoop.getBody();
   Block *newBody = newLoop.getBody();
   mapping.map(oldLoop.getInductionVar(), newLoop.getInductionVar());
-  for (auto [oldArg, newArg] :
-       llvm::zip_equal(oldLoop.getRegionIterArgs(),
-                       newLoop.getRegionIterArgs()))
+  for (auto [oldArg, newArg] : llvm::zip_equal(oldLoop.getRegionIterArgs(),
+                                               newLoop.getRegionIterArgs()))
     mapping.map(oldArg, newArg);
 
   b.setInsertionPointToStart(newBody);
   if (!newBody->empty() && newBody->mightHaveTerminator())
     newBody->getTerminator()->erase();
 
-  Value elemOffset = arith::SubIOp::create(
-      b, loc, toI64(b, loc, newLoop.getInductionVar()),
-      toI64(b, loc, newLoop.getLowerBound()));
-  Value byteOffset = arith::MulIOp::create(
-      b, loc, elemOffset, i64Cst(b, loc, spmStepBytes));
+  Value elemOffset =
+      arith::SubIOp::create(b, loc, toI64(b, loc, newLoop.getInductionVar()),
+                            toI64(b, loc, newLoop.getLowerBound()));
+  Value byteOffset =
+      arith::MulIOp::create(b, loc, elemOffset, i64Cst(b, loc, spmStepBytes));
   Value xSpmAddr = arith::AddIOp::create(b, loc, rowSpmBase, byteOffset);
 
   Value expSpmAddr;
@@ -2518,8 +2637,8 @@ static bool cloneLoopBodyWithRowBlockSpm(
         mapping.map(xLoad.readOp.getResult(), xSpmAddr); // placeholder
         continue;
       }
-      Value spmVal = emitSpmReadWithStrides(b, loc, xSpmAddr, xLoad.vecTy,
-                                            spmMemStrides);
+      Value spmVal =
+          emitSpmReadWithStrides(b, loc, xSpmAddr, xLoad.vecTy, spmMemStrides);
       mapping.map(xLoad.readOp.getResult(), spmVal);
       continue;
     }
@@ -2555,10 +2674,9 @@ static bool cloneLoopBodyWithRowBlockSpm(
   return true;
 }
 
-static bool emitFullRowBlockDma(OpBuilder &b, Location loc,
-                                Value rowSpmAddr, Value firstDramAddr,
-                                VectorType vecTy, MemRefType memRefTy,
-                                int64_t trips) {
+static bool emitFullRowBlockDma(OpBuilder &b, Location loc, Value rowSpmAddr,
+                                Value firstDramAddr, VectorType vecTy,
+                                MemRefType memRefTy, int64_t trips) {
   if (!hasColMajorRowBlockDmaLayout(vecTy, memRefTy) || trips <= 0)
     return false;
 
@@ -2570,10 +2688,8 @@ static bool emitFullRowBlockDma(OpBuilder &b, Location loc,
     return false;
 
   triton::cpu::DmaEnqueue2DOp::create(
-      b, loc, rowSpmAddr, firstDramAddr,
-      i64Cst(b, loc, columns * elemBytes),
-      i64Cst(b, loc, rows),
-      i64Cst(b, loc, strides[1] * elemBytes),
+      b, loc, rowSpmAddr, firstDramAddr, i64Cst(b, loc, columns * elemBytes),
+      i64Cst(b, loc, rows), i64Cst(b, loc, strides[1] * elemBytes),
       i64Cst(b, loc, columns * elemBytes));
   return true;
 }
@@ -2608,8 +2724,8 @@ static bool lowerSoftmaxRowBlockGroupDma(
     return false;
 
   auto makeTensorPtr =
-      plan.producer.forOp.getTiedLoopInit(
-                              plan.producer.forOp.getRegionIterArgs().front())
+      plan.producer.forOp
+          .getTiedLoopInit(plan.producer.forOp.getRegionIterArgs().front())
           ->get()
           .template getDefiningOp<triton::MakeTensorPtrOp>();
   if (!makeTensorPtr)
@@ -2620,15 +2736,12 @@ static bool lowerSoftmaxRowBlockGroupDma(
   OpBuilder b(outerLoop);
 
   IRMapping firstPtrMapping;
-  firstPtrMapping.map(outerLoop.getInductionVar(),
-                      outerLoop.getLowerBound());
+  firstPtrMapping.map(outerLoop.getInductionVar(), outerLoop.getLowerBound());
   for (auto [iterArg, initArg] :
-       llvm::zip_equal(outerLoop.getRegionIterArgs(),
-                       outerLoop.getInitArgs()))
+       llvm::zip_equal(outerLoop.getRegionIterArgs(), outerLoop.getInitArgs()))
     firstPtrMapping.map(iterArg, initArg);
   Operation *firstTensorPtrOp =
-      cloneBlockPrefixThrough(b, makeTensorPtr.getOperation(),
-                              firstPtrMapping);
+      cloneBlockPrefixThrough(b, makeTensorPtr.getOperation(), firstPtrMapping);
   if (!firstTensorPtrOp) {
     guard.cleanup();
     return false;
@@ -2640,17 +2753,17 @@ static bool lowerSoftmaxRowBlockGroupDma(
     return false;
   }
   if (!emitFullRowBlockDma(b, loc, i64Cst(b, loc, rowSpmAddress0),
-                           firstDramAddr, plan.producer.xLoad.vecTy,
-                           memRefTy, plan.trips)) {
+                           firstDramAddr, plan.producer.xLoad.vecTy, memRefTy,
+                           plan.trips)) {
     guard.cleanup();
     return false;
   }
 
   SmallVector<Value> outerInitArgs(outerLoop.getInitArgs());
   outerInitArgs.push_back(i64Cst(b, loc, 0));
-  auto newOuter = scf::ForOp::create(
-      b, loc, outerLoop.getLowerBound(), outerLoop.getUpperBound(),
-      outerLoop.getStep(), outerInitArgs);
+  auto newOuter = scf::ForOp::create(b, loc, outerLoop.getLowerBound(),
+                                     outerLoop.getUpperBound(),
+                                     outerLoop.getStep(), outerInitArgs);
 
   Block *oldOuterBody = outerLoop.getBody();
   Block *newOuterBody = newOuter.getBody();
@@ -2669,21 +2782,19 @@ static bool lowerSoftmaxRowBlockGroupDma(
   triton::cpu::DmaWaitOp::create(b, loc);
 
   Value zero = i64Cst(b, loc, 0);
-  Value isZero = arith::CmpIOp::create(
-      b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
+  Value isZero =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
   Value spmBuf0 = i64Cst(b, loc, rowSpmAddress0);
   Value spmBuf1 = i64Cst(b, loc, rowSpmAddress1);
-  Value currentSpm =
-      arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
-  Value nextSpm =
-      arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
+  Value currentSpm = arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
+  Value nextSpm = arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
 
   Value iv = newOuter.getInductionVar();
   Value step = newOuter.getStep();
   Value ub = newOuter.getUpperBound();
   Value nextIv = arith::AddIOp::create(b, loc, iv, step);
-  Value hasNext = arith::CmpIOp::create(
-      b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+  Value hasNext =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, nextIv, ub);
 
   auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
   b.setInsertionPointToStart(&ifOp.getThenRegion().front());
@@ -2694,21 +2805,19 @@ static bool lowerSoftmaxRowBlockGroupDma(
                        newOuter.getRegionIterArgs().take_front(oldOuterArgs)))
     nextPtrMapping.map(iterArg, newIterArg);
   Operation *nextTensorPtrOp =
-      cloneBlockPrefixThrough(b, makeTensorPtr.getOperation(),
-                              nextPtrMapping);
+      cloneBlockPrefixThrough(b, makeTensorPtr.getOperation(), nextPtrMapping);
   if (!nextTensorPtrOp) {
     guard.cleanup();
     return false;
   }
-  Value nextDramAddr = computeTensorPtrDramAddr(
-      b, loc, nextTensorPtrOp->getResult(0), memRefTy);
+  Value nextDramAddr =
+      computeTensorPtrDramAddr(b, loc, nextTensorPtrOp->getResult(0), memRefTy);
   if (!nextDramAddr) {
     guard.cleanup();
     return false;
   }
   if (!emitFullRowBlockDma(b, loc, nextSpm, nextDramAddr,
-                           plan.producer.xLoad.vecTy, memRefTy,
-                           plan.trips)) {
+                           plan.producer.xLoad.vecTy, memRefTy, plan.trips)) {
     guard.cleanup();
     return false;
   }
@@ -2754,12 +2863,12 @@ static bool lowerSoftmaxRowBlockGroupDma(
             b, loc, mapOrDefault(outerMapping, forOp.getLowerBound()),
             mapOrDefault(outerMapping, forOp.getUpperBound()),
             mapOrDefault(outerMapping, forOp.getStep()), initArgs);
-        cloneLoopBodyWithRowBlockSpm(
-            b, loc, forOp, newLoop, loopUse->xLoad, currentSpm,
-            plan.elemBytes, spmStepBytes, spmMemStrides, outerMapping,
-            cacheExp ? expSpmBase : nullptr,
-            /*writeExpToSpm=*/cacheExp && isExpSumLoop,
-            /*readExpFromSpm=*/cacheExp && isNormLoop);
+        cloneLoopBodyWithRowBlockSpm(b, loc, forOp, newLoop, loopUse->xLoad,
+                                     currentSpm, plan.elemBytes, spmStepBytes,
+                                     spmMemStrides, outerMapping,
+                                     cacheExp ? expSpmBase : nullptr,
+                                     /*writeExpToSpm=*/cacheExp && isExpSumLoop,
+                                     /*readExpFromSpm=*/cacheExp && isNormLoop);
         b.setInsertionPointAfter(newLoop);
         for (auto [oldResult, newResult] :
              llvm::zip_equal(forOp.getResults(), newLoop.getResults()))
@@ -2842,8 +2951,7 @@ static bool transformReductionResidencyPlan(
     if (evidence.decision != "accept") {
       if (report)
         report->rejections.push_back(
-            makeD3RowResidentProfitabilityRejection(plan,
-                                                    std::move(evidence)));
+            makeD3RowResidentProfitabilityRejection(plan, std::move(evidence)));
       markResidencyPlanLoopsHandled(plan, rowResidentHandledLoops);
       return false;
     }
@@ -2881,20 +2989,17 @@ static bool transformReductionResidencyPlan(
     }
     if (!lowerSoftmaxRowBlockGroupDma(plan, allocRow->address,
                                       allocRow1->address,
-                                      rowResidentHandledLoops,
-                                      expSpmAddress))
+                                      rowResidentHandledLoops, expSpmAddress))
       return reject("unsupported_reduction_residency_plan",
                     "row-block group DMA double-buffer lowering failed");
   } else if (plan.producerPass == ReductionProducerPass::FillOnFirstPass) {
-    scf::ForOp newProducer =
-        cloneLoopWithRowResidentX(plan.producer, allocRow->address,
-                                  plan.elemBytes,
-                                  /*fillSpmFromOriginalRead=*/true);
+    scf::ForOp newProducer = cloneLoopWithRowResidentX(
+        plan.producer, allocRow->address, plan.elemBytes,
+        /*fillSpmFromOriginalRead=*/true);
     rowResidentHandledLoops.insert(newProducer.getOperation());
     for (const ReductionLoopResidencyUse &consumer : plan.consumers) {
       scf::ForOp newConsumer =
-          cloneLoopWithRowResidentX(consumer, allocRow->address,
-                                    plan.elemBytes,
+          cloneLoopWithRowResidentX(consumer, allocRow->address, plan.elemBytes,
                                     /*fillSpmFromOriginalRead=*/false);
       rowResidentHandledLoops.insert(newConsumer.getOperation());
     }
@@ -2903,32 +3008,28 @@ static bool transformReductionResidencyPlan(
       return reject("unsupported_pattern",
                     "producer-store row residency needs a later x consumer");
     rowResidentHandledLoops.insert(plan.producer.forOp.getOperation());
-    scf::ForOp newMaterializer =
-        cloneLoopWithRowResidentX(plan.consumers.front(), allocRow->address,
-                                  plan.elemBytes,
-                                  /*fillSpmFromOriginalRead=*/true);
+    scf::ForOp newMaterializer = cloneLoopWithRowResidentX(
+        plan.consumers.front(), allocRow->address, plan.elemBytes,
+        /*fillSpmFromOriginalRead=*/true);
     rowResidentHandledLoops.insert(newMaterializer.getOperation());
     for (const ReductionLoopResidencyUse &consumer :
          ArrayRef<ReductionLoopResidencyUse>(plan.consumers).drop_front()) {
       scf::ForOp newConsumer =
-          cloneLoopWithRowResidentX(consumer, allocRow->address,
-                                    plan.elemBytes,
+          cloneLoopWithRowResidentX(consumer, allocRow->address, plan.elemBytes,
                                     /*fillSpmFromOriginalRead=*/false);
-          rowResidentHandledLoops.insert(newConsumer.getOperation());
-      }
+      rowResidentHandledLoops.insert(newConsumer.getOperation());
+    }
   } else if (plan.producerPass == ReductionProducerPass::DmaPrefetch) {
     if (!lowerDmaPrefetchRowResidentX(plan.producer, allocRow->address,
-                                      plan.elemBytes,
-                                      useRowBlockDmaLayout))
+                                      plan.elemBytes, useRowBlockDmaLayout))
       return reject("unsupported_reduction_residency_plan",
                     "DMA-prefetch row residency could not lower the producer "
                     "loop");
     rowResidentHandledLoops.insert(plan.producer.forOp.getOperation());
     for (const ReductionLoopResidencyUse &consumer : plan.consumers) {
-      scf::ForOp newConsumer =
-          cloneLoopWithRowResidentX(consumer, allocRow->address, plan.elemBytes,
-                                    /*fillSpmFromOriginalRead=*/false,
-                                    useRowBlockDmaLayout);
+      scf::ForOp newConsumer = cloneLoopWithRowResidentX(
+          consumer, allocRow->address, plan.elemBytes,
+          /*fillSpmFromOriginalRead=*/false, useRowBlockDmaLayout);
       rowResidentHandledLoops.insert(newConsumer.getOperation());
     }
   } else {
@@ -2945,6 +3046,661 @@ static bool transformReductionResidencyPlan(
       attachD3Profitability(record, std::move(evidence));
     }
     report->records.push_back(std::move(record));
+  }
+
+  return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Attention v2 Q-resident transformation.
+//
+// Attention has an unusually useful loop-invariant Q tile and loop-local K/V
+// streams.  The old K/V SPM window schedule reduced some cache misses but made
+// LLVM lower many more scalar SPM loads and inflated the loop body.  This path
+// deliberately stages only Q, which has real reuse across both stage loops, and
+// leaves K/V on the cache path.
+//===----------------------------------------------------------------------===//
+
+struct AttentionOuterQPlan {
+  vector::TransferReadOp readOp;
+  VectorType vecTy;
+  MemRefType memRefTy;
+  SmallVector<int64_t, 2> spmMemStrides;
+  int64_t tileBytes = 0;
+  int64_t addr = 0;
+};
+
+struct AttentionStreamPlan {
+  TiledLoadInfo load;
+  MemRefType memRefTy;
+  SmallVector<int64_t, 2> spmMemStrides;
+  int64_t stepBytes = 0;
+  int64_t addrBuf0 = 0;
+  int64_t addrBuf1 = 0;
+  Value dramAddr;
+  Value spmCur;
+  Value spmNxt;
+};
+
+struct AttentionResidentQState {
+  int64_t addr = 0;
+  int64_t tileBytes = 0;
+};
+
+struct AttentionFunctionState {
+  int64_t spmBase = 0;
+  int64_t spmSize = 0;
+  int64_t persistentBytes = 0;
+  DenseMap<Operation *, AttentionResidentQState> residentQ;
+
+  void initialize(int64_t base, int64_t size) {
+    if (spmSize != 0)
+      return;
+    spmBase = base;
+    spmSize = size;
+  }
+
+  static std::optional<int64_t> alignUp(int64_t value, int64_t alignment) {
+    if (alignment <= 1)
+      return value;
+    int64_t remainder = value % alignment;
+    if (remainder == 0)
+      return value;
+    if (value > std::numeric_limits<int64_t>::max() - (alignment - remainder))
+      return std::nullopt;
+    return value + (alignment - remainder);
+  }
+
+  std::optional<int64_t> nextPersistentTop(int64_t bytes,
+                                           int64_t alignment = 1) const {
+    auto aligned = alignUp(persistentBytes, alignment);
+    if (!aligned)
+      return std::nullopt;
+    if (bytes < 0 || *aligned > spmSize || bytes > spmSize - *aligned)
+      return std::nullopt;
+    return *aligned + bytes;
+  }
+};
+
+static bool contractConsumesRead(vector::ContractionOp contract,
+                                 vector::TransferReadOp readOp) {
+  for (Value operand : {contract.getLhs(), contract.getRhs()}) {
+    auto operandRead = getTransferReadThroughShapePreservingCasts(operand);
+    if (operandRead == readOp)
+      return true;
+  }
+  return false;
+}
+
+static bool isOneOfReads(vector::TransferReadOp readOp,
+                         ArrayRef<TiledLoadInfo> reads) {
+  for (const TiledLoadInfo &read : reads)
+    if (read.readOp == readOp)
+      return true;
+  return false;
+}
+
+static bool shouldTryAttentionV2QResident(scf::ForOp forOp,
+                                          ArrayRef<TiledLoadInfo> dotLoads) {
+  if (dotLoads.size() != 2)
+    return false;
+
+  // GEMM still owns the case where the two loop-local loads feed the same
+  // contraction.  Attention has two contractions: QK and P/V.
+  if (analyzeGemmContract(forOp, dotLoads[0].readOp, dotLoads[1].readOp) ||
+      analyzeGemmContract(forOp, dotLoads[1].readOp, dotLoads[0].readOp))
+    return false;
+
+  return true;
+}
+
+static std::optional<AttentionOuterQPlan>
+findAttentionOuterQPlan(scf::ForOp forOp, ArrayRef<TiledLoadInfo> streams,
+                        AttentionFunctionState &state) {
+  std::optional<AttentionOuterQPlan> result;
+  forOp.getBody()->walk([&](vector::ContractionOp contract) {
+    if (result || !isGemmContract(contract))
+      return WalkResult::advance();
+
+    bool consumesStream = false;
+    for (const TiledLoadInfo &stream : streams) {
+      if (contractConsumesRead(contract, stream.readOp)) {
+        consumesStream = true;
+        break;
+      }
+    }
+    if (!consumesStream)
+      return WalkResult::advance();
+
+    for (Value operand : {contract.getLhs(), contract.getRhs()}) {
+      auto readOp = getTransferReadThroughShapePreservingCasts(operand);
+      if (!readOp || isOneOfReads(readOp, streams))
+        continue;
+      if (forOp.getBodyRegion().isAncestor(readOp->getParentRegion()))
+        continue;
+      if (readOp->getBlock() != forOp->getBlock() ||
+          !readOp->isBeforeInBlock(forOp))
+        continue;
+
+      auto vecTy = dyn_cast<VectorType>(readOp.getType());
+      auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+      if (!vecTy || vecTy.getRank() != 2 || !memRefTy ||
+          memRefTy.getRank() != 2)
+        continue;
+
+      if (memRefTy.getMemorySpaceAsInt() == SPM_ADDR_SPACE) {
+        auto existing = state.residentQ.find(readOp.getOperation());
+        if (existing == state.residentQ.end())
+          continue;
+        AttentionOuterQPlan plan;
+        plan.readOp = readOp;
+        plan.vecTy = vecTy;
+        plan.memRefTy = memRefTy;
+        plan.spmMemStrides = getDefaultSpmMemStrides(vecTy);
+        plan.tileBytes = getTileBytes(vecTy);
+        plan.addr = existing->second.addr;
+        result = std::move(plan);
+        return WalkResult::interrupt();
+      }
+
+      SmallVector<int64_t> strides;
+      if (!getStaticStrides(memRefTy, strides))
+        continue;
+
+      AttentionOuterQPlan plan;
+      plan.readOp = readOp;
+      plan.vecTy = vecTy;
+      plan.memRefTy = memRefTy;
+      plan.spmMemStrides = getDmaFilledSpmMemStrides(vecTy, memRefTy);
+      plan.tileBytes = getTileBytes(vecTy);
+      result = std::move(plan);
+      return WalkResult::interrupt();
+    }
+
+    return WalkResult::advance();
+  });
+  return result;
+}
+
+static void eraseDeadReadIfUnused(vector::TransferReadOp readOp) {
+  if (readOp && readOp.getResult().use_empty())
+    readOp.erase();
+}
+
+static std::optional<int64_t>
+getAttentionStreamStepBytes(vector::TransferReadOp readOp, scf::ForOp forOp) {
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  auto vecTy = dyn_cast<VectorType>(readOp.getType());
+  if (!memRefTy || !vecTy || vecTy.getRank() != 2)
+    return std::nullopt;
+
+  if (auto stepBytes = getLoopStepBytes(readOp, forOp,
+                                        /*requireLoopIv=*/true)) {
+    auto stepCst = getConstantIntValue(forOp.getStep());
+    if (!stepCst || *stepCst <= 0)
+      return std::nullopt;
+    return *stepBytes * *stepCst;
+  }
+
+  BlockArgument blockPtrArg;
+  auto *baseDefOp = readOp.getBase().getDefiningOp();
+  if (!baseDefOp || baseDefOp->getParentRegion() != &forOp.getRegion())
+    return std::nullopt;
+
+  auto extractMR = dyn_cast<triton::cpu::ExtractMemRefOp>(baseDefOp);
+  if (!extractMR)
+    return std::nullopt;
+
+  auto arg = dyn_cast<BlockArgument>(extractMR.getSrc());
+  if (!arg || arg.getOwner() != forOp.getBody() || arg.getArgNumber() == 0)
+    return std::nullopt;
+  unsigned iterArgIdx = arg.getArgNumber() - 1;
+  if (iterArgIdx >= forOp.getRegionIterArgs().size())
+    return std::nullopt;
+  blockPtrArg = arg;
+
+  OpOperand *yielded = forOp.getTiedLoopYieldedValue(blockPtrArg);
+  if (!yielded)
+    return std::nullopt;
+
+  auto advance = yielded->get().getDefiningOp<triton::AdvanceOp>();
+  if (!advance || advance.getPtr() != blockPtrArg)
+    return std::nullopt;
+
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides))
+    return std::nullopt;
+  auto offsets = advance.getOffsets();
+  if (offsets.size() != strides.size())
+    return std::nullopt;
+
+  unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+  int64_t stepElems = 0;
+  bool sawNonZero = false;
+  for (auto [offset, stride] : llvm::zip_equal(offsets, strides)) {
+    auto offsetValue = getConstantIntValue(offset);
+    if (!offsetValue)
+      return std::nullopt;
+    if (*offsetValue != 0)
+      sawNonZero = true;
+    stepElems += *offsetValue * stride;
+  }
+  if (!sawNonZero || stepElems <= 0)
+    return std::nullopt;
+  return stepElems * elemBytes;
+}
+
+static bool materializeAttentionQ(AttentionOuterQPlan &qPlan,
+                                  AttentionFunctionState &state) {
+  if (qPlan.memRefTy.getMemorySpaceAsInt() == SPM_ADDR_SPACE)
+    return true;
+
+  auto nextTop = state.nextPersistentTop(qPlan.tileBytes);
+  if (!nextTop)
+    return false;
+
+  auto alignedTop = AttentionFunctionState::alignUp(state.persistentBytes, 1);
+  if (!alignedTop)
+    return false;
+  int64_t qAddr = state.spmBase + *alignedTop;
+  Location loc = qPlan.readOp.getLoc();
+  InsertedBeforeGuard qGuard(qPlan.readOp.getOperation());
+  OpBuilder qBuilder(qPlan.readOp);
+  Value qDram = computeDramAddr(qBuilder, loc, qPlan.readOp);
+  if (!qDram) {
+    qGuard.cleanup();
+    return false;
+  }
+
+  emitDmaFilledEnqueue(qBuilder, loc, i64Cst(qBuilder, loc, qAddr), qDram,
+                       qPlan.vecTy, qPlan.memRefTy);
+  triton::cpu::DmaWaitOp::create(qBuilder, loc);
+  Value qSpm =
+      emitSpmReadWithStrides(qBuilder, loc, i64Cst(qBuilder, loc, qAddr),
+                             qPlan.vecTy, qPlan.spmMemStrides);
+  qPlan.readOp.getResult().replaceAllUsesWith(qSpm);
+  eraseDeadReadIfUnused(qPlan.readOp);
+  qGuard.commit();
+
+  if (auto spmRead = qSpm.getDefiningOp<vector::TransferReadOp>()) {
+    state.residentQ[spmRead.getOperation()] =
+        AttentionResidentQState{qAddr, qPlan.tileBytes};
+    qPlan.readOp = spmRead;
+    qPlan.memRefTy = cast<MemRefType>(spmRead.getBase().getType());
+    qPlan.spmMemStrides = getDefaultSpmMemStrides(qPlan.vecTy);
+  }
+  qPlan.addr = qAddr;
+  state.persistentBytes = *nextTop;
+  return true;
+}
+
+static int64_t getAttentionQReuseCount(vector::TransferReadOp qRead) {
+  int64_t uses = 0;
+  for (Operation *user : qRead.getResult().getUsers()) {
+    if (isa<vector::ContractionOp>(user)) {
+      ++uses;
+      continue;
+    }
+    if (!isShapePreservingCastLikeOp(user))
+      continue;
+    for (Operation *castUser : user->getResult(0).getUsers())
+      if (isa<vector::ContractionOp>(castUser))
+        ++uses;
+  }
+  return std::max<int64_t>(1, uses);
+}
+
+static void appendAttentionV2QRecord(SPMPromotionReport *report,
+                                     StringRef source, StringRef scope,
+                                     VectorType shapeTy, int64_t uses,
+                                     int64_t bytes, int64_t spmAddress,
+                                     int64_t liveBytes, int64_t dmaDescriptors,
+                                     int64_t waits, StringRef bufferRole,
+                                     StringRef rotationPolicy,
+                                     StringRef reasonCode, StringRef reason) {
+  if (!report)
+    return;
+
+  SPMPromotionRecord record;
+  record.source = source.str();
+  record.scope = scope.str();
+  appendShape(record.shape, shapeTy);
+  record.uses = uses;
+  record.copyIn = "DMA";
+  record.copyOut = "none";
+  record.bytes = bytes;
+  record.spmAddress = spmAddress;
+  record.overhead = "one Q DMA and one wait before the attention loop";
+  record.benefit = "keeps the loop-invariant Q tile resident across QK loops";
+  record.reasonCode = reasonCode.str();
+  record.reason = reason.str();
+  record.residencyPlan.present = true;
+  record.residencyPlan.producerPass = "dma_prefetch";
+  record.residencyPlan.consumerPasses.push_back("attention_v2_q_resident");
+  record.residencyPlan.bufferRole = bufferRole.str();
+  record.residencyPlan.rotationPolicy = rotationPolicy.str();
+  record.residencyPlan.copyInMode = "dma";
+  record.residencyPlan.requiredSpmSlots =
+      std::max<int64_t>(1, bytes / getTileBytes(shapeTy));
+  record.residencyPlan.expectedMarkers.push_back("addrspace(3)");
+  record.residencyPlan.expectedMarkers.push_back("dma_descriptors");
+  record.residencyPlan.expectedMarkers.push_back("fence_iorw");
+  record.profitability = makeD3ProfitabilityEvidence(
+      "accept", reasonCode, reason, dmaDescriptors, waits,
+      /*copyBytes=*/bytes, /*spmWriteBytes=*/bytes,
+      /*spmReadBytes=*/getTileBytes(shapeTy) * uses,
+      /*avoidedRepeatedReadBytes=*/getTileBytes(shapeTy) *
+          std::max<int64_t>(0, uses - 1),
+      liveBytes, /*estimatedExtraOps=*/uses,
+      /*measuredBankConflicts=*/0, uses);
+  report->records.push_back(std::move(record));
+}
+
+static bool transformAttentionV2QResidentLoop(scf::ForOp forOp,
+                                              ArrayRef<TiledLoadInfo> dotLoads,
+                                              AttentionFunctionState &state,
+                                              SPMPromotionReport *report) {
+  auto reject = [&](StringRef reasonCode, StringRef reason) {
+    if (report)
+      report->rejections.push_back(
+          makePromotionRejection("attention_v2_q_resident", reasonCode,
+                                 reason));
+    return false;
+  };
+
+  if (!shouldTryAttentionV2QResident(forOp, dotLoads))
+    return false;
+
+  auto trips = getExactStaticTripCount(forOp);
+  if (trips && *trips <= 0)
+    return reject("dynamic_shape_or_stride",
+                  "attention-v2 requires a positive trip count");
+
+  std::optional<AttentionOuterQPlan> qPlan =
+      findAttentionOuterQPlan(forOp, dotLoads, state);
+  if (!qPlan)
+    return reject("unsupported_pattern",
+                  "attention-v2 requires an outer loop-invariant Q tile");
+
+  bool qAlreadyResident =
+      qPlan->memRefTy.getMemorySpaceAsInt() == SPM_ADDR_SPACE;
+  if (qAlreadyResident)
+    return true;
+
+  int64_t qReuseCount = getAttentionQReuseCount(qPlan->readOp);
+  std::optional<bool> qResidentPolicy =
+      getEnvBoolOverride("TRITON_SPM_ATTENTION_Q_RESIDENT");
+  if (qResidentPolicy && !*qResidentPolicy)
+    return reject("policy_disabled",
+                  "attention Q residency is disabled by policy");
+
+  bool forceQResident = qResidentPolicy.value_or(false);
+  if (!forceQResident) {
+    if (!trips)
+      return reject("dynamic_trip_count_not_profitable",
+                    "auto attention Q residency requires a known static trip "
+                    "count; use TRITON_SPM_ATTENTION_Q_RESIDENT=1 to force");
+    int64_t minTrips =
+        getEnvInt64("TRITON_SPM_ATTENTION_Q_RESIDENT_MIN_TRIPS", 4);
+    if (minTrips > 1 && *trips < minTrips)
+      return reject("short_attention_loop_not_profitable",
+                    "short attention loops do not amortize Q DMA/wait cost");
+    int64_t minUses =
+        getEnvInt64("TRITON_SPM_ATTENTION_Q_RESIDENT_MIN_USES", 2);
+    if (minUses > 1 && qReuseCount < minUses)
+      return reject("low_q_reuse_not_profitable",
+                    "Q is already loaded outside the attention loop; single "
+                    "QK consumers do not amortize DMA/wait cost");
+  }
+
+  int64_t maxQTileBytes =
+      getEnvInt64("TRITON_SPM_ATTENTION_Q_RESIDENT_MAX_BYTES", 2048);
+  if (maxQTileBytes >= 0 && qPlan->tileBytes > maxQTileBytes)
+    return reject("large_q_tile_not_safe",
+                  "large attention Q tiles are kept cacheable because wide "
+                  "addrspace(3) vector loads are not correctness-stable");
+  auto nextTop = state.nextPersistentTop(qPlan->tileBytes);
+  if (!nextTop)
+    return reject("spm_capacity_overflow",
+                  "SPM capacity cannot fit attention-v2 resident Q tile");
+
+  int64_t liveBytes = qPlan->tileBytes;
+
+  if (!materializeAttentionQ(*qPlan, state))
+    return reject("dynamic_shape_or_stride",
+                  "failed to compute resident Q tile DRAM address");
+
+  appendAttentionV2QRecord(
+      report, "attention Q resident tile", "function-scope attention tile",
+      qPlan->vecTy, qReuseCount, qPlan->tileBytes, qPlan->addr, liveBytes,
+      /*dmaDescriptors=*/1, /*waits=*/1, "resident_q_tile", "none",
+      "accepted_attention_v2_q_resident",
+      "Q is staged once and reused by attention QK loops while K/V remain "
+      "cacheable");
+
+  return true;
+}
+
+static bool transformAttentionV2KVStreamingLoop(
+    scf::ForOp forOp, ArrayRef<TiledLoadInfo> dotLoads,
+    AttentionFunctionState &state, SPMPromotionReport *report) {
+  auto reject = [&](StringRef reasonCode, StringRef reason) {
+    if (report)
+      report->rejections.push_back(
+          makePromotionRejection("attention_v2_kv_stream", reasonCode,
+                                 reason));
+    return false;
+  };
+
+  if (!getEnvBool("TRITON_SPM_ATTENTION_KV_STREAM", false))
+    return reject("policy_disabled",
+                  "attention K/V streaming is disabled by default");
+
+  if (!shouldTryAttentionV2QResident(forOp, dotLoads))
+    return false;
+
+  auto trips = getExactStaticTripCount(forOp);
+  if (trips && *trips <= 0)
+    return reject("dynamic_shape_or_stride",
+                  "attention-v2 requires a positive trip count");
+  if (trips && *trips == 1)
+    return reject("single_iteration_not_profitable",
+                  "single-iteration attention K/V streaming is not useful");
+
+  std::optional<AttentionOuterQPlan> qPlan =
+      findAttentionOuterQPlan(forOp, dotLoads, state);
+  if (!qPlan)
+    return reject("unsupported_pattern",
+                  "attention-v2 requires an outer loop-invariant Q tile");
+
+  bool qAlreadyResident =
+      qPlan->memRefTy.getMemorySpaceAsInt() == SPM_ADDR_SPACE;
+  bool stageQ = qAlreadyResident ||
+                getEnvBool("TRITON_SPM_ATTENTION_KV_STREAM_STAGE_Q", false);
+  if (stageQ && !qAlreadyResident) {
+    int64_t maxQTileBytes =
+        getEnvInt64("TRITON_SPM_ATTENTION_Q_RESIDENT_MAX_BYTES", 2048);
+    if (maxQTileBytes >= 0 && qPlan->tileBytes > maxQTileBytes)
+      return reject("large_q_tile_not_safe",
+                    "large attention Q tiles are kept cacheable because wide "
+                    "addrspace(3) vector loads are not correctness-stable");
+    if (!state.nextPersistentTop(qPlan->tileBytes))
+      return reject("spm_capacity_overflow",
+                    "SPM capacity cannot fit attention-v2 resident Q tile");
+  }
+
+  int64_t persistentTop =
+      stageQ ? (qAlreadyResident ? state.persistentBytes
+                                 : *state.nextPersistentTop(qPlan->tileBytes))
+             : state.persistentBytes;
+
+  SmallVector<AttentionStreamPlan, 2> streams;
+  streams.reserve(dotLoads.size());
+  for (const TiledLoadInfo &load : dotLoads) {
+    vector::TransferReadOp readOp = load.readOp;
+    auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+    if (!memRefTy || memRefTy.getRank() != 2 || load.vecTy.getRank() != 2)
+      return reject("unsupported_pattern",
+                    "attention K/V streams must be rank-2 tiled loads");
+    if (!canComputePrologueDramAddr(readOp, forOp))
+      return reject("dynamic_shape_or_stride",
+                    "failed to compute attention stream prologue address");
+    auto stepBytes = getAttentionStreamStepBytes(readOp, forOp);
+    if (!stepBytes)
+      return reject("dynamic_shape_or_stride",
+                    "failed to compute attention stream step bytes");
+
+    AttentionStreamPlan plan;
+    plan.load = load;
+    plan.memRefTy = memRefTy;
+    plan.spmMemStrides = getDmaFilledSpmMemStrides(load.vecTy, memRefTy);
+    plan.stepBytes = *stepBytes;
+    streams.push_back(std::move(plan));
+  }
+
+  SPMSpaceManager spmLayout(state.spmBase + persistentTop,
+                            state.spmSize - persistentTop);
+  int64_t liveBytes = stageQ ? qPlan->tileBytes : 0;
+  for (AttentionStreamPlan &stream : streams) {
+    auto alloc0 = spmLayout.alloc(stream.load.tileBytes, /*alignment=*/1,
+                                  SPMSpaceManager::Lifetime::Loop);
+    auto alloc1 = spmLayout.alloc(stream.load.tileBytes, /*alignment=*/1,
+                                  SPMSpaceManager::Lifetime::Loop);
+    if (!alloc0 || !alloc1)
+      return reject("spm_capacity_overflow",
+                    "SPM capacity cannot fit double-buffered K/V tiles");
+    stream.addrBuf0 = alloc0->address;
+    stream.addrBuf1 = alloc1->address;
+    liveBytes += stream.load.tileBytes * 2;
+  }
+
+  int64_t qReuseCount = getAttentionQReuseCount(qPlan->readOp);
+  if (stageQ && !materializeAttentionQ(*qPlan, state))
+    return reject("dynamic_shape_or_stride",
+                  "failed to compute resident Q tile DRAM address");
+
+  Location loc = forOp.getLoc();
+  InsertedBeforeGuard guard(forOp.getOperation());
+  OpBuilder b(forOp);
+
+  for (AttentionStreamPlan &stream : streams) {
+    stream.dramAddr = computePrologueDramAddr(b, loc, stream.load.readOp, forOp);
+    if (!stream.dramAddr) {
+      guard.cleanup();
+      return reject("dynamic_shape_or_stride",
+                    "failed to compute attention stream DRAM address");
+    }
+    emitDmaFilledEnqueue(b, loc, i64Cst(b, loc, stream.addrBuf0),
+                         stream.dramAddr, stream.load.vecTy, stream.memRefTy);
+  }
+
+  SmallVector<Value> initArgs(forOp.getInitArgs());
+  initArgs.push_back(i64Cst(b, loc, 0));
+  auto newForOp =
+      scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                         forOp.getStep(), initArgs);
+
+  Block *newBody = newForOp.getBody();
+  Block *oldBody = forOp.getBody();
+  b.setInsertionPointToStart(newBody);
+  if (!newBody->empty() && newBody->mightHaveTerminator())
+    newBody->getTerminator()->erase();
+
+  unsigned numOldArgs = forOp.getRegionIterArgs().size();
+  IRMapping mapping;
+  mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  for (unsigned i = 0; i < numOldArgs; ++i)
+    mapping.map(forOp.getRegionIterArgs()[i], newForOp.getRegionIterArgs()[i]);
+
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  Value bufIdx = newForOp.getRegionIterArgs()[numOldArgs];
+  Value zero = i64Cst(b, loc, 0);
+  Value one = i64Cst(b, loc, 1);
+  Value isZero =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
+  for (AttentionStreamPlan &stream : streams) {
+    Value buf0 = i64Cst(b, loc, stream.addrBuf0);
+    Value buf1 = i64Cst(b, loc, stream.addrBuf1);
+    stream.spmCur = arith::SelectOp::create(b, loc, isZero, buf0, buf1);
+    stream.spmNxt = arith::SelectOp::create(b, loc, isZero, buf1, buf0);
+  }
+
+  Value iv = newForOp.getInductionVar();
+  Value nextIv = arith::AddIOp::create(b, loc, iv, newForOp.getStep());
+  Value hasNext = arith::CmpIOp::create(
+      b, loc, arith::CmpIPredicate::slt, nextIv, newForOp.getUpperBound());
+  Value nextOff = arith::SubIOp::create(b, loc, nextIv,
+                                        newForOp.getLowerBound());
+  Value nextIterNum =
+      arith::DivSIOp::create(b, loc, toI64(b, loc, nextOff),
+                             toI64(b, loc, newForOp.getStep()));
+
+  auto prefetchIf =
+      scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
+  b.setInsertionPointToStart(&prefetchIf.getThenRegion().front());
+  for (AttentionStreamPlan &stream : streams) {
+    Value nextByteOff = arith::MulIOp::create(
+        b, loc, nextIterNum, i64Cst(b, loc, stream.stepBytes));
+    Value nextDram = arith::AddIOp::create(b, loc, stream.dramAddr,
+                                           nextByteOff);
+    emitDmaFilledEnqueue(b, loc, stream.spmNxt, nextDram,
+                         stream.load.vecTy, stream.memRefTy);
+  }
+  b.setInsertionPointAfter(prefetchIf);
+
+  for (Operation &op : oldBody->without_terminator()) {
+    bool replacedRead = false;
+    for (AttentionStreamPlan &stream : streams) {
+      if (&op != stream.load.readOp.getOperation())
+        continue;
+      Value spmVal = emitSpmReadWithStrides(
+          b, loc, stream.spmCur, stream.load.vecTy, stream.spmMemStrides);
+      mapping.map(stream.load.readOp.getResult(), spmVal);
+      replacedRead = true;
+      break;
+    }
+    if (replacedRead)
+      continue;
+    b.clone(op, mapping);
+  }
+
+  auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
+  SmallVector<Value> yieldVals;
+  for (Value operand : oldYield.getOperands())
+    yieldVals.push_back(mapping.lookupOrDefault(operand));
+  Value flipped = arith::SubIOp::create(b, loc, one, bufIdx);
+  yieldVals.push_back(flipped);
+  scf::YieldOp::create(b, loc, yieldVals);
+
+  for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+    forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
+  guard.commit();
+  forOp.erase();
+
+  if (stageQ && !qAlreadyResident)
+    appendAttentionV2QRecord(
+        report, "attention Q resident tile", "function-scope attention tile",
+        qPlan->vecTy, qReuseCount, qPlan->tileBytes, qPlan->addr, liveBytes,
+        /*dmaDescriptors=*/1, /*waits=*/1, "resident_q_tile", "none",
+        "accepted_attention_v2_q_resident",
+        "Q is staged once and reused by attention QK loops");
+
+  int64_t recordUses = trips ? *trips : 2;
+  for (const AttentionStreamPlan &stream : streams) {
+    std::string source =
+        hasColMajorRowBlockDmaLayout(stream.load.vecTy, stream.memRefTy)
+            ? "attention K stream tile"
+            : "attention V stream tile";
+    appendAttentionV2QRecord(
+        report, source, "double-buffered attention K/V stream",
+        stream.load.vecTy, recordUses, stream.load.tileBytes * 2,
+        stream.addrBuf0, liveBytes,
+        /*dmaDescriptors=*/recordUses, /*waits=*/recordUses,
+        "stream_kv_tile", "double_buffered",
+        "accepted_attention_v2_kv_stream",
+        "K/V tiles are streamed through SPM without unrolling the attention "
+        "loop");
   }
 
   return true;
@@ -2995,17 +3751,14 @@ static bool transformReductionResidencyPlan(
 /// microM rows of A that the current contract consumes.  The full accumulator
 /// tile is spilled to SPM between K windows so each inner loop carries only a
 /// microM x N vector accumulator.
-static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
-                                         ArrayRef<TiledLoadInfo> dotLoads,
-                                         int64_t spmBase, int64_t spmSize,
-                                         int64_t microM,
-                                         int64_t requestedWindowK,
-                                         bool enablePromotionProfitability,
-                                         SPMPromotionReport *report) {
+static bool transformFusedMicroGemmLoop(
+    scf::ForOp forOp, ArrayRef<TiledLoadInfo> dotLoads, int64_t spmBase,
+    int64_t spmSize, int64_t microM, int64_t requestedWindowK,
+    bool enablePromotionProfitability, SPMPromotionReport *report) {
   auto reject = [&](StringRef reasonCode, StringRef reason) {
     if (report)
-      report->rejections.push_back(makePromotionRejection(
-          "fused_micro_gemm", reasonCode, reason));
+      report->rejections.push_back(
+          makePromotionRejection("fused_micro_gemm", reasonCode, reason));
     return false;
   };
 
@@ -3035,79 +3788,76 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
     return record;
   };
 
-  auto makeBWindowRecord =
-      [&](VectorType shapeTy, int64_t window, int64_t uses, int64_t bytes,
-          int64_t spmAddress) {
-        SPMPromotionRecord record;
-        record.source = "B tile window";
-        record.scope = "loop-window";
-        appendShape(record.shape, shapeTy);
-        record.shape.push_back(window);
-        record.uses = uses;
-        record.copyIn = "DMA";
-        record.copyOut = "none";
-        record.bytes = bytes;
-        record.spmAddress = spmAddress;
-        record.overhead = "windowK DMA descriptors plus one wait per K window";
-        record.benefit =
-            "B window is loaded once and reused across all microM slices";
-        if (enablePromotionProfitability)
-          attachD3Profitability(
-              record,
-              makeD3ProfitabilityEvidence(
-                  "accept", "accepted_reused_loop_window",
-                  "D3 static model accepts the existing fused matmul B window: "
-                  "bounded loop-window lifetime and reuse across microM slices",
-                  window, /*waits=*/1, bytes,
-                  /*spmWriteBytes=*/bytes, /*spmReadBytes=*/bytes,
-                  (bytes / window) * std::max<int64_t>(0, uses - window),
-                  bytes, /*estimatedExtraOps=*/window,
-                  /*measuredBankConflicts=*/0, uses));
-        return record;
-      };
+  auto makeBWindowRecord = [&](VectorType shapeTy, int64_t window, int64_t uses,
+                               int64_t bytes, int64_t spmAddress) {
+    SPMPromotionRecord record;
+    record.source = "B tile window";
+    record.scope = "loop-window";
+    appendShape(record.shape, shapeTy);
+    record.shape.push_back(window);
+    record.uses = uses;
+    record.copyIn = "DMA";
+    record.copyOut = "none";
+    record.bytes = bytes;
+    record.spmAddress = spmAddress;
+    record.overhead = "windowK DMA descriptors plus one wait per K window";
+    record.benefit =
+        "B window is loaded once and reused across all microM slices";
+    if (enablePromotionProfitability)
+      attachD3Profitability(
+          record,
+          makeD3ProfitabilityEvidence(
+              "accept", "accepted_reused_loop_window",
+              "D3 static model accepts the existing fused matmul B window: "
+              "bounded loop-window lifetime and reuse across microM slices",
+              window, /*waits=*/1, bytes,
+              /*spmWriteBytes=*/bytes, /*spmReadBytes=*/bytes,
+              (bytes / window) * std::max<int64_t>(0, uses - window), bytes,
+              /*estimatedExtraOps=*/window,
+              /*measuredBankConflicts=*/0, uses));
+    return record;
+  };
 
-  auto makeAccumulatorRecord =
-      [&](VectorType shapeTy, int64_t uses, int64_t bytes,
-          int64_t spmAddress) {
-        SPMPromotionRecord record;
-        record.source = "accumulator tile";
-        record.scope = "loop-window temporary";
-        appendShape(record.shape, shapeTy);
-        record.uses = uses;
-        record.copyIn = "CPU/vector store";
-        record.copyOut = "CPU/vector transfer read";
-        record.bytes = bytes;
-        record.spmAddress = spmAddress;
-        record.overhead = "SPM read/write around each microM slice";
-        record.benefit =
-            "keeps the full accumulator tile resident while inner loops carry "
-            "only microM rows";
-        if (enablePromotionProfitability)
-          attachD3Profitability(
-              record,
-              makeD3ProfitabilityEvidence(
-                  "accept", "accepted_bounded_temporary",
-                  "D3 static model accepts the accumulator tile as a bounded "
-                  "loop-window temporary in the existing fused matmul schedule",
-                  /*dmaDescriptors=*/0, /*waits=*/0, /*copyBytes=*/0,
-                  /*spmWriteBytes=*/bytes * std::max<int64_t>(0, uses - 1),
-                  /*spmReadBytes=*/bytes * std::max<int64_t>(0, uses - 1),
-                  bytes * std::max<int64_t>(0, uses - 1), bytes,
-                  /*estimatedExtraOps=*/uses,
-                  /*measuredBankConflicts=*/0, uses));
-        return record;
-      };
+  auto makeAccumulatorRecord = [&](VectorType shapeTy, int64_t uses,
+                                   int64_t bytes, int64_t spmAddress) {
+    SPMPromotionRecord record;
+    record.source = "accumulator tile";
+    record.scope = "loop-window temporary";
+    appendShape(record.shape, shapeTy);
+    record.uses = uses;
+    record.copyIn = "CPU/vector store";
+    record.copyOut = "CPU/vector transfer read";
+    record.bytes = bytes;
+    record.spmAddress = spmAddress;
+    record.overhead = "SPM read/write around each microM slice";
+    record.benefit =
+        "keeps the full accumulator tile resident while inner loops carry "
+        "only microM rows";
+    if (enablePromotionProfitability)
+      attachD3Profitability(
+          record,
+          makeD3ProfitabilityEvidence(
+              "accept", "accepted_bounded_temporary",
+              "D3 static model accepts the accumulator tile as a bounded "
+              "loop-window temporary in the existing fused matmul schedule",
+              /*dmaDescriptors=*/0, /*waits=*/0, /*copyBytes=*/0,
+              /*spmWriteBytes=*/bytes * std::max<int64_t>(0, uses - 1),
+              /*spmReadBytes=*/bytes * std::max<int64_t>(0, uses - 1),
+              bytes * std::max<int64_t>(0, uses - 1), bytes,
+              /*estimatedExtraOps=*/uses,
+              /*measuredBankConflicts=*/0, uses));
+    return record;
+  };
 
-  auto makeAMicroRecord =
-      [&](VectorType shapeTy, int64_t uses, int64_t bytes,
-          int64_t spmAddress) {
-        return makeRecord("A micro tile", "single-iteration", shapeTy, uses,
-                          "DMA", "none", bytes, spmAddress,
-                          "two SPM buffers, one DMA descriptor per microM/K "
-                          "step, and one wait-at-top per step",
-                          "pipelines A micro-tile staging while limiting A to "
-                          "the rows consumed by the current microM contract");
-      };
+  auto makeAMicroRecord = [&](VectorType shapeTy, int64_t uses, int64_t bytes,
+                              int64_t spmAddress) {
+    return makeRecord("A micro tile", "single-iteration", shapeTy, uses, "DMA",
+                      "none", bytes, spmAddress,
+                      "two SPM buffers, one DMA descriptor per microM/K "
+                      "step, and one wait-at-top per step",
+                      "pipelines A micro-tile staging while limiting A to "
+                      "the rows consumed by the current microM contract");
+  };
 
   auto lbCst = getConstantIntValue(forOp.getLowerBound());
   auto ubCst = getConstantIntValue(forOp.getUpperBound());
@@ -3124,11 +3874,9 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
 
   TiledLoadInfo loadA = dotLoads[0];
   TiledLoadInfo loadB = dotLoads[1];
-  auto contractInfo =
-      analyzeGemmContract(forOp, loadA.readOp, loadB.readOp);
+  auto contractInfo = analyzeGemmContract(forOp, loadA.readOp, loadB.readOp);
   if (!contractInfo) {
-    contractInfo =
-        analyzeGemmContract(forOp, loadB.readOp, loadA.readOp);
+    contractInfo = analyzeGemmContract(forOp, loadB.readOp, loadA.readOp);
     if (!contractInfo)
       return reject("unsupported_pattern",
                     "could not identify vector.contract consuming A/B loads");
@@ -3165,8 +3913,8 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   auto memRefTyB = cast<MemRefType>(loadB.readOp.getBase().getType());
   SmallVector<int64_t> stridesA, stridesB;
   if (!getStaticStrides(memRefTyA, stridesA) ||
-      !getStaticStrides(memRefTyB, stridesB) ||
-      stridesA.size() < 2 || stridesB.size() < 2)
+      !getStaticStrides(memRefTyB, stridesB) || stridesA.size() < 2 ||
+      stridesB.size() < 2)
     return reject("dynamic_shape_or_stride",
                   "A/B memrefs require static rank-2 strides");
 
@@ -3195,9 +3943,9 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   auto allocAcc = spmLayout.alloc(accBytes, /*alignment=*/1,
                                   SPMSpaceManager::Lifetime::Loop);
   if (!allocBWindow || !allocAMicro0 || !allocAMicro1 || !allocAcc)
-    return reject(
-        "spm_capacity_overflow",
-        "SPM capacity cannot fit B window, A micro double buffer, and accumulator");
+    return reject("spm_capacity_overflow",
+                  "SPM capacity cannot fit B window, A micro double buffer, "
+                  "and accumulator");
 
   int64_t addrBWindow = allocBWindow->address;
   int64_t addrAMicro0 = allocAMicro0->address;
@@ -3220,10 +3968,10 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
     int64_t microSlices = BM / microM;
     report->records.push_back(makeBWindowRecord(
         bTy, windowK, microSlices * windowK, bWindowBytes, addrBWindow));
-    report->records.push_back(makeAMicroRecord(
-        microATy, /*uses=*/1, microABytes * 2, addrAMicro0));
-    report->records.push_back(makeAccumulatorRecord(
-        accTy, microSlices * 2 + 1, accBytes, addrAcc));
+    report->records.push_back(
+        makeAMicroRecord(microATy, /*uses=*/1, microABytes * 2, addrAMicro0));
+    report->records.push_back(
+        makeAccumulatorRecord(accTy, microSlices * 2 + 1, accBytes, addrAcc));
   }
 
   MLIRContext *ctx = forOp.getContext();
@@ -3246,9 +3994,9 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
                  microInit);
   }
 
-  auto winFor = scf::ForOp::create(
-      b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, trips),
-      i64Cst(b, loc, windowK));
+  auto winFor =
+      scf::ForOp::create(b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, trips),
+                         i64Cst(b, loc, windowK));
   Block *winBody = winFor.getBody();
   if (!winBody->empty() && winBody->mightHaveTerminator())
     winBody->getTerminator()->erase();
@@ -3259,8 +4007,7 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   // Stage the resident B window once.  windowK is capped to the DMA queue
   // depth default (4) by the caller/env setting.
   auto bStageFor = scf::ForOp::create(
-      b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, windowK),
-      i64Cst(b, loc, 1));
+      b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, windowK), i64Cst(b, loc, 1));
   Block *bStageBody = bStageFor.getBody();
   if (!bStageBody->empty() && bStageBody->mightHaveTerminator())
     bStageBody->getTerminator()->erase();
@@ -3270,12 +4017,10 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
   Value bAbsIter = arith::AddIOp::create(b, loc, winIter, bLocal);
   Value bDram = arith::AddIOp::create(
       b, loc, dramAddrB,
-      arith::MulIOp::create(b, loc, bAbsIter,
-                            i64Cst(b, loc, stepBytesB)));
+      arith::MulIOp::create(b, loc, bAbsIter, i64Cst(b, loc, stepBytesB)));
   Value bSpm = arith::AddIOp::create(
       b, loc, i64Cst(b, loc, addrBWindow),
-      arith::MulIOp::create(b, loc, bLocal,
-                            i64Cst(b, loc, loadB.tileBytes)));
+      arith::MulIOp::create(b, loc, bLocal, i64Cst(b, loc, loadB.tileBytes)));
   emitDmaEnqueue(b, loc, bSpm, bDram, bTy, memRefTyB);
   scf::YieldOp::create(b, loc);
 
@@ -3288,17 +4033,15 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
         b, loc, dramAddrA,
         arith::AddIOp::create(
             b, loc,
-            arith::MulIOp::create(b, loc, winIter,
-                                  i64Cst(b, loc, stepBytesA)),
+            arith::MulIOp::create(b, loc, winIter, i64Cst(b, loc, stepBytesA)),
             i64Cst(b, loc, mOff * rowBytesA)));
-    emitDmaEnqueue(b, loc, i64Cst(b, loc, addrAMicro0), aDram0,
-                   microATy, memRefTyA);
+    emitDmaEnqueue(b, loc, i64Cst(b, loc, addrAMicro0), aDram0, microATy,
+                   memRefTyA);
     Value microInit = emitSpmRead(b, loc, accAddr, microAccTy);
 
-    auto kFor = scf::ForOp::create(
-        b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, windowK),
-        i64Cst(b, loc, 1),
-        ValueRange{microInit, i64Cst(b, loc, 0)});
+    auto kFor = scf::ForOp::create(b, loc, i64Cst(b, loc, 0),
+                                   i64Cst(b, loc, windowK), i64Cst(b, loc, 1),
+                                   ValueRange{microInit, i64Cst(b, loc, 0)});
     Block *kBody = kFor.getBody();
     if (!kBody->empty() && kBody->mightHaveTerminator())
       kBody->getTerminator()->erase();
@@ -3311,27 +4054,25 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
     Value aBufIdx = kFor.getRegionIterArgs()[1];
     Value zero = i64Cst(b, loc, 0);
     Value one = i64Cst(b, loc, 1);
-    Value isZero = arith::CmpIOp::create(
-        b, loc, arith::CmpIPredicate::eq, aBufIdx, zero);
-    Value aCur = arith::SelectOp::create(
-        b, loc, isZero, i64Cst(b, loc, addrAMicro0),
-        i64Cst(b, loc, addrAMicro1));
-    Value aNxt = arith::SelectOp::create(
-        b, loc, isZero, i64Cst(b, loc, addrAMicro1),
-        i64Cst(b, loc, addrAMicro0));
+    Value isZero =
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, aBufIdx, zero);
+    Value aCur =
+        arith::SelectOp::create(b, loc, isZero, i64Cst(b, loc, addrAMicro0),
+                                i64Cst(b, loc, addrAMicro1));
+    Value aNxt =
+        arith::SelectOp::create(b, loc, isZero, i64Cst(b, loc, addrAMicro1),
+                                i64Cst(b, loc, addrAMicro0));
 
     Value nextKLocal = arith::AddIOp::create(b, loc, kLocal, one);
-    Value hasNextA = arith::CmpIOp::create(
-        b, loc, arith::CmpIPredicate::slt, nextKLocal,
-        i64Cst(b, loc, windowK));
+    Value hasNextA = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt,
+                                           nextKLocal, i64Cst(b, loc, windowK));
     Value nextKAbsIter = arith::AddIOp::create(b, loc, kAbsIter, one);
     Value nextADram = arith::AddIOp::create(
         b, loc, dramAddrA,
-        arith::AddIOp::create(
-            b, loc,
-            arith::MulIOp::create(b, loc, nextKAbsIter,
-                                  i64Cst(b, loc, stepBytesA)),
-            i64Cst(b, loc, mOff * rowBytesA)));
+        arith::AddIOp::create(b, loc,
+                              arith::MulIOp::create(b, loc, nextKAbsIter,
+                                                    i64Cst(b, loc, stepBytesA)),
+                              i64Cst(b, loc, mOff * rowBytesA)));
     auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNextA, false);
     b.setInsertionPointToStart(&ifOp.getThenRegion().front());
     emitDmaEnqueue(b, loc, aNxt, nextADram, microATy, memRefTyA);
@@ -3340,8 +4081,7 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
     Value aVal = emitSpmRead(b, loc, aCur, microATy);
     Value bReadAddr = arith::AddIOp::create(
         b, loc, i64Cst(b, loc, addrBWindow),
-        arith::MulIOp::create(b, loc, kLocal,
-                              i64Cst(b, loc, loadB.tileBytes)));
+        arith::MulIOp::create(b, loc, kLocal, i64Cst(b, loc, loadB.tileBytes)));
     Value bVal = emitSpmRead(b, loc, bReadAddr, bTy);
     Value microAcc = kFor.getRegionIterArgs()[0];
     Value contracted = vector::ContractionOp::create(
@@ -3369,15 +4109,14 @@ static bool transformFusedMicroGemmLoop(scf::ForOp forOp,
 /// `dotLoads` must have exactly 2 entries (A and B tile loads).
 /// Returns true on success.
 static bool transformGemmLoop(scf::ForOp forOp,
-                              ArrayRef<TiledLoadInfo> dotLoads,
-                              int64_t spmBase, int64_t spmSize) {
+                              ArrayRef<TiledLoadInfo> dotLoads, int64_t spmBase,
+                              int64_t spmSize) {
   if (dotLoads.size() != 2)
     return false;
 
   TiledLoadInfo loadA = dotLoads[0];
   TiledLoadInfo loadB = dotLoads[1];
-  auto contractInfo =
-      analyzeGemmContract(forOp, loadA.readOp, loadB.readOp);
+  auto contractInfo = analyzeGemmContract(forOp, loadA.readOp, loadB.readOp);
   if (!contractInfo) {
     contractInfo = analyzeGemmContract(forOp, loadB.readOp, loadA.readOp);
     if (!contractInfo)
@@ -3397,14 +4136,14 @@ static bool transformGemmLoop(scf::ForOp forOp,
     return false;
 
   SPMSpaceManager spmLayout(spmBase, spmSize);
-  auto allocA0 = spmLayout.alloc(tileA, /*alignment=*/1,
-                                 SPMSpaceManager::Lifetime::Loop);
-  auto allocA1 = spmLayout.alloc(tileA, /*alignment=*/1,
-                                 SPMSpaceManager::Lifetime::Loop);
-  auto allocB0 = spmLayout.alloc(tileB, /*alignment=*/1,
-                                 SPMSpaceManager::Lifetime::Loop);
-  auto allocB1 = spmLayout.alloc(tileB, /*alignment=*/1,
-                                 SPMSpaceManager::Lifetime::Loop);
+  auto allocA0 =
+      spmLayout.alloc(tileA, /*alignment=*/1, SPMSpaceManager::Lifetime::Loop);
+  auto allocA1 =
+      spmLayout.alloc(tileA, /*alignment=*/1, SPMSpaceManager::Lifetime::Loop);
+  auto allocB0 =
+      spmLayout.alloc(tileB, /*alignment=*/1, SPMSpaceManager::Lifetime::Loop);
+  auto allocB1 =
+      spmLayout.alloc(tileB, /*alignment=*/1, SPMSpaceManager::Lifetime::Loop);
   if (!allocA0 || !allocA1 || !allocB0 || !allocB1)
     return false;
 
@@ -3430,10 +4169,10 @@ static bool transformGemmLoop(scf::ForOp forOp,
     return false;
   }
 
-  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrA0), dramAddrA,
-                 loadA.vecTy, memRefTyA);
-  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrB0), dramAddrB,
-                 loadB.vecTy, memRefTyB);
+  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrA0), dramAddrA, loadA.vecTy,
+                 memRefTyA);
+  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrB0), dramAddrB, loadB.vecTy,
+                 memRefTyB);
   // No explicit prologue wait: the DmaWait emitted at the top of the
   // body block (before any SPM read of buffer 0) already polls until
   // the prologue DMAs complete.  Issuing another wait here just adds a
@@ -3458,9 +4197,9 @@ static bool transformGemmLoop(scf::ForOp forOp,
   newInitArgs.push_back(initBufIdx);
 
   // Create new for loop.
-  auto newForOp = scf::ForOp::create(
-      b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
-      newInitArgs);
+  auto newForOp =
+      scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                         forOp.getStep(), newInitArgs);
 
   // The new loop's body block has: iv, then one block arg per init arg.
   Block *newBody = newForOp.getBody();
@@ -3471,8 +4210,7 @@ static bool transformGemmLoop(scf::ForOp forOp,
   mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
   unsigned numOldArgs = forOp.getRegionIterArgs().size();
   for (unsigned i = 0; i < numOldArgs; ++i)
-    mapping.map(forOp.getRegionIterArgs()[i],
-                newForOp.getRegionIterArgs()[i]);
+    mapping.map(forOp.getRegionIterArgs()[i], newForOp.getRegionIterArgs()[i]);
 
   Value bufIdx = newForOp.getRegionIterArgs()[numOldArgs]; // new buf_idx arg
 
@@ -3497,8 +4235,8 @@ static bool transformGemmLoop(scf::ForOp forOp,
   // Build buffer selection BEFORE cloning the body so these ops dominate
   // the SPM reads that will replace the cloned transfer_reads.
   Value zero = i64Cst(b, loc, 0);
-  Value isZero = arith::CmpIOp::create(
-      b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
+  Value isZero =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
 
   // SPM addresses for A
   Value spmA0 = i64Cst(b, loc, addrA0);
@@ -3515,8 +4253,8 @@ static bool transformGemmLoop(scf::ForOp forOp,
   Value step = newForOp.getStep();
   Value ub = newForOp.getUpperBound();
   Value nextIv = arith::AddIOp::create(b, loc, iv, step);
-  Value hasNext = arith::CmpIOp::create(
-      b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+  Value hasNext =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, nextIv, ub);
 
   Value spmANxt = arith::SelectOp::create(b, loc, isZero, spmA1, spmA0);
   Value spmBNxt = arith::SelectOp::create(b, loc, isZero, spmB1, spmB0);
@@ -3673,9 +4411,9 @@ static bool transformReductionLoop(scf::ForOp forOp,
     if (!allocBuf0 || !allocBuf1)
       return false;
 
-    plans.push_back(ReductionLoadPlan{
-        load, memRefTy, allocBuf0->address, allocBuf1->address, *stepBytes,
-        Value(), Value(), Value()});
+    plans.push_back(ReductionLoadPlan{load, memRefTy, allocBuf0->address,
+                                      allocBuf1->address, *stepBytes, Value(),
+                                      Value(), Value()});
   }
 
   Location loc = forOp.getLoc();
@@ -3696,9 +4434,9 @@ static bool transformReductionLoop(scf::ForOp forOp,
   // Rebuild loop with one extra iter_arg: the current buffer index.
   SmallVector<Value> initArgs(forOp.getInitArgs());
   initArgs.push_back(i64Cst(b, loc, 0));
-  auto newForOp = scf::ForOp::create(
-      b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
-      initArgs);
+  auto newForOp =
+      scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                         forOp.getStep(), initArgs);
 
   Block *newBody = newForOp.getBody();
   Block *oldBody = forOp.getBody();
@@ -3707,8 +4445,7 @@ static bool transformReductionLoop(scf::ForOp forOp,
   mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
   unsigned numOldArgs = forOp.getRegionIterArgs().size();
   for (unsigned i = 0; i < numOldArgs; ++i)
-    mapping.map(forOp.getRegionIterArgs()[i],
-                newForOp.getRegionIterArgs()[i]);
+    mapping.map(forOp.getRegionIterArgs()[i], newForOp.getRegionIterArgs()[i]);
   Value bufIdx = newForOp.getRegionIterArgs()[numOldArgs];
 
   b.setInsertionPointToStart(newBody);
@@ -3720,8 +4457,8 @@ static bool transformReductionLoop(scf::ForOp forOp,
   triton::cpu::DmaWaitOp::create(b, loc);
 
   Value zero = i64Cst(b, loc, 0);
-  Value isZero = arith::CmpIOp::create(
-      b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
+  Value isZero =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
   for (ReductionLoadPlan &plan : plans) {
     Value spmBuf0 = i64Cst(b, loc, plan.addrBuf0);
     Value spmBuf1 = i64Cst(b, loc, plan.addrBuf1);
@@ -3734,8 +4471,8 @@ static bool transformReductionLoop(scf::ForOp forOp,
   Value step = newForOp.getStep();
   Value ub = newForOp.getUpperBound();
   Value nextIv = arith::AddIOp::create(b, loc, iv, step);
-  Value hasNext = arith::CmpIOp::create(
-      b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+  Value hasNext =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, nextIv, ub);
 
   Value lbInLoop = newForOp.getLowerBound();
   Value nextOff = arith::SubIOp::create(b, loc, nextIv, lbInLoop);
@@ -3744,10 +4481,9 @@ static bool transformReductionLoop(scf::ForOp forOp,
   auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
   b.setInsertionPointToStart(&ifOp.getThenRegion().front());
   for (ReductionLoadPlan &plan : plans) {
-    Value nextByteOff = arith::MulIOp::create(
-        b, loc, nextOffI64, i64Cst(b, loc, plan.stepBytes));
-    Value nextDram = arith::AddIOp::create(b, loc, plan.dramAddr,
-                                           nextByteOff);
+    Value nextByteOff = arith::MulIOp::create(b, loc, nextOffI64,
+                                              i64Cst(b, loc, plan.stepBytes));
+    Value nextDram = arith::AddIOp::create(b, loc, plan.dramAddr, nextByteOff);
     emitDmaEnqueue(b, loc, plan.spmNxt, nextDram, plan.load.vecTy,
                    plan.memRefTy);
   }
@@ -3805,25 +4541,24 @@ struct ConvertMemoryToSPM
     this->spmBase = spmBase_;
     this->spmSize = spmSize_;
   }
-  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_,
-                     int64_t microM_, int64_t windowK_) {
+  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_, int64_t microM_,
+                     int64_t windowK_) {
     this->spmBase = spmBase_;
     this->spmSize = spmSize_;
     this->microM = microM_;
     this->windowK = windowK_;
   }
-  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_,
-                     int64_t microM_, int64_t windowK_,
-                     bool enableReductions_) {
+  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_, int64_t microM_,
+                     int64_t windowK_, bool enableReductions_) {
     this->spmBase = spmBase_;
     this->spmSize = spmSize_;
     this->microM = microM_;
     this->windowK = windowK_;
     this->enableReductions = enableReductions_;
   }
-  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_,
-                     int64_t microM_, int64_t windowK_,
-                     bool enableReductions_, bool promotionReport_) {
+  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_, int64_t microM_,
+                     int64_t windowK_, bool enableReductions_,
+                     bool promotionReport_) {
     this->spmBase = spmBase_;
     this->spmSize = spmSize_;
     this->microM = microM_;
@@ -3831,9 +4566,8 @@ struct ConvertMemoryToSPM
     this->enableReductions = enableReductions_;
     this->promotionReport = promotionReport_;
   }
-  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_,
-                     int64_t microM_, int64_t windowK_,
-                     bool enableReductions_,
+  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_, int64_t microM_,
+                     int64_t windowK_, bool enableReductions_,
                      bool enableRowResidentReductions_,
                      int64_t rowResidentMaxBytes_,
                      StringRef rowResidentProducerPass_,
@@ -3854,6 +4588,7 @@ struct ConvertMemoryToSPM
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     DenseMap<Operation *, SPMPromotionReport> reports;
+    DenseMap<Operation *, AttentionFunctionState> attentionStates;
     llvm::DenseSet<Operation *> rowResidentHandledLoops;
 
     if (enableRowResidentReductions) {
@@ -3874,14 +4609,14 @@ struct ConvertMemoryToSPM
 
         if (isRowBlockDmaProducerPassMode(rowResidentProducerPass) &&
             getEnvBool("TRITON_SPM_SOFTMAX_INTERNAL_ROW_BLOCK", false)) {
-          int64_t rowBlock = getEnvInt64(
-              "TRITON_SPM_SOFTMAX_ROW_BLOCK",
-              getEnvInt64("SOFTMAX_SPM_ROW_BLOCK", 2));
-          int64_t rowGroupBlocks = getEnvInt64(
-              "TRITON_SPM_SOFTMAX_ROW_GROUP_BLOCKS",
-              getEnvInt64("SOFTMAX_SPM_ROW_GROUP_BLOCKS", 8));
-          if (lowerCanonicalSoftmaxToRowBlockGroup(
-                  topLevelLoops, funcOp, rowBlock, rowGroupBlocks)) {
+          int64_t rowBlock =
+              getEnvInt64("TRITON_SPM_SOFTMAX_ROW_BLOCK",
+                          getEnvInt64("SOFTMAX_SPM_ROW_BLOCK", 2));
+          int64_t rowGroupBlocks =
+              getEnvInt64("TRITON_SPM_SOFTMAX_ROW_GROUP_BLOCKS",
+                          getEnvInt64("SOFTMAX_SPM_ROW_GROUP_BLOCKS", 8));
+          if (lowerCanonicalSoftmaxToRowBlockGroup(topLevelLoops, funcOp,
+                                                   rowBlock, rowGroupBlocks)) {
             topLevelLoops.clear();
             for (Operation &op : entryBlock) {
               if (auto forOp = dyn_cast<scf::ForOp>(&op))
@@ -3896,27 +4631,26 @@ struct ConvertMemoryToSPM
             topLevelLoops, funcOp, rejectReasonCode, rejectReason,
             rowResidentProducerPass);
         if (!plan) {
-          plan = matchLayerNormResidencyPlan(
-              topLevelLoops, funcOp, rejectReasonCode, rejectReason,
-              rowResidentProducerPass);
+          plan = matchLayerNormResidencyPlan(topLevelLoops, funcOp,
+                                             rejectReasonCode, rejectReason,
+                                             rowResidentProducerPass);
         }
         if (!plan) {
-          plan = matchSoftmaxResidencyPlan(topLevelLoops, funcOp,
-                                           rejectReasonCode, rejectReason,
-                                           rowResidentProducerPass);
+          plan =
+              matchSoftmaxResidencyPlan(topLevelLoops, funcOp, rejectReasonCode,
+                                        rejectReason, rowResidentProducerPass);
         }
         if (!plan) {
           if (report && !rejectReasonCode.empty()) {
-            report->rejections.push_back(makeRowResidentRejection(
-                rejectReasonCode, rejectReason));
+            report->rejections.push_back(
+                makeRowResidentRejection(rejectReasonCode, rejectReason));
           }
           return;
         }
 
-        transformReductionResidencyPlan(*plan, spmBase, spmSize,
-                                        rowResidentMaxBytes,
-                                        enablePromotionProfitability, report,
-                                        rowResidentHandledLoops);
+        transformReductionResidencyPlan(
+            *plan, spmBase, spmSize, rowResidentMaxBytes,
+            enablePromotionProfitability, report, rowResidentHandledLoops);
       });
     }
 
@@ -3942,12 +4676,20 @@ struct ConvertMemoryToSPM
 
       if (dotLoads.size() == 2) {
         SPMPromotionReport *report = nullptr;
-        if (promotionReport) {
-          auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
-          if (funcOp)
-            report = &reports[funcOp.getOperation()];
+        auto parentFunc = forOp->getParentOfType<FunctionOpInterface>();
+        if (promotionReport && parentFunc)
+          report = &reports[parentFunc.getOperation()];
+        AttentionFunctionState *attentionState = nullptr;
+        if (parentFunc) {
+          attentionState = &attentionStates[parentFunc.getOperation()];
+          attentionState->initialize(spmBase, spmSize);
         }
-        if (!transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
+        if (!(attentionState &&
+              (transformAttentionV2KVStreamingLoop(forOp, dotLoads,
+                                                   *attentionState, report) ||
+               transformAttentionV2QResidentLoop(forOp, dotLoads,
+                                                 *attentionState, report))) &&
+            !transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
                                          microM, windowK,
                                          enablePromotionProfitability, report))
           transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
@@ -3958,8 +4700,8 @@ struct ConvertMemoryToSPM
             auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
             if (funcOp) {
               SPMProfitabilityEvidence evidence =
-                  evaluateD3StreamingReductionProfitability(
-                      forOp, nonDotLoads, spmSize);
+                  evaluateD3StreamingReductionProfitability(forOp, nonDotLoads,
+                                                            spmSize);
               reports[funcOp.getOperation()].rejections.push_back(
                   makeD3StreamingReductionRejection(forOp, nonDotLoads,
                                                     std::move(evidence)));
@@ -4027,41 +4769,35 @@ createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize) {
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
-                         int64_t microM, int64_t windowK) {
-  return std::make_unique<ConvertMemoryToSPM>(
-      spmBase, spmSize, microM, windowK);
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize, int64_t microM,
+                         int64_t windowK) {
+  return std::make_unique<ConvertMemoryToSPM>(spmBase, spmSize, microM,
+                                              windowK);
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
-                         int64_t microM, int64_t windowK,
-                         bool enableReductions) {
-  return std::make_unique<ConvertMemoryToSPM>(
-      spmBase, spmSize, microM, windowK, enableReductions);
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize, int64_t microM,
+                         int64_t windowK, bool enableReductions) {
+  return std::make_unique<ConvertMemoryToSPM>(spmBase, spmSize, microM, windowK,
+                                              enableReductions);
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
-                         int64_t microM, int64_t windowK,
-                         bool enableReductions, bool promotionReport) {
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize, int64_t microM,
+                         int64_t windowK, bool enableReductions,
+                         bool promotionReport) {
   return std::make_unique<ConvertMemoryToSPM>(
       spmBase, spmSize, microM, windowK, enableReductions, promotionReport);
 }
 
-std::unique_ptr<OperationPass<ModuleOp>>
-createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
-                         int64_t microM, int64_t windowK,
-                         bool enableReductions,
-                         bool enableRowResidentReductions,
-                         int64_t rowResidentMaxBytes,
-                         StringRef rowResidentProducerPass,
-                         bool enablePromotionProfitability,
-                         bool promotionReport) {
+std::unique_ptr<OperationPass<ModuleOp>> createConvertMemoryToSPM(
+    int64_t spmBase, int64_t spmSize, int64_t microM, int64_t windowK,
+    bool enableReductions, bool enableRowResidentReductions,
+    int64_t rowResidentMaxBytes, StringRef rowResidentProducerPass,
+    bool enablePromotionProfitability, bool promotionReport) {
   return std::make_unique<ConvertMemoryToSPM>(
       spmBase, spmSize, microM, windowK, enableReductions,
-      enableRowResidentReductions, rowResidentMaxBytes,
-      rowResidentProducerPass,
+      enableRowResidentReductions, rowResidentMaxBytes, rowResidentProducerPass,
       enablePromotionProfitability, promotionReport);
 }
 

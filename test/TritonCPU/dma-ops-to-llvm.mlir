@@ -1,6 +1,6 @@
 // RUN: triton-opt %s -split-input-file -triton-cpu-dma-ops-to-llvm | FileCheck %s
 // RUN: triton-opt %s -split-input-file -triton-cpu-dma-ops-to-llvm="dma-mmio-base=0xE0000000" | FileCheck %s --check-prefix=BASE
-// RUN: not triton-opt %s -split-input-file -triton-cpu-dma-ops-to-llvm="use-xspm-insn=1" 2>&1 | FileCheck %s --check-prefix=XSPMERR
+// RUN: triton-opt %s -split-input-file -triton-cpu-dma-ops-to-llvm="use-xspm-insn=1" | FileCheck %s --check-prefix=XSPM
 
 // ============================================================================
 // Test: DmaEnqueue2DOp lowers to volatile MMIO stores + fences
@@ -27,6 +27,11 @@
 // BASE:       llvm.mlir.constant(3758096392 : i64) : i64
 // BASE:       llvm.mlir.constant(3758096440 : i64) : i64
 // BASE:       llvm.mlir.constant(3758096400 : i64) : i64
+//
+// XSPM-LABEL: @dma_enqueue_2d_basic
+// XSPM:       llvm.inline_asm has_side_effects asm_dialect = att ".insn r 0x0B, 2, 0, x0, $0, $1", "r,r,~{memory}"
+// XSPM:       llvm.inline_asm has_side_effects asm_dialect = att ".insn r 0x0B, 3, 0, $0, $1, $2", "r,r,r,~{memory}"
+// XSPM-NOT:   llvm.store volatile
 
 module {
   tt.func public @dma_enqueue_2d_basic(
@@ -53,7 +58,11 @@ module {
 // BASE-LABEL: @dma_wait_basic
 // BASE:       llvm.mlir.constant(3758096408 : i64) : i64
 //
-// XSPMERR: use-xspm-insn path is not implemented yet
+// XSPM-LABEL: @dma_wait_basic
+// XSPM:       llvm.inline_asm has_side_effects asm_dialect = att ".insn i 0x0B, 1, $0, x0, 0", "=r,~{memory}"
+// XSPM:       llvm.cond_br
+// XSPM:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", ""
+// XSPM-NOT:   llvm.load volatile
 
 module {
   tt.func public @dma_wait_basic() {

@@ -1,5 +1,6 @@
 // RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s
 // RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=NOREDUCE
+// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=MULTI
 
 // ============================================================================
 // Test: GEMM K-loop with two tiled loads feeding vector.contract
@@ -505,6 +506,170 @@ module {
       scf.yield %sum : vector<16xf32>
     }
 
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
+// Test: attention-v2 Q-resident lowering.
+//       Q is materialized once into SPM before the loop. K/V remain normal
+//       cacheable transfer_read operations to avoid SPM scalarization blow-up.
+// ============================================================================
+
+// MULTI-LABEL: @attention_v2_window_qkv
+// MULTI:       triton_cpu.dma_enqueue_2d
+// MULTI:       triton_cpu.dma_wait
+// MULTI:       vector.transfer_read {{.*}} memref<16x32xf16, strided<[32, 1]>, 3>
+// MULTI:       arith.extf
+// MULTI:       scf.for
+// MULTI:         vector.transfer_read {{.*}} memref<32x64xf32, strided<[1, 32]>>
+// MULTI:         vector.transfer_read {{.*}} memref<64x32xf32, strided<[32, 1]>>
+// MULTI:         vector.contract
+// MULTI:         vector.contract
+// MULTI-NOT:   double-buffered attention K/V window
+// MULTI-NOT:   vector.transfer_read {{.*}} memref<64x32xf16, strided<[32, 1], offset: 0>>
+
+module {
+  tt.func public @attention_v2_window_qkv(
+      %Q: memref<64x32xf16, strided<[32, 1], offset: 0>>,
+      %K: memref<32x64xf32, strided<[1, 32], offset: 0>>,
+      %V: memref<64x32xf32, strided<[32, 1], offset: 0>>,
+      %O: memref<64x32xf32, strided<[32, 1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %c16 = arith.constant 16 : index
+    %c32 = arith.constant 32 : index
+    %c64 = arith.constant 64 : index
+    %cst = arith.constant 0.0 : f32
+    %cst_h = arith.constant 0.0 : f16
+    %score_init = arith.constant dense<0.0> : vector<16x16xf32>
+    %acc_init = arith.constant dense<0.0> : vector<16x32xf32>
+
+    %q_tile = vector.transfer_read %Q[%c0, %c0], %cst_h
+        {in_bounds = [true, true]} : memref<64x32xf16, strided<[32, 1], offset: 0>>, vector<16x32xf16>
+    %q_cast = arith.extf %q_tile : vector<16x32xf16> to vector<16x32xf32>
+
+    %result = scf.for %n = %c0 to %c64 step %c16
+        iter_args(%acc = %acc_init) -> (vector<16x32xf32>) {
+      %k_tile = vector.transfer_read %K[%c0, %n], %cst
+          {in_bounds = [true, true]} : memref<32x64xf32, strided<[1, 32], offset: 0>>, vector<32x16xf32>
+      %v_tile = vector.transfer_read %V[%n, %c0], %cst
+          {in_bounds = [true, true]} : memref<64x32xf32, strided<[32, 1], offset: 0>>, vector<16x32xf32>
+
+      %scores = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %q_cast, %k_tile, %score_init : vector<16x32xf32>, vector<32x16xf32> into vector<16x16xf32>
+
+      %next = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %scores, %v_tile, %acc : vector<16x16xf32>, vector<16x32xf32> into vector<16x32xf32>
+
+      scf.yield %next : vector<16x32xf32>
+    }
+
+    vector.transfer_write %result, %O[%c0, %c0]
+        {in_bounds = [true, true]} : vector<16x32xf32>, memref<64x32xf32, strided<[32, 1], offset: 0>>
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
+// Test: two attention-v2 loops share one resident Q tile.  The first loop
+//       materializes Q into SPM; the second loop recognizes that SPM read as
+//       the same resident Q instead of issuing another Q DMA/prologue.
+// ============================================================================
+
+// MULTI-LABEL: @attention_v2_two_stage_shared_q
+// MULTI:       triton_cpu.dma_enqueue_2d
+// MULTI:       triton_cpu.dma_wait
+// MULTI:       vector.transfer_read {{.*}} memref<16x32xf16, strided<[32, 1]>, 3>
+// MULTI:       scf.for
+// MULTI:         vector.transfer_read {{.*}} memref<32x64xf32, strided<[1, 32]>>
+// MULTI:         vector.transfer_read {{.*}} memref<64x32xf32, strided<[32, 1]>>
+// MULTI:       scf.for
+// MULTI:         vector.transfer_read {{.*}} memref<32x64xf32, strided<[1, 32]>>
+// MULTI:         vector.transfer_read {{.*}} memref<64x32xf32, strided<[32, 1]>>
+// MULTI-NOT:   vector.transfer_read {{.*}} memref<64x32xf16, strided<[32, 1], offset: 0>>
+
+module {
+  tt.func public @attention_v2_two_stage_shared_q(
+      %Q: memref<64x32xf16, strided<[32, 1], offset: 0>>,
+      %K0: memref<32x64xf32, strided<[1, 32], offset: 0>>,
+      %V0: memref<64x32xf32, strided<[32, 1], offset: 0>>,
+      %K1: memref<32x64xf32, strided<[1, 32], offset: 0>>,
+      %V1: memref<64x32xf32, strided<[32, 1], offset: 0>>,
+      %O: memref<64x32xf32, strided<[32, 1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %c16 = arith.constant 16 : index
+    %c64 = arith.constant 64 : index
+    %cst = arith.constant 0.0 : f32
+    %cst_h = arith.constant 0.0 : f16
+    %score_init = arith.constant dense<0.0> : vector<16x16xf32>
+    %acc_init = arith.constant dense<0.0> : vector<16x32xf32>
+
+    %q_tile = vector.transfer_read %Q[%c0, %c0], %cst_h
+        {in_bounds = [true, true]} : memref<64x32xf16, strided<[32, 1], offset: 0>>, vector<16x32xf16>
+    %q_cast = arith.extf %q_tile : vector<16x32xf16> to vector<16x32xf32>
+
+    %result0 = scf.for %n = %c0 to %c64 step %c16
+        iter_args(%acc = %acc_init) -> (vector<16x32xf32>) {
+      %k_tile = vector.transfer_read %K0[%c0, %n], %cst
+          {in_bounds = [true, true]} : memref<32x64xf32, strided<[1, 32], offset: 0>>, vector<32x16xf32>
+      %v_tile = vector.transfer_read %V0[%n, %c0], %cst
+          {in_bounds = [true, true]} : memref<64x32xf32, strided<[32, 1], offset: 0>>, vector<16x32xf32>
+
+      %scores = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %q_cast, %k_tile, %score_init : vector<16x32xf32>, vector<32x16xf32> into vector<16x16xf32>
+
+      %next = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %scores, %v_tile, %acc : vector<16x16xf32>, vector<16x32xf32> into vector<16x32xf32>
+
+      scf.yield %next : vector<16x32xf32>
+    }
+
+    %result1 = scf.for %n = %c0 to %c64 step %c16
+        iter_args(%acc = %result0) -> (vector<16x32xf32>) {
+      %k_tile = vector.transfer_read %K1[%c0, %n], %cst
+          {in_bounds = [true, true]} : memref<32x64xf32, strided<[1, 32], offset: 0>>, vector<32x16xf32>
+      %v_tile = vector.transfer_read %V1[%n, %c0], %cst
+          {in_bounds = [true, true]} : memref<64x32xf32, strided<[32, 1], offset: 0>>, vector<16x32xf32>
+
+      %scores = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %q_cast, %k_tile, %score_init : vector<16x32xf32>, vector<32x16xf32> into vector<16x16xf32>
+
+      %next = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %scores, %v_tile, %acc : vector<16x16xf32>, vector<16x32xf32> into vector<16x32xf32>
+
+      scf.yield %next : vector<16x32xf32>
+    }
+
+    vector.transfer_write %result1, %O[%c0, %c0]
+        {in_bounds = [true, true]} : vector<16x32xf32>, memref<64x32xf32, strided<[32, 1], offset: 0>>
     tt.return
   }
 }

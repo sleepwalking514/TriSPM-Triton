@@ -135,6 +135,56 @@ static void emitFence(ConversionPatternRewriter &rewriter, Location loc) {
       /*operand_attrs=*/ArrayAttr());
 }
 
+static Value emitInlineAsm(ConversionPatternRewriter &rewriter, Location loc,
+                           Type resultType, ValueRange operands,
+                           StringRef asmString, StringRef constraints) {
+  auto *ctx = rewriter.getContext();
+  auto asmOp = LLVM::InlineAsmOp::create(
+      rewriter, loc, resultType, operands, asmString, constraints,
+      /*has_side_effects=*/true,
+      /*is_align_stack=*/false,
+      /*tail_call_kind=*/LLVM::TailCallKind::None,
+      LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
+      /*operand_attrs=*/ArrayAttr());
+  return resultType ? asmOp.getRes() : Value();
+}
+
+static Value truncI64ToI32(ConversionPatternRewriter &rewriter, Location loc,
+                           Value val) {
+  return LLVM::TruncOp::create(rewriter, loc, rewriter.getI32Type(), val);
+}
+
+static Value zextI32ToI64(ConversionPatternRewriter &rewriter, Location loc,
+                          Value val) {
+  return LLVM::ZExtOp::create(rewriter, loc, rewriter.getI64Type(), val);
+}
+
+static void emitXspmDmaStride(ConversionPatternRewriter &rewriter, Location loc,
+                              Value srcStride, Value dstStride) {
+  emitInlineAsm(rewriter, loc, /*resultType=*/Type(), {srcStride, dstStride},
+                ".insn r 0x0B, 2, 0, x0, $0, $1", "r,r,~{memory}");
+}
+
+static void emitXspmDma2D(ConversionPatternRewriter &rewriter, Location loc,
+                          Value dst, Value src, Value width, Value height) {
+  auto i64Ty = rewriter.getI64Type();
+  Value width64 =
+      zextI32ToI64(rewriter, loc, truncI64ToI32(rewriter, loc, width));
+  Value height64 =
+      zextI32ToI64(rewriter, loc, truncI64ToI32(rewriter, loc, height));
+  Value shift32 = createI64Constant(rewriter, loc, 32);
+  Value heightHi = LLVM::ShlOp::create(rewriter, loc, i64Ty, height64, shift32);
+  Value wh = LLVM::OrOp::create(rewriter, loc, i64Ty, width64, heightHi);
+  emitInlineAsm(rewriter, loc, /*resultType=*/Type(), {dst, src, wh},
+                ".insn r 0x0B, 3, 0, $0, $1, $2", "r,r,r,~{memory}");
+}
+
+static Value emitXspmDmaWaitPoll(ConversionPatternRewriter &rewriter,
+                                 Location loc) {
+  return emitInlineAsm(rewriter, loc, rewriter.getI64Type(), ValueRange{},
+                       ".insn i 0x0B, 1, $0, x0, 0", "=r,~{memory}");
+}
+
 // ===----------------------------------------------------------------------===
 // DmaEnqueue2DOp → volatile MMIO stores
 // ===----------------------------------------------------------------------===
@@ -203,6 +253,23 @@ private:
   uint64_t dmaMmioBase;
 };
 
+struct DmaEnqueue2DOpXspmConversion
+    : public OpConversionPattern<triton::cpu::DmaEnqueue2DOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::cpu::DmaEnqueue2DOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    emitXspmDmaStride(rewriter, loc, adaptor.getSrcStride(),
+                      adaptor.getDstStride());
+    emitXspmDma2D(rewriter, loc, adaptor.getDst(), adaptor.getSrc(),
+                  adaptor.getWidth(), adaptor.getHeight());
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 // ===----------------------------------------------------------------------===
 // DmaWaitOp → polling loop on STATUS register until idle (== 0)
 // ===----------------------------------------------------------------------===
@@ -256,6 +323,39 @@ private:
   uint64_t dmaMmioBase;
 };
 
+struct DmaWaitOpXspmConversion
+    : public OpConversionPattern<triton::cpu::DmaWaitOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::cpu::DmaWaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto i1Ty = rewriter.getI1Type();
+
+    Block *currentBlock = rewriter.getInsertionBlock();
+    Block *continuationBB =
+        rewriter.splitBlock(currentBlock, Block::iterator(op));
+    Block *pollBB = rewriter.createBlock(continuationBB);
+
+    rewriter.setInsertionPointToEnd(currentBlock);
+    LLVM::BrOp::create(rewriter, loc, pollBB);
+
+    rewriter.setInsertionPointToStart(pollBB);
+    Value pending = emitXspmDmaWaitPoll(rewriter, loc);
+    Value zero = createI64Constant(rewriter, loc, 0);
+    Value busy = LLVM::ICmpOp::create(rewriter, loc, i1Ty,
+                                      LLVM::ICmpPredicate::ne, pending, zero);
+    LLVM::CondBrOp::create(rewriter, loc, busy, pollBB, continuationBB);
+
+    rewriter.setInsertionPointToStart(continuationBB);
+    emitFence(rewriter, loc);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 // ===----------------------------------------------------------------------===
 // Pass definition
 // ===----------------------------------------------------------------------===
@@ -269,20 +369,19 @@ struct DmaOpsToLLVM
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
 
-    if (useXspmInsn) {
-      mod.emitError("triton-cpu-dma-ops-to-llvm use-xspm-insn path is not "
-                    "implemented yet; use the default MMIO lowering");
-      return signalPassFailure();
-    }
-
     mlir::LowerToLLVMOptions option(context);
     TritonCPUToLLVMTypeConverter typeConverter(context, option);
     TritonLLVMConversionTarget convTarget(*context);
 
     RewritePatternSet patterns(context);
-    patterns.add<DmaEnqueue2DOpConversion>(typeConverter, context,
-                                           dmaMmioBase);
-    patterns.add<DmaWaitOpConversion>(typeConverter, context, dmaMmioBase);
+    if (useXspmInsn) {
+      patterns.add<DmaEnqueue2DOpXspmConversion>(typeConverter, context);
+      patterns.add<DmaWaitOpXspmConversion>(typeConverter, context);
+    } else {
+      patterns.add<DmaEnqueue2DOpConversion>(typeConverter, context,
+                                             dmaMmioBase);
+      patterns.add<DmaWaitOpConversion>(typeConverter, context, dmaMmioBase);
+    }
 
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();

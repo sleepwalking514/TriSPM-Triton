@@ -196,8 +196,7 @@ static bool splitLoopContract(const LoopContractInfo &info, int64_t microM) {
 
         Value mappedAcc = mapping.lookupOrDefault(origContract.getAcc());
         Value microResult = vector::ContractionOp::create(
-            b, loc, microAccTy, aSlice, mappedB, mappedAcc,
-            mapsAttr, iterAttr);
+            b, loc, microAccTy, aSlice, mappedB, mappedAcc, mapsAttr, iterAttr);
 
         mapping.map(origContract.getResult(), microResult);
         continue;

@@ -435,6 +435,22 @@ def make_aot_launcher(constants, signature, ids, kernel_name):
     arg_decls = ', '.join(f"{ty_to_cpp(signature_flat[i])} arg{i}" for i in kernel_fn_args)
     kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_fn_args)
     tiers = _read_tier_sidecar(kernel_name)
+    flash_head_resident = (
+        kernel_name == "flash_attention"
+        and os.getenv("TRITON_DISABLE_SPM", "0") != "1"
+        and os.getenv("TRITON_SPM_FLASH_HEAD_RESIDENT", "1") != "0"
+        and all(i in kernel_fn_args for i in (0, 1, 2, 3, 4))
+    )
+    flash_head_resident_k_env = os.getenv("TRITON_SPM_FLASH_HEAD_RESIDENT_K")
+    flash_head_resident_v_env = os.getenv("TRITON_SPM_FLASH_HEAD_RESIDENT_V")
+    flash_head_resident_k = (
+        "1" if flash_head_resident_k_env is not None and
+        flash_head_resident_k_env != "0" else "0"
+    )
+    flash_head_resident_v = (
+        "1" if flash_head_resident_v_env is not None and
+        flash_head_resident_v_env != "0" else "0"
+    )
 
     def _alloc_case(arg_index, tier):
         if tier == 1:
@@ -465,6 +481,114 @@ def make_aot_launcher(constants, signature, ids, kernel_name):
     )
 
     guard = f"{kernel_name.upper()}_LAUNCHER_H"
+
+    extra_helpers = ""
+    launch_body = f"""\
+    for (int32_t z = 0; z < gridZ; ++z)
+        for (int32_t y = 0; y < gridY; ++y)
+            for (int32_t x = 0; x < gridX; ++x)
+                {kernel_name}({kernel_fn_args_list + ', ' if kernel_fn_args_list else ''}x, y, z, gridX, gridY, gridZ);
+"""
+
+    if flash_head_resident:
+        extra_helpers = f"""\
+static size_t {kernel_name}_align_up_size(size_t value, size_t alignment)
+{{
+    return (value + alignment - 1) & ~(alignment - 1);
+}}
+
+static inline void {kernel_name}_head_dma_enqueue_2d(void *dst,
+                                                     const void *src,
+                                                     size_t width,
+                                                     size_t height,
+                                                     size_t src_stride,
+                                                     size_t dst_stride)
+{{
+#ifdef USE_XSPM_INSN
+    xspm_dma_stride((uint64_t)src_stride, (uint64_t)dst_stride);
+    xspm_dma_2d((uintptr_t)dst, (uintptr_t)src, (uint32_t)width,
+                (uint32_t)height);
+#else
+    spm_dma_enqueue_2d(dst, src, width, height, src_stride, dst_stride);
+#endif
+}}
+
+static inline void {kernel_name}_head_dma_wait(void)
+{{
+#ifdef USE_XSPM_INSN
+    xspm_dma_wait();
+#else
+    (void)spm_dma_wait();
+#endif
+}}
+
+"""
+        launch_body = f"""\
+    if (gridX > 0 && gridY > 0 &&
+        {kernel_name}_arg_bytes[0] != 0 &&
+        {kernel_name}_arg_bytes[1] != 0 &&
+        {kernel_name}_arg_bytes[1] == {kernel_name}_arg_bytes[2] &&
+        ({kernel_name}_arg_bytes[1] % (size_t)gridY) == 0 &&
+        ({kernel_name}_arg_bytes[0] % ((size_t)gridX * (size_t)gridY)) == 0) {{
+        size_t head_bytes = {kernel_name}_arg_bytes[1] / (size_t)gridY;
+        size_t q_tile_bytes =
+            {kernel_name}_arg_bytes[0] / ((size_t)gridX * (size_t)gridY);
+        size_t row_bytes = q_tile_bytes / 16;
+        size_t seq_rows = row_bytes != 0 ? head_bytes / row_bytes : 0;
+
+        if (head_bytes >= 8192 && gridX >= 2 &&
+            row_bytes != 0 && seq_rows != 0 && row_bytes * seq_rows == head_bytes) {{
+            int resident_k = {flash_head_resident_k};
+            int resident_v = {flash_head_resident_v};
+            uintptr_t spm_base = (uintptr_t)SPM_BASE;
+            size_t spm_size = get_spm_size();
+            uintptr_t next_spm =
+                spm_base + {kernel_name}_align_up_size(q_tile_bytes, 64);
+            uintptr_t k_spm = 0;
+            uintptr_t v_spm = 0;
+            if (resident_k) {{
+                k_spm = (uintptr_t){kernel_name}_align_up_size((size_t)next_spm, 64);
+                next_spm = k_spm + head_bytes;
+            }}
+            if (resident_v) {{
+                v_spm = (uintptr_t){kernel_name}_align_up_size((size_t)next_spm, 64);
+                next_spm = v_spm + head_bytes;
+            }}
+
+            if ((resident_k || resident_v) &&
+                next_spm >= spm_base && next_spm <= spm_base + spm_size) {{
+                for (int32_t z = 0; z < gridZ; ++z) {{
+                    for (int32_t y = 0; y < gridY; ++y) {{
+                        size_t head_offset = (size_t)y * head_bytes;
+                        if (resident_k)
+                            {kernel_name}_head_dma_enqueue_2d(
+                                (void *)k_spm,
+                                (const void *)((const char *)arg1 + head_offset),
+                                row_bytes, seq_rows, row_bytes, row_bytes);
+                        if (resident_v)
+                            {kernel_name}_head_dma_enqueue_2d(
+                                (void *)v_spm,
+                                (const void *)((const char *)arg2 + head_offset),
+                                row_bytes, seq_rows, row_bytes, row_bytes);
+                        {kernel_name}_head_dma_wait();
+
+                        void *k_arg = resident_k ? (void *)(k_spm - head_offset) : arg1;
+                        void *v_arg = resident_v ? (void *)(v_spm - head_offset) : arg2;
+                        for (int32_t x = 0; x < gridX; ++x)
+                            {kernel_name}(arg0, k_arg, v_arg, arg3, arg4,
+                                          x, y, z, gridX, gridY, gridZ);
+                    }}
+                }}
+                return;
+            }}
+        }}
+    }}
+
+    for (int32_t z = 0; z < gridZ; ++z)
+        for (int32_t y = 0; y < gridY; ++y)
+            for (int32_t x = 0; x < gridX; ++x)
+                {kernel_name}({kernel_fn_args_list + ', ' if kernel_fn_args_list else ''}x, y, z, gridX, gridY, gridZ);
+"""
 
     # --- Header (C-compatible) ---
     header = f"""\
@@ -498,6 +622,7 @@ extern void {kernel_name}({extern_arg_types});
 
 static void *{kernel_name}_malloc_ptrs[64];
 static int {kernel_name}_malloc_count = 0;
+static size_t {kernel_name}_arg_bytes[64];
 
 static void *{kernel_name}_record_malloc(void *ptr)
 {{
@@ -506,8 +631,12 @@ static void *{kernel_name}_record_malloc(void *ptr)
     return ptr;
 }}
 
+{extra_helpers}
+
 void *{kernel_name}_alloc(int arg_index, size_t nbytes)
 {{
+    if (arg_index >= 0 && arg_index < 64)
+        {kernel_name}_arg_bytes[arg_index] = nbytes;
     switch (arg_index) {{
 {alloc_cases}
     }}
@@ -526,10 +655,7 @@ void {kernel_name}_launch(
     int32_t gridX, int32_t gridY, int32_t gridZ
     {(', ' + arg_decls) if arg_decls else ''})
 {{
-    for (int32_t z = 0; z < gridZ; ++z)
-        for (int32_t y = 0; y < gridY; ++y)
-            for (int32_t x = 0; x < gridX; ++x)
-                {kernel_name}({kernel_fn_args_list + ', ' if kernel_fn_args_list else ''}x, y, z, gridX, gridY, gridZ);
+{launch_body}
 }}
 """
 

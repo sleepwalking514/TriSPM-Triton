@@ -14,6 +14,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
@@ -23,8 +24,8 @@
 #include "triton/Dialect/TritonCPU/IR/Dialect.h"
 
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -67,6 +68,128 @@ static bool getStaticStrides(MemRefType ty, SmallVectorImpl<int64_t> &strides) {
   return true;
 }
 
+static bool isGemmContract(vector::ContractionOp op) {
+  auto iterTypes = op.getIteratorTypes().getValue();
+  if (iterTypes.size() != 3)
+    return false;
+
+  using IT = vector::IteratorType;
+  auto get = [](Attribute a) {
+    return cast<vector::IteratorTypeAttr>(a).getValue();
+  };
+  if (get(iterTypes[0]) != IT::parallel || get(iterTypes[1]) != IT::parallel ||
+      get(iterTypes[2]) != IT::reduction)
+    return false;
+
+  auto maps = op.getIndexingMaps();
+  MLIRContext *ctx = op.getContext();
+  return cast<AffineMapAttr>(maps[0]).getValue() ==
+             AffineMap::getMultiDimMapWithTargets(3, {0, 2}, ctx) &&
+         cast<AffineMapAttr>(maps[1]).getValue() ==
+             AffineMap::getMultiDimMapWithTargets(3, {2, 1}, ctx) &&
+         cast<AffineMapAttr>(maps[2]).getValue() ==
+             AffineMap::getMultiDimMapWithTargets(3, {0, 1}, ctx);
+}
+
+static bool isShapePreservingCastLikeOp(Operation *op) {
+  if (!op || op->getNumOperands() != 1 || op->getNumResults() != 1)
+    return false;
+  return isa<arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp,
+             arith::TruncIOp, arith::IndexCastOp, arith::BitcastOp,
+             vector::ShapeCastOp, UnrealizedConversionCastOp>(op);
+}
+
+static bool valueFeedsDot(Value value, unsigned depth = 0) {
+  if (!value || depth > 4)
+    return false;
+  for (Operation *user : value.getUsers()) {
+    if (isa<vector::ContractionOp>(user) || isa<triton::cpu::DotOp>(user))
+      return true;
+    if (isShapePreservingCastLikeOp(user) &&
+        valueFeedsDot(user->getResult(0), depth + 1))
+      return true;
+  }
+  return false;
+}
+
+static vector::TransferReadOp
+getTransferReadThroughShapePreservingCasts(Value value, unsigned depth = 0) {
+  if (!value || depth > 4)
+    return {};
+  if (auto readOp = value.getDefiningOp<vector::TransferReadOp>())
+    return readOp;
+  Operation *defOp = value.getDefiningOp();
+  if (!isShapePreservingCastLikeOp(defOp))
+    return {};
+  return getTransferReadThroughShapePreservingCasts(defOp->getOperand(0),
+                                                    depth + 1);
+}
+
+static bool readFeedsLoopLocalGemm(vector::TransferReadOp readOp) {
+  scf::ForOp parentFor = readOp->getParentOfType<scf::ForOp>();
+  if (!parentFor)
+    return false;
+
+  for (Operation *user : readOp->getUsers()) {
+    auto contract = dyn_cast<vector::ContractionOp>(user);
+    if (!contract || !isGemmContract(contract))
+      continue;
+
+    auto lhsRead =
+        getTransferReadThroughShapePreservingCasts(contract.getLhs());
+    auto rhsRead =
+        getTransferReadThroughShapePreservingCasts(contract.getRhs());
+    if (!lhsRead || !rhsRead)
+      continue;
+    if (lhsRead->getParentOfType<scf::ForOp>() == parentFor &&
+        rhsRead->getParentOfType<scf::ForOp>() == parentFor)
+      return true;
+  }
+
+  return false;
+}
+
+static bool contractOperandTracesToRead(vector::ContractionOp contract,
+                                        vector::TransferReadOp readOp) {
+  for (Value operand : {contract.getLhs(), contract.getRhs()}) {
+    auto operandRead = getTransferReadThroughShapePreservingCasts(operand);
+    if (operandRead == readOp)
+      return true;
+  }
+  return false;
+}
+
+static bool readFeedsAttentionV2OuterQ(vector::TransferReadOp readOp) {
+  if (readOp->getParentOfType<scf::ForOp>())
+    return false;
+
+  auto vecTy = dyn_cast<VectorType>(readOp.getType());
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!vecTy || vecTy.getRank() != 2 || !memRefTy || memRefTy.getRank() != 2)
+    return false;
+
+  for (Operation *user : readOp.getResult().getUsers()) {
+    SmallVector<Operation *, 4> stack{user};
+    while (!stack.empty()) {
+      Operation *cur = stack.pop_back_val();
+      if (auto contract = dyn_cast<vector::ContractionOp>(cur)) {
+        if (!isGemmContract(contract) ||
+            !contractOperandTracesToRead(contract, readOp))
+          continue;
+        if (contract->getParentOfType<scf::ForOp>())
+          return true;
+        continue;
+      }
+
+      if (!isShapePreservingCastLikeOp(cur))
+        continue;
+      for (Operation *next : cur->getResult(0).getUsers())
+        stack.push_back(next);
+    }
+  }
+  return false;
+}
+
 static BlockArgument traceFunctionArgument(Value value,
                                            FunctionOpInterface funcOp,
                                            unsigned depth = 0) {
@@ -104,8 +227,8 @@ static BlockArgument traceFunctionArgument(Value value,
 }
 
 static bool isEligibleTiledRead(vector::TransferReadOp readOp,
-                               FunctionOpInterface funcOp,
-                               BlockArgument &arg) {
+                                FunctionOpInterface funcOp, BlockArgument &arg,
+                                bool allowOutsideLoop = false) {
   auto vecTy = dyn_cast<VectorType>(readOp.getType());
   if (!vecTy || vecTy.getRank() < 1)
     return false;
@@ -118,7 +241,7 @@ static bool isEligibleTiledRead(vector::TransferReadOp readOp,
   if (!getStaticStrides(memRefTy, strides))
     return false;
 
-  if (!readOp->getParentOfType<scf::ForOp>())
+  if (!allowOutsideLoop && !readOp->getParentOfType<scf::ForOp>())
     return false;
 
   arg = traceFunctionArgument(readOp.getBase(), funcOp);
@@ -131,12 +254,7 @@ static bool isVector1Read(vector::TransferReadOp readOp) {
 }
 
 static bool readFeedsDot(vector::TransferReadOp readOp) {
-  for (auto *user : readOp->getUsers()) {
-    if (isa<vector::ContractionOp>(user) ||
-        isa<triton::cpu::DotOp>(user))
-      return true;
-  }
-  return false;
+  return valueFeedsDot(readOp.getResult());
 }
 
 static bool hasScalarReuse(FunctionOpInterface funcOp, BlockArgument arg) {
@@ -165,7 +283,9 @@ static bool hasScalarReuse(FunctionOpInterface funcOp, BlockArgument arg) {
   return hasReuse;
 }
 
-static SPMTier chooseTier(bool scalarReuse) {
+static SPMTier chooseTier(bool scalarReuse, bool cacheableDmaSource) {
+  if (cacheableDmaSource)
+    return SPMTier::CacheableDram;
   if (!scalarReuse)
     return SPMTier::UncacheableDmaBuffer;
 
@@ -174,9 +294,9 @@ static SPMTier chooseTier(bool scalarReuse) {
   return SPMTier::CacheableDram;
 }
 
-static LogicalResult writeTierSidecar(
-    FunctionOpInterface funcOp,
-    ArrayRef<std::pair<unsigned, int32_t>> tiers) {
+static LogicalResult
+writeTierSidecar(FunctionOpInterface funcOp,
+                 ArrayRef<std::pair<unsigned, int32_t>> tiers) {
   const char *auxDir = std::getenv("KERNEL_AUX_FILE_DIR");
   if (!auxDir || StringRef(auxDir).empty())
     return success();
@@ -221,20 +341,32 @@ struct SPMTensorPlacement
         return;
 
       llvm::DenseSet<unsigned> candidateArgs;
+      llvm::DenseSet<unsigned> cacheableDmaSourceArgs;
       funcOp->walk([&](vector::TransferReadOp readOp) {
-        if (!enableReductions && !readFeedsDot(readOp))
+        bool feedsDot = readFeedsDot(readOp);
+        bool attentionOuterQ = readFeedsAttentionV2OuterQ(readOp);
+        if (feedsDot) {
+          if (!readFeedsLoopLocalGemm(readOp) && !attentionOuterQ)
+            return;
+        } else if (!enableReductions) {
           return;
+        }
 
         BlockArgument arg;
-        if (isEligibleTiledRead(readOp, funcOp, arg))
+        if (isEligibleTiledRead(readOp, funcOp, arg,
+                                /*allowOutsideLoop=*/attentionOuterQ)) {
           candidateArgs.insert(arg.getArgNumber());
+          if (attentionOuterQ)
+            cacheableDmaSourceArgs.insert(arg.getArgNumber());
+        }
       });
 
       SmallVector<std::pair<unsigned, int32_t>> tiers;
       for (unsigned argIndex : candidateArgs) {
         BlockArgument arg = funcOp.getArgument(argIndex);
         bool scalarReuse = hasScalarReuse(funcOp, arg);
-        SPMTier tier = chooseTier(scalarReuse);
+        SPMTier tier =
+            chooseTier(scalarReuse, cacheableDmaSourceArgs.contains(argIndex));
         int32_t tierValue = static_cast<int32_t>(tier);
         funcOp.setArgAttr(argIndex, kSPMTierAttrName,
                           IntegerAttr::get(i32Ty, tierValue));

@@ -256,10 +256,12 @@ class CPUBackend(BaseBackend):
                     enable_promotion_profitability,
                     promotion_report)
 
-                # Split large vector.contract into register-friendly
-                # micro-tiles.  SPM-only: cache baseline doesn't need this
-                # and benefits more from the default large accumulator.
-                cpu.passes.ttcpuir.add_split_large_contract(pm, micro_m)
+                kernel_hint = os.getenv("TRITON_KERNEL_NAME", "")
+                enable_split_large_contract = env_bool(
+                    "TRITON_ENABLE_SPM_SPLIT_LARGE_CONTRACT",
+                    kernel_hint != "flash_attention")
+                if enable_split_large_contract:
+                    cpu.passes.ttcpuir.add_split_large_contract(pm, micro_m)
 
             # bf16 hardware support requires Zfbfmin (not in gem5 yet)
             promote_bf16_to_fp32 = True
