@@ -57,6 +57,15 @@ enum class SPMTier : int32_t {
   UncacheableDmaBuffer = 3,
 };
 
+static bool getEnvBool(StringRef name, bool defaultValue = false) {
+  if (const char *value = std::getenv(name.str().c_str())) {
+    StringRef text(value);
+    return !(text.empty() || text == "0" || text.equals_insensitive("false") ||
+             text.equals_insensitive("no") || text.equals_insensitive("off"));
+  }
+  return defaultValue;
+}
+
 /// Get static strides from a memref type. Returns false if dynamic.
 static bool getStaticStrides(MemRefType ty, SmallVectorImpl<int64_t> &strides) {
   int64_t offset;
@@ -177,6 +186,49 @@ static bool readFeedsAttentionV2OuterQ(vector::TransferReadOp readOp) {
             !contractOperandTracesToRead(contract, readOp))
           continue;
         if (contract->getParentOfType<scf::ForOp>())
+          return true;
+        continue;
+      }
+
+      if (!isShapePreservingCastLikeOp(cur))
+        continue;
+      for (Operation *next : cur->getResult(0).getUsers())
+        stack.push_back(next);
+    }
+  }
+  return false;
+}
+
+static bool hasLocalConsumerOutput(vector::ContractionOp contract) {
+  if (contract->getParentOfType<scf::ForOp>())
+    return false;
+  if (contract.getResult().use_empty())
+    return false;
+  for (Operation *user : contract.getResult().getUsers())
+    if (isa<vector::TransferWriteOp, scf::YieldOp>(user))
+      return false;
+  return true;
+}
+
+static bool readFeedsAttentionQKTile(vector::TransferReadOp readOp) {
+  if (!getEnvBool("TRITON_SPM_ATTENTION_QK_TILE", false))
+    return false;
+  if (readOp->getParentOfType<scf::ForOp>())
+    return false;
+
+  auto vecTy = dyn_cast<VectorType>(readOp.getType());
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!vecTy || vecTy.getRank() != 2 || !memRefTy || memRefTy.getRank() != 2)
+    return false;
+
+  for (Operation *user : readOp.getResult().getUsers()) {
+    SmallVector<Operation *, 4> stack{user};
+    while (!stack.empty()) {
+      Operation *cur = stack.pop_back_val();
+      if (auto contract = dyn_cast<vector::ContractionOp>(cur)) {
+        if (isGemmContract(contract) &&
+            contractOperandTracesToRead(contract, readOp) &&
+            hasLocalConsumerOutput(contract))
           return true;
         continue;
       }
@@ -345,16 +397,19 @@ struct SPMTensorPlacement
       funcOp->walk([&](vector::TransferReadOp readOp) {
         bool feedsDot = readFeedsDot(readOp);
         bool attentionOuterQ = readFeedsAttentionV2OuterQ(readOp);
+        bool attentionQKTile = readFeedsAttentionQKTile(readOp);
         if (feedsDot) {
-          if (!readFeedsLoopLocalGemm(readOp) && !attentionOuterQ)
+          if (!readFeedsLoopLocalGemm(readOp) && !attentionOuterQ &&
+              !attentionQKTile)
             return;
         } else if (!enableReductions) {
           return;
         }
 
         BlockArgument arg;
-        if (isEligibleTiledRead(readOp, funcOp, arg,
-                                /*allowOutsideLoop=*/attentionOuterQ)) {
+        if (isEligibleTiledRead(
+                readOp, funcOp, arg,
+                /*allowOutsideLoop=*/attentionOuterQ || attentionQKTile)) {
           candidateArgs.insert(arg.getArgNumber());
           if (attentionOuterQ)
             cacheableDmaSourceArgs.insert(arg.getArgNumber());

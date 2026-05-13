@@ -656,6 +656,32 @@ static void emitSpmWrite(OpBuilder &b, Location loc, Value spmAddr,
                           getDefaultSpmMemStrides(vecTy));
 }
 
+static bool isShapePreservingCastLikeOp(Operation *op);
+
+static bool allResultsUseEmpty(Operation *op) {
+  if (!op)
+    return false;
+  for (Value result : op->getResults())
+    if (!result.use_empty())
+      return false;
+  return true;
+}
+
+static void eraseDeadReadOrCastChain(Value value) {
+  Operation *op = value.getDefiningOp();
+  if (!op)
+    return;
+  if (!isa<vector::TransferReadOp>(op) && !isShapePreservingCastLikeOp(op))
+    return;
+  if (!allResultsUseEmpty(op))
+    return;
+
+  SmallVector<Value, 4> operands(op->getOperands());
+  op->erase();
+  for (Value operand : operands)
+    eraseDeadReadOrCastChain(operand);
+}
+
 //===----------------------------------------------------------------------===//
 // Tiled load descriptor.
 //===----------------------------------------------------------------------===//
@@ -3217,6 +3243,191 @@ static void markResidencyPlanLoopsHandled(
     rowResidentHandledLoops.insert(forOp.getOperation());
 }
 
+//===----------------------------------------------------------------------===//
+// Function-scope fused-attention QK tile staging.
+//
+// This opt-in path handles the first fused naive-attention milestone: a single
+// memory-backed QK vector.contract whose result feeds local softmax code rather
+// than a loop-carried GEMM accumulator or direct store.  It stages the Q and K
+// tiles into SPM immediately before the QK contraction and leaves softmax/PV on
+// the original path.
+//===----------------------------------------------------------------------===//
+
+static bool isFunctionScopeLocalConsumerQK(vector::ContractionOp contractOp) {
+  if (!isGemmContract(contractOp))
+    return false;
+  if (contractOp->getParentOfType<scf::ForOp>())
+    return false;
+  return getContractionOutputRelation(contractOp.getResult(),
+                                      /*parentFor=*/nullptr) ==
+         "local_consumer";
+}
+
+static bool isEligibleAttentionQKRead(vector::TransferReadOp readOp) {
+  auto vecTy = dyn_cast<VectorType>(readOp.getType());
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!vecTy || vecTy.getRank() != 2 || !memRefTy || memRefTy.getRank() != 2)
+    return false;
+  if (memRefTy.getMemorySpaceAsInt() == SPM_ADDR_SPACE)
+    return false;
+  SmallVector<int64_t> strides;
+  return getStaticStrides(memRefTy, strides);
+}
+
+static SPMPromotionRecord makeAttentionQKTileRecord(
+    StringRef source, VectorType shapeTy, int64_t bytes, int64_t spmAddress) {
+  SPMPromotionRecord record;
+  record.source = source.str();
+  record.scope = "function-scope QK tile";
+  appendShape(record.shape, shapeTy);
+  record.uses = 1;
+  record.copyIn = "DMA";
+  record.copyOut = "none";
+  record.bytes = bytes;
+  record.spmAddress = spmAddress;
+  record.overhead = "one DMA descriptor plus one wait before the QK contract";
+  record.benefit =
+      "conservative opt-in staging for the memory-backed QK operand before "
+      "local softmax consumption";
+  record.reasonCode = "accepted_attention_qk_tile_staging";
+  record.reason =
+      "accepted by the opt-in fused-attention QK tile staging prototype";
+  return record;
+}
+
+static void markAttentionQKContractionAccepted(
+    SPMPromotionReport *report, vector::ContractionOp contractOp) {
+  if (!report)
+    return;
+
+  auto lhsTy = dyn_cast<VectorType>(contractOp.getLhs().getType());
+  auto accTy = dyn_cast<VectorType>(contractOp.getAcc().getType());
+  if (!lhsTy || !accTy || lhsTy.getRank() != 2 || accTy.getRank() != 2)
+    return;
+
+  SmallVector<int64_t, 3> mnk = {accTy.getDimSize(0), accTy.getDimSize(1),
+                                lhsTy.getDimSize(1)};
+  for (SPMContractionReport &entry : report->contractions) {
+    if (entry.operation != contractOp->getName().getStringRef().str())
+      continue;
+    if (!llvm::equal(entry.mnkShape, mnk))
+      continue;
+    if (entry.outputRelation != "local_consumer" ||
+        entry.lhs.source != "memory_backed" ||
+        entry.rhs.source != "memory_backed")
+      continue;
+    entry.status = "accepted";
+    entry.scheduleStatus = "accepted_attention_qk_tile_staging";
+    entry.reasonCode = "accepted_attention_qk_tile_staging";
+    entry.reason =
+        "memory-backed QK contraction feeds a local softmax consumer; "
+        "opt-in conservative staging puts Q/K tiles in SPM before the "
+        "contract while leaving softmax and PV unchanged";
+    return;
+  }
+}
+
+static bool transformFunctionScopeAttentionQKContract(
+    vector::ContractionOp contractOp, int64_t spmBase, int64_t spmSize,
+    SPMPromotionReport *report) {
+  if (!isFunctionScopeLocalConsumerQK(contractOp))
+    return false;
+
+  auto lhsRead =
+      getTransferReadThroughShapePreservingCasts(contractOp.getLhs());
+  auto rhsRead =
+      getTransferReadThroughShapePreservingCasts(contractOp.getRhs());
+  if (!lhsRead || !rhsRead || lhsRead == rhsRead)
+    return false;
+  if (!isEligibleAttentionQKRead(lhsRead) ||
+      !isEligibleAttentionQKRead(rhsRead))
+    return false;
+
+  auto lhsTy = cast<VectorType>(lhsRead.getType());
+  auto rhsTy = cast<VectorType>(rhsRead.getType());
+  if (contractOp.getLhs().getType() != lhsTy ||
+      contractOp.getRhs().getType() != rhsTy)
+    return false;
+
+  auto lhsMemRefTy = cast<MemRefType>(lhsRead.getBase().getType());
+  auto rhsMemRefTy = cast<MemRefType>(rhsRead.getBase().getType());
+  int64_t lhsBytes = getTileBytes(lhsTy);
+  int64_t rhsBytes = getTileBytes(rhsTy);
+
+  SPMSpaceManager spmLayout(spmBase, spmSize);
+  auto lhsAlloc = spmLayout.alloc(lhsBytes, /*alignment=*/1,
+                                  SPMSpaceManager::Lifetime::Loop);
+  auto rhsAlloc = spmLayout.alloc(rhsBytes, /*alignment=*/1,
+                                  SPMSpaceManager::Lifetime::Loop);
+  if (!lhsAlloc || !rhsAlloc) {
+    if (report)
+      report->rejections.push_back(makePromotionRejection(
+          "attention_qk_tile", "spm_capacity_overflow",
+          "SPM capacity cannot fit both memory-backed QK operand tiles"));
+    return false;
+  }
+
+  Location loc = contractOp.getLoc();
+  InsertedBeforeGuard guard(contractOp.getOperation());
+  OpBuilder b(contractOp);
+
+  Value lhsDram = computeDramAddr(b, loc, lhsRead);
+  Value rhsDram = computeDramAddr(b, loc, rhsRead);
+  if (!lhsDram || !rhsDram) {
+    guard.cleanup();
+    if (report)
+      report->rejections.push_back(makePromotionRejection(
+          "attention_qk_tile", "dynamic_shape_or_stride",
+          "failed to compute static DRAM addresses for QK operand tiles"));
+    return false;
+  }
+
+  Value lhsSpmAddr = i64Cst(b, loc, lhsAlloc->address);
+  Value rhsSpmAddr = i64Cst(b, loc, rhsAlloc->address);
+  emitDmaFilledEnqueue(b, loc, lhsSpmAddr, lhsDram, lhsTy, lhsMemRefTy);
+  emitDmaFilledEnqueue(b, loc, rhsSpmAddr, rhsDram, rhsTy, rhsMemRefTy);
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  Value lhsSpm = emitSpmReadWithStrides(
+      b, loc, lhsSpmAddr, lhsTy, getDmaFilledSpmMemStrides(lhsTy, lhsMemRefTy));
+  Value rhsSpm = emitSpmReadWithStrides(
+      b, loc, rhsSpmAddr, rhsTy, getDmaFilledSpmMemStrides(rhsTy, rhsMemRefTy));
+
+  Value oldLhs = contractOp.getLhs();
+  Value oldRhs = contractOp.getRhs();
+  contractOp->setOperand(0, lhsSpm);
+  contractOp->setOperand(1, rhsSpm);
+  eraseDeadReadOrCastChain(oldLhs);
+  eraseDeadReadOrCastChain(oldRhs);
+
+  guard.commit();
+
+  if (report) {
+    report->records.push_back(makeAttentionQKTileRecord(
+        "attention QK lhs tile", lhsTy, lhsBytes, lhsAlloc->address));
+    report->records.push_back(makeAttentionQKTileRecord(
+        "attention QK rhs tile", rhsTy, rhsBytes, rhsAlloc->address));
+    markAttentionQKContractionAccepted(report, contractOp);
+  }
+
+  return true;
+}
+
+static bool transformFunctionScopeAttentionQK(
+    FunctionOpInterface funcOp, int64_t spmBase, int64_t spmSize,
+    SPMPromotionReport *report) {
+  SmallVector<vector::ContractionOp, 4> contracts;
+  funcOp->walk([&](vector::ContractionOp contractOp) {
+    contracts.push_back(contractOp);
+  });
+
+  bool changed = false;
+  for (vector::ContractionOp contractOp : contracts)
+    changed |= transformFunctionScopeAttentionQKContract(contractOp, spmBase,
+                                                         spmSize, report);
+  return changed;
+}
+
 static bool transformReductionResidencyPlan(
     ReductionResidencyPlan &plan, int64_t spmBase, int64_t spmSize,
     int64_t rowResidentMaxBytes, bool enablePromotionProfitability,
@@ -4900,6 +5111,17 @@ struct ConvertMemoryToSPM
             funcOp.getFunctionBody().empty())
           return;
         collectVectorContractionReports(funcOp, reports[funcOp.getOperation()]);
+      });
+    }
+
+    if (getEnvBool("TRITON_SPM_ATTENTION_QK_TILE", false)) {
+      mod.walk([&](FunctionOpInterface funcOp) {
+        if (funcOp.getFunctionBody().empty())
+          return;
+        SPMPromotionReport *report = nullptr;
+        if (promotionReport)
+          report = &reports[funcOp.getOperation()];
+        transformFunctionScopeAttentionQK(funcOp, spmBase, spmSize, report);
       });
     }
 

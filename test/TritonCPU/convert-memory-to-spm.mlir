@@ -1,6 +1,7 @@
 // RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s
 // RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=NOREDUCE
-// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=MULTI
+// RUN: env TRITON_SPM_ATTENTION_Q_RESIDENT=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=MULTI
+// RUN: env TRITON_SPM_ATTENTION_QK_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=QK-TILE
 
 // ============================================================================
 // Test: GEMM K-loop with two tiled loads feeding vector.contract
@@ -670,6 +671,48 @@ module {
 
     vector.transfer_write %result1, %O[%c0, %c0]
         {in_bounds = [true, true]} : vector<16x32xf32>, memref<64x32xf32, strided<[32, 1], offset: 0>>
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
+// Test: opt-in function-scope fused-attention QK tile staging.
+//       Q/K are DMA-staged into SPM before the local-consumer QK contraction;
+//       softmax-like local consumers remain on the original vector path.
+// ============================================================================
+
+// QK-TILE-LABEL: @fused_attention_qk_tile
+// QK-TILE:       triton_cpu.dma_enqueue_2d
+// QK-TILE:       triton_cpu.dma_enqueue_2d
+// QK-TILE:       triton_cpu.dma_wait
+// QK-TILE:       vector.transfer_read {{.*}} memref<16x16xf32, strided<[16, 1]>, 3>
+// QK-TILE:       vector.transfer_read {{.*}} memref<16x32xf32, strided<[1, 16]>, 3>
+// QK-TILE:       vector.contract
+// QK-TILE:       arith.mulf
+
+module {
+  tt.func public @fused_attention_qk_tile(
+      %Q: memref<64x16xf32, strided<[16, 1], offset: 0>>,
+      %K: memref<16x64xf32, strided<[1, 16], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %cst = arith.constant 0.0 : f32
+    %score_init = arith.constant dense<0.0> : vector<16x32xf32>
+
+    %q_tile = vector.transfer_read %Q[%c0, %c0], %cst
+        {in_bounds = [true, true]} : memref<64x16xf32, strided<[16, 1], offset: 0>>, vector<16x16xf32>
+    %k_tile = vector.transfer_read %K[%c0, %c0], %cst
+        {in_bounds = [true, true]} : memref<16x64xf32, strided<[1, 16], offset: 0>>, vector<16x32xf32>
+
+    %scores = vector.contract {
+        indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                         affine_map<(d0, d1, d2) -> (d2, d1)>,
+                         affine_map<(d0, d1, d2) -> (d0, d1)>],
+        iterator_types = ["parallel", "parallel", "reduction"]
+    } %q_tile, %k_tile, %score_init : vector<16x16xf32>, vector<16x32xf32> into vector<16x32xf32>
+
+    %scaled = arith.mulf %scores, %scores : vector<16x32xf32>
     tt.return
   }
 }
