@@ -1051,6 +1051,30 @@ struct SPMPromotionRejection {
   SPMProfitabilityEvidence profitability;
 };
 
+struct ContractionOperandReport {
+  std::string role;
+  std::string source;
+  SmallVector<int64_t> shape;
+};
+
+struct SPMContractionReport {
+  std::string status = "reported";
+  std::string pattern = "gemm_like_contraction";
+  std::string operation;
+  std::string scope;
+  SmallVector<int64_t, 3> mnkShape;
+  ContractionOperandReport lhs;
+  ContractionOperandReport rhs;
+  ContractionOperandReport acc;
+  std::string outputRelation;
+  std::string consumer;
+  int64_t consumerCount = 0;
+  int64_t loopTripCount = 0;
+  std::string scheduleStatus;
+  std::string reasonCode;
+  std::string reason;
+};
+
 static constexpr int64_t kDmaMmioStoresPerDescriptor = 4;
 
 static SPMProfitabilityEvidence makeD3ProfitabilityEvidence(
@@ -1108,11 +1132,218 @@ makeResidencyPlanEvidence(const ReductionResidencyPlan &plan) {
 struct SPMPromotionReport {
   SmallVector<SPMPromotionRecord, 4> records;
   SmallVector<SPMPromotionRejection, 4> rejections;
+  SmallVector<SPMContractionReport, 4> contractions;
 };
 
 static void appendShape(SmallVectorImpl<int64_t> &shape, VectorType vecTy) {
   for (int64_t dim : vecTy.getShape())
     shape.push_back(dim);
+}
+
+static std::string classifyContractionOperandSource(Value value,
+                                                    unsigned depth = 0) {
+  if (!value || depth > 6)
+    return "unknown";
+
+  if (getTransferReadThroughShapePreservingCasts(value))
+    return "memory_backed";
+
+  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    Operation *parentOp = blockArg.getOwner()->getParentOp();
+    if (parentOp && isa<scf::ForOp>(parentOp))
+      return "loop_accumulator";
+    return "block_argument";
+  }
+
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp)
+    return "unknown";
+
+  if (isShapePreservingCastLikeOp(defOp))
+    return classifyContractionOperandSource(defOp->getOperand(0), depth + 1);
+
+  if (isa<vector::ContractionOp, triton::cpu::DotOp>(defOp))
+    return "generated_contraction";
+
+  if (isa<arith::ConstantOp>(defOp))
+    return "constant";
+
+  return "generated_local";
+}
+
+static ContractionOperandReport makeContractionOperandReport(StringRef role,
+                                                             Value value) {
+  ContractionOperandReport report;
+  report.role = role.str();
+  report.source = classifyContractionOperandSource(value);
+  if (auto vecTy = dyn_cast<VectorType>(value.getType()))
+    appendShape(report.shape, vecTy);
+  return report;
+}
+
+static std::optional<unsigned> getYieldedResultIndex(scf::ForOp forOp,
+                                                     Value value) {
+  if (!forOp || forOp.getNumResults() == 0)
+    return std::nullopt;
+  auto yieldOp = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  if (!yieldOp)
+    return std::nullopt;
+  for (auto [index, operand] : llvm::enumerate(yieldOp.getOperands()))
+    if (operand == value)
+      return static_cast<unsigned>(index);
+  return std::nullopt;
+}
+
+static bool valueHasUserNamed(Value value, StringRef opName) {
+  for (Operation *user : value.getUsers())
+    if (user->getName().getStringRef() == opName)
+      return true;
+  return false;
+}
+
+static bool loopResultHasTransferWrite(scf::ForOp forOp, unsigned resultIndex) {
+  if (!forOp || resultIndex >= forOp.getNumResults())
+    return false;
+  return valueHasUserNamed(forOp.getResult(resultIndex),
+                           vector::TransferWriteOp::getOperationName());
+}
+
+static std::string getContractionConsumer(Value result, scf::ForOp parentFor) {
+  for (Operation *user : result.getUsers()) {
+    if (isa<vector::ContractionOp, triton::cpu::DotOp>(user))
+      return user->getName().getStringRef().str();
+  }
+
+  if (auto yieldedIndex = getYieldedResultIndex(parentFor, result)) {
+    if (loopResultHasTransferWrite(parentFor, *yieldedIndex))
+      return "scf.yield -> vector.transfer_write";
+    return "scf.yield";
+  }
+
+  for (Operation *user : result.getUsers()) {
+    if (isa<vector::TransferWriteOp>(user))
+      return user->getName().getStringRef().str();
+  }
+
+  if (result.use_empty())
+    return "none";
+  return (*result.getUsers().begin())->getName().getStringRef().str();
+}
+
+static std::string getContractionOutputRelation(Value result,
+                                                scf::ForOp parentFor) {
+  for (Operation *user : result.getUsers()) {
+    if (isa<vector::ContractionOp, triton::cpu::DotOp>(user))
+      return "local_consumer";
+  }
+
+  if (auto yieldedIndex = getYieldedResultIndex(parentFor, result)) {
+    if (loopResultHasTransferWrite(parentFor, *yieldedIndex))
+      return "loop_carried_accumulator_to_memory_store";
+    return "loop_carried_accumulator";
+  }
+
+  if (valueHasUserNamed(result, vector::TransferWriteOp::getOperationName()))
+    return "memory_store";
+
+  if (result.use_empty())
+    return "dead";
+
+  return "local_consumer";
+}
+
+static void classifyContractionSchedule(SPMContractionReport &report) {
+  bool lhsMemory = report.lhs.source == "memory_backed";
+  bool rhsMemory = report.rhs.source == "memory_backed";
+  bool lhsGenerated = report.lhs.source == "generated_contraction" ||
+                      report.lhs.source == "generated_local";
+  bool rhsGenerated = report.rhs.source == "generated_contraction" ||
+                      report.rhs.source == "generated_local";
+
+  if (lhsMemory && rhsMemory &&
+      report.outputRelation == "loop_carried_accumulator_to_memory_store") {
+    report.status = "accepted";
+    report.scheduleStatus = "existing_gemm_schedule_candidate";
+    report.reasonCode = "accepted_existing_schedule";
+    report.reason =
+        "memory-backed contraction with a loop-carried accumulator and "
+        "memory-backed output matches the existing GEMM scheduling shape";
+    return;
+  }
+
+  report.status = "rejected";
+  report.scheduleStatus = "report_only_no_schedule_change";
+  if (lhsGenerated || rhsGenerated) {
+    report.reasonCode = "generated_operand_not_resident";
+    report.reason =
+        "one operand is produced inside the fused region; scheduling needs an "
+        "explicit generated-tile residency plan before SPM lowering";
+    return;
+  }
+
+  if (lhsMemory && rhsMemory && report.outputRelation == "local_consumer") {
+    report.reasonCode = "local_consumer_output";
+    report.reason =
+        "memory-backed contraction output feeds a local consumer instead of "
+        "an ordinary memory-backed output";
+    return;
+  }
+
+  if (report.loopTripCount == 0) {
+    report.reasonCode = "unsupported_dynamic_shape";
+    report.reason =
+        "loop bounds/step do not provide an exact static trip count for the "
+        "reporting-only matcher";
+    return;
+  }
+
+  report.reasonCode = "unsupported_pattern";
+  report.reason =
+      "contraction shape was reported, but the current SPM scheduler has no "
+      "matching standalone or generated-operand mode";
+}
+
+static void collectVectorContractionReports(FunctionOpInterface funcOp,
+                                            SPMPromotionReport &report) {
+  funcOp.getOperation()->walk([&](vector::ContractionOp contractOp) {
+    if (!isGemmContract(contractOp))
+      return;
+
+    auto lhsTy = dyn_cast<VectorType>(contractOp.getLhs().getType());
+    auto rhsTy = dyn_cast<VectorType>(contractOp.getRhs().getType());
+    auto accTy = dyn_cast<VectorType>(contractOp.getAcc().getType());
+    if (!lhsTy || !rhsTy || !accTy || lhsTy.getRank() != 2 ||
+        rhsTy.getRank() != 2 || accTy.getRank() != 2)
+      return;
+
+    SPMContractionReport entry;
+    entry.operation = contractOp->getName().getStringRef().str();
+    entry.scope = "function";
+    entry.mnkShape.push_back(accTy.getDimSize(0));
+    entry.mnkShape.push_back(accTy.getDimSize(1));
+    entry.mnkShape.push_back(lhsTy.getDimSize(1));
+    entry.lhs = makeContractionOperandReport("lhs", contractOp.getLhs());
+    entry.rhs = makeContractionOperandReport("rhs", contractOp.getRhs());
+    entry.acc =
+        makeContractionOperandReport("accumulator", contractOp.getAcc());
+
+    scf::ForOp parentFor = contractOp->getParentOfType<scf::ForOp>();
+    if (parentFor) {
+      entry.scope = "scf.for";
+      if (auto trips = getExactStaticTripCount(parentFor))
+        entry.loopTripCount = *trips;
+    }
+
+    entry.outputRelation =
+        getContractionOutputRelation(contractOp.getResult(), parentFor);
+    entry.consumer = getContractionConsumer(contractOp.getResult(), parentFor);
+    for (Operation *user : contractOp.getResult().getUsers()) {
+      (void)user;
+      ++entry.consumerCount;
+    }
+    classifyContractionSchedule(entry);
+    report.contractions.push_back(std::move(entry));
+  });
 }
 
 static void writeJsonString(llvm::raw_ostream &os, StringRef value) {
@@ -1161,6 +1392,80 @@ static void writeJsonStringArray(llvm::raw_ostream &os,
     writeJsonString(os, value);
   }
   os << "]";
+}
+
+static void
+writeContractionOperandReport(llvm::raw_ostream &os,
+                              const ContractionOperandReport &operand,
+                              StringRef indent) {
+  os << indent << "{\n";
+  os << indent << "  \"role\": ";
+  writeJsonString(os, operand.role);
+  os << ",\n";
+  os << indent << "  \"source\": ";
+  writeJsonString(os, operand.source);
+  os << ",\n";
+  os << indent << "  \"shape\": ";
+  writeJsonShape(os, operand.shape);
+  os << "\n";
+  os << indent << "}";
+}
+
+static void writeContractionReports(llvm::raw_ostream &os,
+                                    ArrayRef<SPMContractionReport> contractions,
+                                    StringRef indent) {
+  os << indent << "\"contractions\": [\n";
+  for (auto [index, contraction] : llvm::enumerate(contractions)) {
+    os << indent << "  {\n";
+    os << indent << "    \"status\": ";
+    writeJsonString(os, contraction.status);
+    os << ",\n";
+    os << indent << "    \"pattern\": ";
+    writeJsonString(os, contraction.pattern);
+    os << ",\n";
+    os << indent << "    \"operation\": ";
+    writeJsonString(os, contraction.operation);
+    os << ",\n";
+    os << indent << "    \"scope\": ";
+    writeJsonString(os, contraction.scope);
+    os << ",\n";
+    os << indent << "    \"mnk_shape\": ";
+    writeJsonShape(os, contraction.mnkShape);
+    os << ",\n";
+    os << indent << "    \"lhs\": ";
+    writeContractionOperandReport(os, contraction.lhs, indent.str() + "    ");
+    os << ",\n";
+    os << indent << "    \"rhs\": ";
+    writeContractionOperandReport(os, contraction.rhs, indent.str() + "    ");
+    os << ",\n";
+    os << indent << "    \"accumulator\": ";
+    writeContractionOperandReport(os, contraction.acc, indent.str() + "    ");
+    os << ",\n";
+    os << indent << "    \"output_relation\": ";
+    writeJsonString(os, contraction.outputRelation);
+    os << ",\n";
+    os << indent << "    \"consumer\": ";
+    writeJsonString(os, contraction.consumer);
+    os << ",\n";
+    os << indent << "    \"consumer_count\": " << contraction.consumerCount
+       << ",\n";
+    os << indent << "    \"loop_trip_count\": " << contraction.loopTripCount
+       << ",\n";
+    os << indent << "    \"schedule_status\": ";
+    writeJsonString(os, contraction.scheduleStatus);
+    os << ",\n";
+    os << indent << "    \"reason_code\": ";
+    writeJsonString(os, contraction.reasonCode);
+    os << ",\n";
+    os << indent << "    \"reason\": ";
+    writeJsonString(os, contraction.reason);
+    os << "\n";
+    os << indent << "  }";
+    if (index + 1 != contractions.size())
+      os << ",";
+    os << "\n";
+  }
+  os << indent << "]";
 }
 
 static void writePromotionFieldKinds(llvm::raw_ostream &os, StringRef indent) {
@@ -1461,7 +1766,9 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
       os << ",";
     os << "\n";
   }
-  os << "  ]\n";
+  os << "  ],\n";
+  writeContractionReports(os, report.contractions, "  ");
+  os << "\n";
   os << "}\n";
 
   return success();
@@ -3402,9 +3709,8 @@ static bool transformAttentionV2QResidentLoop(scf::ForOp forOp,
                                               SPMPromotionReport *report) {
   auto reject = [&](StringRef reasonCode, StringRef reason) {
     if (report)
-      report->rejections.push_back(
-          makePromotionRejection("attention_v2_q_resident", reasonCode,
-                                 reason));
+      report->rejections.push_back(makePromotionRejection(
+          "attention_v2_q_resident", reasonCode, reason));
     return false;
   };
 
@@ -3487,8 +3793,7 @@ static bool transformAttentionV2KVStreamingLoop(
   auto reject = [&](StringRef reasonCode, StringRef reason) {
     if (report)
       report->rejections.push_back(
-          makePromotionRejection("attention_v2_kv_stream", reasonCode,
-                                 reason));
+          makePromotionRejection("attention_v2_kv_stream", reasonCode, reason));
     return false;
   };
 
@@ -3584,7 +3889,8 @@ static bool transformAttentionV2KVStreamingLoop(
   OpBuilder b(forOp);
 
   for (AttentionStreamPlan &stream : streams) {
-    stream.dramAddr = computePrologueDramAddr(b, loc, stream.load.readOp, forOp);
+    stream.dramAddr =
+        computePrologueDramAddr(b, loc, stream.load.readOp, forOp);
     if (!stream.dramAddr) {
       guard.cleanup();
       return reject("dynamic_shape_or_stride",
@@ -3628,24 +3934,22 @@ static bool transformAttentionV2KVStreamingLoop(
 
   Value iv = newForOp.getInductionVar();
   Value nextIv = arith::AddIOp::create(b, loc, iv, newForOp.getStep());
-  Value hasNext = arith::CmpIOp::create(
-      b, loc, arith::CmpIPredicate::slt, nextIv, newForOp.getUpperBound());
-  Value nextOff = arith::SubIOp::create(b, loc, nextIv,
-                                        newForOp.getLowerBound());
-  Value nextIterNum =
-      arith::DivSIOp::create(b, loc, toI64(b, loc, nextOff),
-                             toI64(b, loc, newForOp.getStep()));
+  Value hasNext = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt,
+                                        nextIv, newForOp.getUpperBound());
+  Value nextOff =
+      arith::SubIOp::create(b, loc, nextIv, newForOp.getLowerBound());
+  Value nextIterNum = arith::DivSIOp::create(b, loc, toI64(b, loc, nextOff),
+                                             toI64(b, loc, newForOp.getStep()));
 
-  auto prefetchIf =
-      scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
+  auto prefetchIf = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
   b.setInsertionPointToStart(&prefetchIf.getThenRegion().front());
   for (AttentionStreamPlan &stream : streams) {
-    Value nextByteOff = arith::MulIOp::create(
-        b, loc, nextIterNum, i64Cst(b, loc, stream.stepBytes));
-    Value nextDram = arith::AddIOp::create(b, loc, stream.dramAddr,
-                                           nextByteOff);
-    emitDmaFilledEnqueue(b, loc, stream.spmNxt, nextDram,
-                         stream.load.vecTy, stream.memRefTy);
+    Value nextByteOff = arith::MulIOp::create(b, loc, nextIterNum,
+                                              i64Cst(b, loc, stream.stepBytes));
+    Value nextDram =
+        arith::AddIOp::create(b, loc, stream.dramAddr, nextByteOff);
+    emitDmaFilledEnqueue(b, loc, stream.spmNxt, nextDram, stream.load.vecTy,
+                         stream.memRefTy);
   }
   b.setInsertionPointAfter(prefetchIf);
 
@@ -3696,9 +4000,8 @@ static bool transformAttentionV2KVStreamingLoop(
         report, source, "double-buffered attention K/V stream",
         stream.load.vecTy, recordUses, stream.load.tileBytes * 2,
         stream.addrBuf0, liveBytes,
-        /*dmaDescriptors=*/recordUses, /*waits=*/recordUses,
-        "stream_kv_tile", "double_buffered",
-        "accepted_attention_v2_kv_stream",
+        /*dmaDescriptors=*/recordUses, /*waits=*/recordUses, "stream_kv_tile",
+        "double_buffered", "accepted_attention_v2_kv_stream",
         "K/V tiles are streamed through SPM without unrolling the attention "
         "loop");
   }
@@ -4590,6 +4893,15 @@ struct ConvertMemoryToSPM
     DenseMap<Operation *, SPMPromotionReport> reports;
     DenseMap<Operation *, AttentionFunctionState> attentionStates;
     llvm::DenseSet<Operation *> rowResidentHandledLoops;
+
+    if (promotionReport) {
+      mod.walk([&](FunctionOpInterface funcOp) {
+        if (funcOp.getVisibility() != SymbolTable::Visibility::Public ||
+            funcOp.getFunctionBody().empty())
+          return;
+        collectVectorContractionReports(funcOp, reports[funcOp.getOperation()]);
+      });
+    }
 
     if (enableRowResidentReductions) {
       mod.walk([&](FunctionOpInterface funcOp) {

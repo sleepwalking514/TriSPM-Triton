@@ -43,6 +43,13 @@
 // REPORT:      "uses": 9
 // REPORT:      "bytes": 2048
 // REPORT:      "rejections": [
+// REPORT:      "contractions": [
+// REPORT:      "pattern": "gemm_like_contraction"
+// REPORT:      "operation": "vector.contract"
+// REPORT:      "mnk_shape": [32, 16, 16]
+// REPORT:      "source": "memory_backed"
+// REPORT:      "output_relation": "loop_carried_accumulator_to_memory_store"
+// REPORT:      "schedule_status": "existing_gemm_schedule_candidate"
 
 // REJECT:      "schema_version": 1
 // REJECT:      "kernel": "reduction_report"
@@ -113,6 +120,22 @@
 // MULTI-NOT:  "source": "attention V window tile"
 // MULTI-NOT:  "reason_code": "accepted_attention_v2_kv_window"
 // MULTI:      "live_spm_bytes": 2048
+// MULTI:      "contractions": [
+// MULTI:      "mnk_shape": [16, 16, 32]
+// MULTI:      "lhs": {
+// MULTI:      "source": "memory_backed"
+// MULTI:      "rhs": {
+// MULTI:      "source": "memory_backed"
+// MULTI:      "output_relation": "local_consumer"
+// MULTI:      "consumer": "vector.contract"
+// MULTI:      "reason_code": "local_consumer_output"
+// MULTI:      "mnk_shape": [16, 32, 16]
+// MULTI:      "lhs": {
+// MULTI:      "source": "generated_contraction"
+// MULTI:      "rhs": {
+// MULTI:      "source": "memory_backed"
+// MULTI:      "output_relation": "loop_carried_accumulator_to_memory_store"
+// MULTI:      "reason_code": "generated_operand_not_resident"
 
 module {
   tt.func public @gemm_fused_report(
