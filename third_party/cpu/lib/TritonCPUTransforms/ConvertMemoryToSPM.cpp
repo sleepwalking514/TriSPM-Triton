@@ -667,7 +667,9 @@ static bool allResultsUseEmpty(Operation *op) {
   return true;
 }
 
-static void eraseDeadReadOrCastChain(Value value) {
+static void eraseDeadReadOrCastChain(Value value, unsigned depth = 0) {
+  if (depth > 8)
+    return;
   Operation *op = value.getDefiningOp();
   if (!op)
     return;
@@ -679,7 +681,7 @@ static void eraseDeadReadOrCastChain(Value value) {
   SmallVector<Value, 4> operands(op->getOperands());
   op->erase();
   for (Value operand : operands)
-    eraseDeadReadOrCastChain(operand);
+    eraseDeadReadOrCastChain(operand, depth + 1);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3253,6 +3255,32 @@ static void markResidencyPlanLoopsHandled(
 // the original path.
 //===----------------------------------------------------------------------===//
 
+struct FunctionScopeAttentionSpmState {
+  int64_t spmBase = 0;
+  int64_t spmSize = 0;
+  int64_t usedBytes = 0;
+
+  int64_t checkpoint() const { return usedBytes; }
+  void restore(int64_t checkpoint) { usedBytes = checkpoint; }
+
+  std::optional<int64_t> alloc(int64_t bytes, int64_t alignment = 1) {
+    if (bytes < 0 || alignment <= 0)
+      return std::nullopt;
+    int64_t aligned = usedBytes;
+    int64_t remainder = aligned % alignment;
+    if (remainder != 0) {
+      if (aligned > std::numeric_limits<int64_t>::max() -
+                        (alignment - remainder))
+        return std::nullopt;
+      aligned += alignment - remainder;
+    }
+    if (aligned > spmSize || bytes > spmSize - aligned)
+      return std::nullopt;
+    usedBytes = aligned + bytes;
+    return spmBase + aligned;
+  }
+};
+
 static bool isFunctionScopeLocalConsumerQK(vector::ContractionOp contractOp) {
   if (!isGemmContract(contractOp))
     return false;
@@ -3328,7 +3356,7 @@ static void markAttentionQKContractionAccepted(
 }
 
 static bool transformFunctionScopeAttentionQKContract(
-    vector::ContractionOp contractOp, int64_t spmBase, int64_t spmSize,
+    vector::ContractionOp contractOp, FunctionScopeAttentionSpmState &state,
     SPMPromotionReport *report) {
   if (!isFunctionScopeLocalConsumerQK(contractOp))
     return false;
@@ -3354,12 +3382,11 @@ static bool transformFunctionScopeAttentionQKContract(
   int64_t lhsBytes = getTileBytes(lhsTy);
   int64_t rhsBytes = getTileBytes(rhsTy);
 
-  SPMSpaceManager spmLayout(spmBase, spmSize);
-  auto lhsAlloc = spmLayout.alloc(lhsBytes, /*alignment=*/1,
-                                  SPMSpaceManager::Lifetime::Loop);
-  auto rhsAlloc = spmLayout.alloc(rhsBytes, /*alignment=*/1,
-                                  SPMSpaceManager::Lifetime::Loop);
-  if (!lhsAlloc || !rhsAlloc) {
+  int64_t spmCheckpoint = state.checkpoint();
+  auto lhsAddr = state.alloc(lhsBytes);
+  auto rhsAddr = state.alloc(rhsBytes);
+  if (!lhsAddr || !rhsAddr) {
+    state.restore(spmCheckpoint);
     if (report)
       report->rejections.push_back(makePromotionRejection(
           "attention_qk_tile", "spm_capacity_overflow",
@@ -3375,6 +3402,7 @@ static bool transformFunctionScopeAttentionQKContract(
   Value rhsDram = computeDramAddr(b, loc, rhsRead);
   if (!lhsDram || !rhsDram) {
     guard.cleanup();
+    state.restore(spmCheckpoint);
     if (report)
       report->rejections.push_back(makePromotionRejection(
           "attention_qk_tile", "dynamic_shape_or_stride",
@@ -3382,8 +3410,8 @@ static bool transformFunctionScopeAttentionQKContract(
     return false;
   }
 
-  Value lhsSpmAddr = i64Cst(b, loc, lhsAlloc->address);
-  Value rhsSpmAddr = i64Cst(b, loc, rhsAlloc->address);
+  Value lhsSpmAddr = i64Cst(b, loc, *lhsAddr);
+  Value rhsSpmAddr = i64Cst(b, loc, *rhsAddr);
   emitDmaFilledEnqueue(b, loc, lhsSpmAddr, lhsDram, lhsTy, lhsMemRefTy);
   emitDmaFilledEnqueue(b, loc, rhsSpmAddr, rhsDram, rhsTy, rhsMemRefTy);
   triton::cpu::DmaWaitOp::create(b, loc);
@@ -3404,18 +3432,19 @@ static bool transformFunctionScopeAttentionQKContract(
 
   if (report) {
     report->records.push_back(makeAttentionQKTileRecord(
-        "attention QK lhs tile", lhsTy, lhsBytes, lhsAlloc->address));
+        "attention QK lhs tile", lhsTy, lhsBytes, *lhsAddr));
     report->records.push_back(makeAttentionQKTileRecord(
-        "attention QK rhs tile", rhsTy, rhsBytes, rhsAlloc->address));
+        "attention QK rhs tile", rhsTy, rhsBytes, *rhsAddr));
     markAttentionQKContractionAccepted(report, contractOp);
   }
 
   return true;
 }
 
-static bool transformFunctionScopeAttentionQK(
-    FunctionOpInterface funcOp, int64_t spmBase, int64_t spmSize,
-    SPMPromotionReport *report) {
+static bool
+transformFunctionScopeAttentionQK(FunctionOpInterface funcOp,
+                                  FunctionScopeAttentionSpmState &state,
+                                  SPMPromotionReport *report) {
   SmallVector<vector::ContractionOp, 4> contracts;
   funcOp->walk([&](vector::ContractionOp contractOp) {
     contracts.push_back(contractOp);
@@ -3423,8 +3452,179 @@ static bool transformFunctionScopeAttentionQK(
 
   bool changed = false;
   for (vector::ContractionOp contractOp : contracts)
-    changed |= transformFunctionScopeAttentionQKContract(contractOp, spmBase,
-                                                         spmSize, report);
+    changed |=
+        transformFunctionScopeAttentionQKContract(contractOp, state, report);
+  return changed;
+}
+
+//===----------------------------------------------------------------------===//
+// Function-scope fused-attention PV generated-operand residency.
+//
+// This opt-in path handles the first generated-operand milestone: a PV
+// vector.contract whose probability/softmax tile is produced inside the same
+// fused region.  It materializes that generated tile into SPM and feeds PV from
+// the SPM read.  The memory-backed V operand remains on the cache path for this
+// stage.
+//===----------------------------------------------------------------------===//
+
+static bool isGeneratedContractionOperand(Value value) {
+  std::string source = classifyContractionOperandSource(value);
+  return source == "generated_contraction" || source == "generated_local";
+}
+
+static std::optional<unsigned>
+getFunctionScopePVGeneratedOperandIndex(vector::ContractionOp contractOp) {
+  if (!isGemmContract(contractOp))
+    return std::nullopt;
+  if (contractOp->getParentOfType<scf::ForOp>())
+    return std::nullopt;
+  if (getContractionOutputRelation(contractOp.getResult(),
+                                   /*parentFor=*/nullptr) != "memory_store")
+    return std::nullopt;
+
+  bool lhsGenerated = isGeneratedContractionOperand(contractOp.getLhs());
+  bool rhsGenerated = isGeneratedContractionOperand(contractOp.getRhs());
+  bool lhsMemory = static_cast<bool>(
+      getTransferReadThroughShapePreservingCasts(contractOp.getLhs()));
+  bool rhsMemory = static_cast<bool>(
+      getTransferReadThroughShapePreservingCasts(contractOp.getRhs()));
+
+  if (lhsGenerated && rhsMemory)
+    return 0;
+  if (rhsGenerated && lhsMemory)
+    return 1;
+  return std::nullopt;
+}
+
+static SPMPromotionRecord makeAttentionPVGeneratedRecord(
+    VectorType shapeTy, int64_t bytes, int64_t spmAddress) {
+  SPMPromotionRecord record;
+  record.source = "attention PV generated tile";
+  record.scope = "function-scope PV generated operand";
+  appendShape(record.shape, shapeTy);
+  record.uses = 1;
+  record.copyIn = "CPU/vector store";
+  record.copyOut = "CPU/vector transfer read";
+  record.bytes = bytes;
+  record.spmAddress = spmAddress;
+  record.overhead = "one SPM vector write and read around the PV contract";
+  record.benefit =
+      "gives the generated softmax/probability operand an explicit SPM "
+      "residency plan before PV scheduling grows to include V streaming";
+  record.reasonCode = "accepted_attention_pv_generated_operand_residency";
+  record.reason =
+      "accepted by the opt-in fused-attention PV generated-operand residency "
+      "prototype";
+  record.residencyPlan.present = true;
+  record.residencyPlan.producerPass = "producer_store";
+  record.residencyPlan.consumerPasses.push_back(
+      "attention_pv_generated_operand");
+  record.residencyPlan.bufferRole = "generated_probability_tile";
+  record.residencyPlan.rotationPolicy = "none";
+  record.residencyPlan.copyInMode = "cpu_direct";
+  record.residencyPlan.requiredSpmSlots = 1;
+  record.residencyPlan.expectedMarkers.push_back("addrspace(3)");
+  return record;
+}
+
+static void markAttentionPVContractionAccepted(
+    SPMPromotionReport *report, vector::ContractionOp contractOp,
+    unsigned generatedOperandIndex) {
+  if (!report)
+    return;
+
+  auto lhsTy = dyn_cast<VectorType>(contractOp.getLhs().getType());
+  auto accTy = dyn_cast<VectorType>(contractOp.getAcc().getType());
+  if (!lhsTy || !accTy || lhsTy.getRank() != 2 || accTy.getRank() != 2)
+    return;
+
+  SmallVector<int64_t, 3> mnk = {accTy.getDimSize(0), accTy.getDimSize(1),
+                                lhsTy.getDimSize(1)};
+  for (SPMContractionReport &entry : report->contractions) {
+    if (entry.operation != contractOp->getName().getStringRef().str())
+      continue;
+    if (!llvm::equal(entry.mnkShape, mnk))
+      continue;
+    if (entry.outputRelation != "memory_store")
+      continue;
+
+    bool expectedSources =
+        generatedOperandIndex == 0
+            ? (entry.lhs.source == "generated_contraction" ||
+               entry.lhs.source == "generated_local") &&
+                  entry.rhs.source == "memory_backed"
+            : (entry.rhs.source == "generated_contraction" ||
+               entry.rhs.source == "generated_local") &&
+                  entry.lhs.source == "memory_backed";
+    if (!expectedSources)
+      continue;
+
+    entry.status = "accepted";
+    entry.scheduleStatus =
+        "accepted_attention_pv_generated_operand_residency";
+    entry.reasonCode = "accepted_attention_pv_generated_operand_residency";
+    entry.reason =
+        "PV consumes a generated softmax/probability tile; opt-in conservative "
+        "residency stores that generated operand to SPM and feeds PV from the "
+        "SPM tile while leaving the memory-backed V operand unchanged";
+    return;
+  }
+}
+
+static bool transformFunctionScopeAttentionPVGeneratedContract(
+    vector::ContractionOp contractOp, FunctionScopeAttentionSpmState &state,
+    SPMPromotionReport *report) {
+  auto generatedIndex = getFunctionScopePVGeneratedOperandIndex(contractOp);
+  if (!generatedIndex)
+    return false;
+
+  Value generated = contractOp->getOperand(*generatedIndex);
+  auto generatedTy = dyn_cast<VectorType>(generated.getType());
+  if (!generatedTy || generatedTy.getRank() != 2)
+    return false;
+
+  int64_t generatedBytes = getTileBytes(generatedTy);
+  int64_t spmCheckpoint = state.checkpoint();
+  auto generatedAddr = state.alloc(generatedBytes);
+  if (!generatedAddr) {
+    state.restore(spmCheckpoint);
+    if (report)
+      report->rejections.push_back(makePromotionRejection(
+          "attention_pv_generated_operand", "spm_capacity_overflow",
+          "SPM capacity cannot fit the generated softmax/probability PV "
+          "operand tile"));
+    return false;
+  }
+
+  Location loc = contractOp.getLoc();
+  OpBuilder b(contractOp);
+  Value spmAddr = i64Cst(b, loc, *generatedAddr);
+  emitSpmWrite(b, loc, spmAddr, generated);
+  Value spmGenerated = emitSpmRead(b, loc, spmAddr, generatedTy);
+  contractOp->setOperand(*generatedIndex, spmGenerated);
+
+  if (report) {
+    report->records.push_back(makeAttentionPVGeneratedRecord(
+        generatedTy, generatedBytes, *generatedAddr));
+    markAttentionPVContractionAccepted(report, contractOp, *generatedIndex);
+  }
+
+  return true;
+}
+
+static bool
+transformFunctionScopeAttentionPVGenerated(FunctionOpInterface funcOp,
+                                           FunctionScopeAttentionSpmState &state,
+                                           SPMPromotionReport *report) {
+  SmallVector<vector::ContractionOp, 4> contracts;
+  funcOp->walk([&](vector::ContractionOp contractOp) {
+    contracts.push_back(contractOp);
+  });
+
+  bool changed = false;
+  for (vector::ContractionOp contractOp : contracts)
+    changed |= transformFunctionScopeAttentionPVGeneratedContract(
+        contractOp, state, report);
   return changed;
 }
 
@@ -5114,14 +5314,22 @@ struct ConvertMemoryToSPM
       });
     }
 
-    if (getEnvBool("TRITON_SPM_ATTENTION_QK_TILE", false)) {
+    bool enableFunctionScopeQK =
+        getEnvBool("TRITON_SPM_ATTENTION_QK_TILE", false);
+    bool enableFunctionScopePVGenerated =
+        getEnvBool("TRITON_SPM_ATTENTION_PV_GENERATED_TILE", false);
+    if (enableFunctionScopeQK || enableFunctionScopePVGenerated) {
       mod.walk([&](FunctionOpInterface funcOp) {
         if (funcOp.getFunctionBody().empty())
           return;
         SPMPromotionReport *report = nullptr;
         if (promotionReport)
           report = &reports[funcOp.getOperation()];
-        transformFunctionScopeAttentionQK(funcOp, spmBase, spmSize, report);
+        FunctionScopeAttentionSpmState state{spmBase, spmSize, 0};
+        if (enableFunctionScopeQK)
+          transformFunctionScopeAttentionQK(funcOp, state, report);
+        if (enableFunctionScopePVGenerated)
+          transformFunctionScopeAttentionPVGenerated(funcOp, state, report);
       });
     }
 

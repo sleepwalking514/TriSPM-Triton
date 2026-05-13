@@ -2,6 +2,7 @@
 // RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=NOREDUCE
 // RUN: env TRITON_SPM_ATTENTION_Q_RESIDENT=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=MULTI
 // RUN: env TRITON_SPM_ATTENTION_QK_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=QK-TILE
+// RUN: env TRITON_SPM_ATTENTION_PV_GENERATED_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=PV-GEN
 
 // ============================================================================
 // Test: GEMM K-loop with two tiled loads feeding vector.contract
@@ -713,6 +714,61 @@ module {
     } %q_tile, %k_tile, %score_init : vector<16x16xf32>, vector<16x32xf32> into vector<16x32xf32>
 
     %scaled = arith.mulf %scores, %scores : vector<16x32xf32>
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
+// Test: opt-in function-scope PV generated-operand residency.
+//       The generated probability tile is written to SPM and read back for PV;
+//       the memory-backed V tile remains on the cache path at this stage.
+// ============================================================================
+
+// PV-GEN-LABEL: @fused_attention_pv_generated_tile
+// PV-GEN:       vector.contract
+// PV-GEN:       arith.mulf
+// PV-GEN:       vector.transfer_read {{.*}} memref<64x16xf32, strided<[16, 1]>>, vector<32x16xf32>
+// PV-GEN:       vector.transfer_write {{.*}} memref<16x32xf32, strided<[32, 1]>, 3>
+// PV-GEN:       vector.transfer_read {{.*}} memref<16x32xf32, strided<[32, 1]>, 3>
+// PV-GEN:       vector.contract
+// PV-GEN:       vector.transfer_write
+
+module {
+  tt.func public @fused_attention_pv_generated_tile(
+      %Q: memref<64x16xf32, strided<[16, 1], offset: 0>>,
+      %K: memref<16x64xf32, strided<[1, 16], offset: 0>>,
+      %V: memref<64x16xf32, strided<[16, 1], offset: 0>>,
+      %O: memref<64x16xf32, strided<[16, 1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %cst = arith.constant 0.0 : f32
+    %score_init = arith.constant dense<0.0> : vector<16x32xf32>
+    %out_init = arith.constant dense<0.0> : vector<16x16xf32>
+
+    %q_tile = vector.transfer_read %Q[%c0, %c0], %cst
+        {in_bounds = [true, true]} : memref<64x16xf32, strided<[16, 1], offset: 0>>, vector<16x16xf32>
+    %k_tile = vector.transfer_read %K[%c0, %c0], %cst
+        {in_bounds = [true, true]} : memref<16x64xf32, strided<[1, 16], offset: 0>>, vector<16x32xf32>
+    %scores = vector.contract {
+        indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                         affine_map<(d0, d1, d2) -> (d2, d1)>,
+                         affine_map<(d0, d1, d2) -> (d0, d1)>],
+        iterator_types = ["parallel", "parallel", "reduction"]
+    } %q_tile, %k_tile, %score_init : vector<16x16xf32>, vector<16x32xf32> into vector<16x32xf32>
+
+    %prob = arith.mulf %scores, %scores : vector<16x32xf32>
+    %v_tile = vector.transfer_read %V[%c0, %c0], %cst
+        {in_bounds = [true, true]} : memref<64x16xf32, strided<[16, 1], offset: 0>>, vector<32x16xf32>
+    %out = vector.contract {
+        indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                         affine_map<(d0, d1, d2) -> (d2, d1)>,
+                         affine_map<(d0, d1, d2) -> (d0, d1)>],
+        iterator_types = ["parallel", "parallel", "reduction"]
+    } %prob, %v_tile, %out_init : vector<16x32xf32>, vector<32x16xf32> into vector<16x16xf32>
+
+    vector.transfer_write %out, %O[%c0, %c0]
+        {in_bounds = [true, true]} : vector<16x16xf32>, memref<64x16xf32, strided<[16, 1], offset: 0>>
     tt.return
   }
 }

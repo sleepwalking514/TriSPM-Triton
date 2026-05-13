@@ -16,6 +16,9 @@
 // RUN: rm -rf %t.qk && mkdir -p %t.qk
 // RUN: env KERNEL_AUX_FILE_DIR=%t.qk TRITON_SPM_ATTENTION_QK_TILE=1 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=0 promotion-report=1" >/dev/null
 // RUN: cat %t.qk/fused_attention_qk_report_promotions.json | FileCheck %s --check-prefix=QKREPORT
+// RUN: rm -rf %t.pv && mkdir -p %t.pv
+// RUN: env KERNEL_AUX_FILE_DIR=%t.pv TRITON_SPM_ATTENTION_PV_GENERATED_TILE=1 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=0 promotion-report=1" >/dev/null
+// RUN: cat %t.pv/fused_attention_pv_generated_report_promotions.json | FileCheck %s --check-prefix=PVREPORT
 
 // REPORT:      "schema_version": 1
 // REPORT:      "schema": "triton_cpu_spm_promotion_d1"
@@ -153,6 +156,22 @@
 // QKREPORT:      "mnk_shape": [16, 32, 16]
 // QKREPORT:      "schedule_status": "accepted_attention_qk_tile_staging"
 
+// PVREPORT:      "kernel": "fused_attention_pv_generated_report"
+// PVREPORT:      "source": "attention PV generated tile"
+// PVREPORT:      "scope": "function-scope PV generated operand"
+// PVREPORT:      "shape": [16, 32]
+// PVREPORT:      "copy_in": "CPU/vector store"
+// PVREPORT:      "copy_out": "CPU/vector transfer read"
+// PVREPORT:      "reason_code": "accepted_attention_pv_generated_operand_residency"
+// PVREPORT:      "buffer_role": "generated_probability_tile"
+// PVREPORT:      "contractions": [
+// PVREPORT:      "status": "rejected"
+// PVREPORT:      "mnk_shape": [16, 32, 16]
+// PVREPORT:      "reason_code": "local_consumer_output"
+// PVREPORT:      "status": "accepted"
+// PVREPORT:      "mnk_shape": [16, 16, 32]
+// PVREPORT:      "schedule_status": "accepted_attention_pv_generated_operand_residency"
+
 module {
   tt.func public @gemm_fused_report(
       %A: memref<64x64xf32, strided<[64, 1], offset: 0>>,
@@ -210,6 +229,46 @@ module {
     } %q_tile, %k_tile, %score_init : vector<16x16xf32>, vector<16x32xf32> into vector<16x32xf32>
 
     %scaled = arith.mulf %scores, %scores : vector<16x32xf32>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func public @fused_attention_pv_generated_report(
+      %Q: memref<64x16xf32, strided<[16, 1], offset: 0>>,
+      %K: memref<16x64xf32, strided<[1, 16], offset: 0>>,
+      %V: memref<64x16xf32, strided<[16, 1], offset: 0>>,
+      %O: memref<64x16xf32, strided<[16, 1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %cst = arith.constant 0.0 : f32
+    %score_init = arith.constant dense<0.0> : vector<16x32xf32>
+    %out_init = arith.constant dense<0.0> : vector<16x16xf32>
+
+    %q_tile = vector.transfer_read %Q[%c0, %c0], %cst
+        {in_bounds = [true, true]} : memref<64x16xf32, strided<[16, 1], offset: 0>>, vector<16x16xf32>
+    %k_tile = vector.transfer_read %K[%c0, %c0], %cst
+        {in_bounds = [true, true]} : memref<16x64xf32, strided<[1, 16], offset: 0>>, vector<16x32xf32>
+    %scores = vector.contract {
+        indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                         affine_map<(d0, d1, d2) -> (d2, d1)>,
+                         affine_map<(d0, d1, d2) -> (d0, d1)>],
+        iterator_types = ["parallel", "parallel", "reduction"]
+    } %q_tile, %k_tile, %score_init : vector<16x16xf32>, vector<16x32xf32> into vector<16x32xf32>
+
+    %prob = arith.mulf %scores, %scores : vector<16x32xf32>
+    %v_tile = vector.transfer_read %V[%c0, %c0], %cst
+        {in_bounds = [true, true]} : memref<64x16xf32, strided<[16, 1], offset: 0>>, vector<32x16xf32>
+    %out = vector.contract {
+        indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                         affine_map<(d0, d1, d2) -> (d2, d1)>,
+                         affine_map<(d0, d1, d2) -> (d0, d1)>],
+        iterator_types = ["parallel", "parallel", "reduction"]
+    } %prob, %v_tile, %out_init : vector<16x32xf32>, vector<32x16xf32> into vector<16x16xf32>
+
+    vector.transfer_write %out, %O[%c0, %c0]
+        {in_bounds = [true, true]} : vector<16x16xf32>, memref<64x16xf32, strided<[16, 1], offset: 0>>
     tt.return
   }
 }
