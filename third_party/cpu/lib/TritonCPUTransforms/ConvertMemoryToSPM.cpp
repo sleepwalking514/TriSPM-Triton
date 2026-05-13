@@ -3952,6 +3952,51 @@ getAttentionStreamStepBytes(vector::TransferReadOp readOp, scf::ForOp forOp) {
   if (!memRefTy || !vecTy || vecTy.getRank() != 2)
     return std::nullopt;
 
+  auto *baseDefOp = readOp.getBase().getDefiningOp();
+  if (baseDefOp && baseDefOp->getParentRegion() == &forOp.getRegion()) {
+    auto extractMR = dyn_cast<triton::cpu::ExtractMemRefOp>(baseDefOp);
+    if (!extractMR)
+      return std::nullopt;
+
+    auto blockPtrArg = dyn_cast<BlockArgument>(extractMR.getSrc());
+    if (!blockPtrArg || blockPtrArg.getOwner() != forOp.getBody() ||
+        blockPtrArg.getArgNumber() == 0)
+      return std::nullopt;
+    unsigned iterArgIdx = blockPtrArg.getArgNumber() - 1;
+    if (iterArgIdx >= forOp.getRegionIterArgs().size())
+      return std::nullopt;
+
+    OpOperand *yielded = forOp.getTiedLoopYieldedValue(blockPtrArg);
+    if (!yielded)
+      return std::nullopt;
+
+    auto advance = yielded->get().getDefiningOp<triton::AdvanceOp>();
+    if (!advance || advance.getPtr() != blockPtrArg)
+      return std::nullopt;
+
+    SmallVector<int64_t> strides;
+    if (!getStaticStrides(memRefTy, strides))
+      return std::nullopt;
+    auto offsets = advance.getOffsets();
+    if (offsets.size() != strides.size())
+      return std::nullopt;
+
+    unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+    int64_t stepElems = 0;
+    bool sawNonZero = false;
+    for (auto [offset, stride] : llvm::zip_equal(offsets, strides)) {
+      auto offsetValue = getConstantIntValue(offset);
+      if (!offsetValue)
+        return std::nullopt;
+      if (*offsetValue != 0)
+        sawNonZero = true;
+      stepElems += *offsetValue * stride;
+    }
+    if (!sawNonZero || stepElems <= 0)
+      return std::nullopt;
+    return stepElems * elemBytes;
+  }
+
   if (auto stepBytes = getLoopStepBytes(readOp, forOp,
                                         /*requireLoopIv=*/true)) {
     auto stepCst = getConstantIntValue(forOp.getStep());
@@ -3960,52 +4005,7 @@ getAttentionStreamStepBytes(vector::TransferReadOp readOp, scf::ForOp forOp) {
     return *stepBytes * *stepCst;
   }
 
-  BlockArgument blockPtrArg;
-  auto *baseDefOp = readOp.getBase().getDefiningOp();
-  if (!baseDefOp || baseDefOp->getParentRegion() != &forOp.getRegion())
-    return std::nullopt;
-
-  auto extractMR = dyn_cast<triton::cpu::ExtractMemRefOp>(baseDefOp);
-  if (!extractMR)
-    return std::nullopt;
-
-  auto arg = dyn_cast<BlockArgument>(extractMR.getSrc());
-  if (!arg || arg.getOwner() != forOp.getBody() || arg.getArgNumber() == 0)
-    return std::nullopt;
-  unsigned iterArgIdx = arg.getArgNumber() - 1;
-  if (iterArgIdx >= forOp.getRegionIterArgs().size())
-    return std::nullopt;
-  blockPtrArg = arg;
-
-  OpOperand *yielded = forOp.getTiedLoopYieldedValue(blockPtrArg);
-  if (!yielded)
-    return std::nullopt;
-
-  auto advance = yielded->get().getDefiningOp<triton::AdvanceOp>();
-  if (!advance || advance.getPtr() != blockPtrArg)
-    return std::nullopt;
-
-  SmallVector<int64_t> strides;
-  if (!getStaticStrides(memRefTy, strides))
-    return std::nullopt;
-  auto offsets = advance.getOffsets();
-  if (offsets.size() != strides.size())
-    return std::nullopt;
-
-  unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
-  int64_t stepElems = 0;
-  bool sawNonZero = false;
-  for (auto [offset, stride] : llvm::zip_equal(offsets, strides)) {
-    auto offsetValue = getConstantIntValue(offset);
-    if (!offsetValue)
-      return std::nullopt;
-    if (*offsetValue != 0)
-      sawNonZero = true;
-    stepElems += *offsetValue * stride;
-  }
-  if (!sawNonZero || stepElems <= 0)
-    return std::nullopt;
-  return stepElems * elemBytes;
+  return std::nullopt;
 }
 
 static bool materializeAttentionQ(AttentionOuterQPlan &qPlan,

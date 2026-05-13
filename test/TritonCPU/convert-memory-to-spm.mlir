@@ -1,6 +1,7 @@
 // RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s
 // RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=NOREDUCE
 // RUN: env TRITON_SPM_ATTENTION_Q_RESIDENT=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=MULTI
+// RUN: env TRITON_SPM_ATTENTION_Q_RESIDENT=1 TRITON_SPM_ATTENTION_KV_STREAM=1 TRITON_SPM_ATTENTION_KV_STREAM_STAGE_Q=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=KV-STREAM
 // RUN: env TRITON_SPM_ATTENTION_QK_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=QK-TILE
 // RUN: env TRITON_SPM_ATTENTION_PV_GENERATED_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=PV-GEN
 
@@ -578,6 +579,95 @@ module {
 
     vector.transfer_write %result, %O[%c0, %c0]
         {in_bounds = [true, true]} : vector<16x32xf32>, memref<64x32xf32, strided<[32, 1], offset: 0>>
+    tt.return
+  }
+}
+
+// -----
+
+// ============================================================================
+// Test: attention-v2 K/V streaming with loop-carried tensor pointers.
+//       The next-tile DRAM step must come from tt.advance offsets rather than
+//       the transfer_read indices extracted from the current block pointer.
+// ============================================================================
+
+// KV-STREAM-LABEL: @attention_v2_blockptr_kv_stream_step
+// KV-STREAM:       triton_cpu.dma_enqueue_2d
+// KV-STREAM:       triton_cpu.dma_enqueue_2d
+// KV-STREAM:       scf.for
+// KV-STREAM:         triton_cpu.dma_wait
+// KV-STREAM:         scf.if
+// KV-STREAM:           arith.constant 1024 : i64
+// KV-STREAM:           arith.muli
+// KV-STREAM:           triton_cpu.dma_enqueue_2d
+// KV-STREAM:           arith.constant 1024 : i64
+// KV-STREAM:           arith.muli
+// KV-STREAM:           triton_cpu.dma_enqueue_2d
+// KV-STREAM:         vector.transfer_read {{.*}} memref<16x16xf32, strided<[1, 16]>, 3>
+// KV-STREAM:         vector.transfer_read {{.*}} memref<16x16xf32, strided<[16, 1]>, 3>
+
+module {
+  tt.func public @attention_v2_blockptr_kv_stream_step(
+      %Q: memref<16x16xf32, strided<[16, 1], offset: 0>>,
+      %K: !tt.ptr<f32>,
+      %V: !tt.ptr<f32>,
+      %O: memref<16x16xf32, strided<[16, 1], offset: 0>>) {
+    %c0 = arith.constant 0 : index
+    %cst = arith.constant 0.0 : f32
+    %c0_i32 = arith.constant 0 : i32
+    %c16_i32 = arith.constant 16 : i32
+    %c32_i32 = arith.constant 32 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %c16_i64 = arith.constant 16 : i64
+    %c32_i64 = arith.constant 32 : i64
+    %score_init = arith.constant dense<0.0> : vector<16x16xf32>
+    %acc_init = arith.constant dense<0.0> : vector<16x16xf32>
+
+    %q_tile = vector.transfer_read %Q[%c0, %c0], %cst
+        {in_bounds = [true, true]} : memref<16x16xf32, strided<[16, 1], offset: 0>>, vector<16x16xf32>
+    %k_ptr = tt.make_tensor_ptr %K, [%c16_i64, %c32_i64], [%c1_i64, %c16_i64], [%c0_i32, %c0_i32]
+        {order = array<i32: 1, 0>} : <tensor<16x16xf32>>
+    %v_ptr = tt.make_tensor_ptr %V, [%c32_i64, %c16_i64], [%c16_i64, %c1_i64], [%c0_i32, %c0_i32]
+        {order = array<i32: 1, 0>} : <tensor<16x16xf32>>
+
+    %result:3 = scf.for %n = %c0_i32 to %c32_i32 step %c16_i32
+        iter_args(%acc = %acc_init, %k_iter = %k_ptr, %v_iter = %v_ptr)
+        -> (vector<16x16xf32>, !tt.ptr<tensor<16x16xf32>>, !tt.ptr<tensor<16x16xf32>>) : i32 {
+      %k_mem = triton_cpu.extract_memref %k_iter
+          : <tensor<16x16xf32>> -> memref<16x32xf32, strided<[1, 16]>>
+      %k_idx:2 = triton_cpu.extract_indices %k_iter
+          : <tensor<16x16xf32>> -> index, index
+      %k_tile = vector.transfer_read %k_mem[%k_idx#0, %k_idx#1], %cst
+          {in_bounds = [true, true]} : memref<16x32xf32, strided<[1, 16]>>, vector<16x16xf32>
+      %v_mem = triton_cpu.extract_memref %v_iter
+          : <tensor<16x16xf32>> -> memref<32x16xf32, strided<[16, 1]>>
+      %v_idx:2 = triton_cpu.extract_indices %v_iter
+          : <tensor<16x16xf32>> -> index, index
+      %v_tile = vector.transfer_read %v_mem[%v_idx#0, %v_idx#1], %cst
+          {in_bounds = [true, true]} : memref<32x16xf32, strided<[16, 1]>>, vector<16x16xf32>
+
+      %scores = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %q_tile, %k_tile, %score_init : vector<16x16xf32>, vector<16x16xf32> into vector<16x16xf32>
+
+      %next = vector.contract {
+          indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                           affine_map<(d0, d1, d2) -> (d2, d1)>,
+                           affine_map<(d0, d1, d2) -> (d0, d1)>],
+          iterator_types = ["parallel", "parallel", "reduction"]
+      } %scores, %v_tile, %acc : vector<16x16xf32>, vector<16x16xf32> into vector<16x16xf32>
+
+      %k_next = tt.advance %k_iter, [%c0_i32, %c16_i32] : <tensor<16x16xf32>>
+      %v_next = tt.advance %v_iter, [%c16_i32, %c0_i32] : <tensor<16x16xf32>>
+      scf.yield %next, %k_next, %v_next
+          : vector<16x16xf32>, !tt.ptr<tensor<16x16xf32>>, !tt.ptr<tensor<16x16xf32>>
+    }
+
+    vector.transfer_write %result#0, %O[%c0, %c0]
+        {in_bounds = [true, true]} : vector<16x16xf32>, memref<16x16xf32, strided<[16, 1], offset: 0>>
     tt.return
   }
 }
