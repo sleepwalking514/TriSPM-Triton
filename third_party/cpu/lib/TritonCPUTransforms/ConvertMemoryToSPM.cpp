@@ -134,18 +134,6 @@ static bool getEnvBool(StringRef name, bool defaultValue = false) {
   return defaultValue;
 }
 
-static bool isStandaloneSoftmaxKernel() {
-  if (const char *kernel = std::getenv("TRITON_KERNEL_NAME"))
-    return StringRef(kernel) == "softmax";
-  return false;
-}
-
-static bool isStandaloneLayerNormKernel() {
-  if (const char *kernel = std::getenv("TRITON_KERNEL_NAME"))
-    return StringRef(kernel) == "layer_norm";
-  return false;
-}
-
 static bool hasEnv(StringRef name) {
   return std::getenv(name.str().c_str()) != nullptr;
 }
@@ -909,6 +897,7 @@ struct ReductionResidencyPlan {
   std::string benefit;
   SmallVector<std::string, 4> expectedMarkers;
   bool hasLowering = false;
+  bool autoSelected = false;
 };
 
 static bool isRowBlockDmaProducerPassMode(StringRef mode) {
@@ -916,17 +905,12 @@ static bool isRowBlockDmaProducerPassMode(StringRef mode) {
          mode == "row_block_dma_prefetch";
 }
 
-static std::string getDefaultRowResidentProducerPass(StringRef mode) {
-  if (isStandaloneLayerNormKernel() &&
-      !hasEnv("TRITON_SPM_ROW_RESIDENT_PRODUCER_PASS") &&
-      (mode.empty() || mode == "fill_on_first_pass" || mode == "first" ||
-       mode == "first_pass"))
-    return "row_block_dma";
-  return mode.str();
+static bool isAutoRowResidentProducerPassMode(StringRef mode) {
+  return mode.empty() || mode == "auto" || mode == "default";
 }
 
 static ReductionProducerPass parseReductionProducerPass(StringRef mode) {
-  if (mode.empty())
+  if (isAutoRowResidentProducerPassMode(mode))
     return ReductionProducerPass::FillOnFirstPass;
   if (mode == "fill_on_first_pass" || mode == "first" || mode == "first_pass")
     return ReductionProducerPass::FillOnFirstPass;
@@ -1404,7 +1388,7 @@ static void classifyContractionSchedule(SPMContractionReport &report) {
   report.reasonCode = "unsupported_pattern";
   report.reason =
       "contraction shape was reported, but the current SPM scheduler has no "
-      "matching standalone or generated-operand mode";
+      "matching vector-contraction lowering mode";
 }
 
 static void collectVectorContractionReports(FunctionOpInterface funcOp,
@@ -1691,12 +1675,17 @@ makeReductionResidencyRecord(const ReductionResidencyPlan &plan,
   } else if (plan.producerPass == ReductionProducerPass::DmaPrefetch) {
     if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
       record.reasonCode = "accepted_block_resident_fill_first";
-      record.reason =
-          plan.source == "Softmax x row block"
-              ? "accepted by the default Softmax row-block resident reduction "
-                "policy"
-              : "accepted by the default LayerNorm row-block resident "
-                "reduction policy";
+      if (plan.autoSelected) {
+        record.reason =
+            plan.source == "Softmax x row block"
+                ? "accepted by the matched Softmax row-block resident "
+                  "reduction policy"
+                : "accepted by the matched LayerNorm row-block resident "
+                  "reduction policy";
+      } else {
+        record.reason = "accepted by the opt-in row-block resident reduction "
+                        "policy";
+      }
     } else {
       record.reasonCode = "accepted_dma_prefetch_row_resident";
       record.reason = "accepted by the opt-in DMA-prefetch row-resident "
@@ -4693,7 +4682,7 @@ static bool transformReductionResidencyPlan(
     SPMPromotionReport *report,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
   bool useSoftmaxExpCache =
-      getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP", isStandaloneSoftmaxKernel()) &&
+      getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP", true) &&
       plan.bufferRole == ReductionBufferRole::ResidentRowBlock &&
       plan.source == "Softmax x row block";
   if (useSoftmaxExpCache) {
@@ -6444,30 +6433,14 @@ struct ConvertMemoryToSPM
         SPMPromotionReport *report = nullptr;
         if (promotionReport)
           report = &reports[funcOp.getOperation()];
-        std::string effectiveRowResidentProducerPass =
-            getDefaultRowResidentProducerPass(rowResidentProducerPass);
-        StringRef producerPassMode(effectiveRowResidentProducerPass);
+        StringRef producerPassMode(rowResidentProducerPass);
+        bool autoProducerPass =
+            isAutoRowResidentProducerPassMode(producerPassMode);
+        bool rowBlockProducerPass =
+            autoProducerPass || isRowBlockDmaProducerPassMode(producerPassMode);
 
-        if (isRowBlockDmaProducerPassMode(producerPassMode) &&
-            getEnvBool("TRITON_SPM_SOFTMAX_INTERNAL_ROW_BLOCK",
-                       isStandaloneSoftmaxKernel())) {
-          int64_t rowBlock =
-              getEnvInt64("TRITON_SPM_SOFTMAX_ROW_BLOCK",
-                          getEnvInt64("SOFTMAX_SPM_ROW_BLOCK", 2));
-          int64_t rowGroupBlocks =
-              getEnvInt64("TRITON_SPM_SOFTMAX_ROW_GROUP_BLOCKS",
-                          getEnvInt64("SOFTMAX_SPM_ROW_GROUP_BLOCKS", 8));
-          if (lowerCanonicalSoftmaxToRowBlockGroup(topLevelLoops, funcOp,
-                                                   rowBlock, rowGroupBlocks)) {
-            topLevelLoops.clear();
-            for (Operation &op : entryBlock) {
-              if (auto forOp = dyn_cast<scf::ForOp>(&op))
-                topLevelLoops.push_back(forOp);
-            }
-          }
-        } else if (isRowBlockDmaProducerPassMode(producerPassMode) &&
-                   getEnvBool("TRITON_SPM_LAYERNORM_INTERNAL_ROW_BLOCK",
-                              isStandaloneLayerNormKernel())) {
+        if (rowBlockProducerPass &&
+            getEnvBool("TRITON_SPM_LAYERNORM_INTERNAL_ROW_BLOCK", true)) {
           int64_t rowBlock = getEnvInt64("TRITON_SPM_LAYERNORM_ROW_BLOCK",
                                          getEnvInt64("SPM_ROW_BLOCK", 2));
           int64_t rowGroupBlocks =
@@ -6483,23 +6456,40 @@ struct ConvertMemoryToSPM
           }
         }
 
+        if (rowBlockProducerPass &&
+            getEnvBool("TRITON_SPM_SOFTMAX_INTERNAL_ROW_BLOCK", true)) {
+          int64_t rowBlock =
+              getEnvInt64("TRITON_SPM_SOFTMAX_ROW_BLOCK",
+                          getEnvInt64("SOFTMAX_SPM_ROW_BLOCK", 2));
+          int64_t rowGroupBlocks =
+              getEnvInt64("TRITON_SPM_SOFTMAX_ROW_GROUP_BLOCKS",
+                          getEnvInt64("SOFTMAX_SPM_ROW_GROUP_BLOCKS", 8));
+          if (lowerCanonicalSoftmaxToRowBlockGroup(topLevelLoops, funcOp,
+                                                   rowBlock, rowGroupBlocks)) {
+            topLevelLoops.clear();
+            for (Operation &op : entryBlock) {
+              if (auto forOp = dyn_cast<scf::ForOp>(&op))
+                topLevelLoops.push_back(forOp);
+            }
+          }
+        }
+
         std::string rejectReasonCode;
         std::string rejectReason;
         std::optional<ReductionResidencyPlan> plan;
-        if (isStandaloneLayerNormKernel()) {
+        if (rowBlockProducerPass) {
           plan = matchLayerNormRowBlockGroupResidencyPlan(
               topLevelLoops, funcOp, rejectReasonCode, rejectReason,
-              producerPassMode);
+              "row_block_dma");
+          if (plan && autoProducerPass)
+            plan->autoSelected = true;
         }
-        if (!plan) {
+        if (!plan && rowBlockProducerPass) {
           plan = matchSoftmaxRowBlockGroupResidencyPlan(
               topLevelLoops, funcOp, rejectReasonCode, rejectReason,
-              producerPassMode);
-        }
-        if (!plan && !isStandaloneLayerNormKernel()) {
-          plan = matchLayerNormRowBlockGroupResidencyPlan(
-              topLevelLoops, funcOp, rejectReasonCode, rejectReason,
-              producerPassMode);
+              "row_block_dma");
+          if (plan && autoProducerPass)
+            plan->autoSelected = true;
         }
         if (!plan) {
           plan = matchLayerNormResidencyPlan(topLevelLoops, funcOp,
