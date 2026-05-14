@@ -27,6 +27,13 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return int(value, 0)
+
+
 def min_dot_size(target: GPUTarget):
     # Other architectures will only support 16,16,16
     return lambda lhsType, rhsType: (4, 4, 4)
@@ -232,19 +239,25 @@ class CPUBackend(BaseBackend):
                 spm_size = int(os.getenv("TRITON_SPM_SIZE", "262144"), 0)
                 micro_m = int(os.getenv("TRITON_MICRO_M", "8"), 0)
                 window_k = int(os.getenv("TRITON_SPM_WINDOW_K", "8"), 0)
+                kernel_hint = os.getenv("TRITON_KERNEL_NAME", "")
+                softmax_default_spm = kernel_hint == "softmax"
                 enable_reductions = (
                     os.getenv("TRITON_ENABLE_SPM_REDUCTIONS", "0") == "1"
                 )
                 enable_row_resident_reductions = env_bool(
-                    "TRITON_ENABLE_SPM_ROW_RESIDENT_REDUCTIONS", False)
-                row_resident_max_bytes = int(
-                    os.getenv("TRITON_SPM_ROW_RESIDENT_MAX_BYTES", "4096"), 0)
+                    "TRITON_ENABLE_SPM_ROW_RESIDENT_REDUCTIONS",
+                    softmax_default_spm)
+                row_resident_max_bytes = env_int(
+                    "TRITON_SPM_ROW_RESIDENT_MAX_BYTES",
+                    65536 if softmax_default_spm else 4096)
                 row_resident_producer_pass = os.getenv(
                     "TRITON_SPM_ROW_RESIDENT_PRODUCER_PASS",
-                    "fill_on_first_pass")
+                    "row_block_dma" if softmax_default_spm else "fill_on_first_pass")
                 enable_promotion_profitability = env_bool(
-                    "TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY", False)
-                promotion_report = env_bool("TRITON_SPM_PROMOTION_REPORT", False)
+                    "TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY",
+                    softmax_default_spm)
+                promotion_report = env_bool(
+                    "TRITON_SPM_PROMOTION_REPORT", softmax_default_spm)
                 cpu.passes.ttcpuir.add_spm_tensor_placement(
                     pm, enable_reductions
                     and not enable_row_resident_reductions
@@ -256,7 +269,6 @@ class CPUBackend(BaseBackend):
                     enable_promotion_profitability,
                     promotion_report)
 
-                kernel_hint = os.getenv("TRITON_KERNEL_NAME", "")
                 enable_split_large_contract = env_bool(
                     "TRITON_ENABLE_SPM_SPLIT_LARGE_CONTRACT",
                     kernel_hint != "flash_attention")

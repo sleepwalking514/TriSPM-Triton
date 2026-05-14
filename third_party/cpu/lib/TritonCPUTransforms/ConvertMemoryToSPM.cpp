@@ -134,6 +134,12 @@ static bool getEnvBool(StringRef name, bool defaultValue = false) {
   return defaultValue;
 }
 
+static bool isStandaloneSoftmaxKernel() {
+  if (const char *kernel = std::getenv("TRITON_KERNEL_NAME"))
+    return StringRef(kernel) == "softmax";
+  return false;
+}
+
 static std::optional<bool> getEnvBoolOverride(StringRef name) {
   if (std::getenv(name.str().c_str()))
     return getEnvBool(name);
@@ -1611,7 +1617,7 @@ makeReductionResidencyRecord(const ReductionResidencyPlan &plan,
     if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
       record.reasonCode = "accepted_block_resident_fill_first";
       record.reason =
-          "accepted by the opt-in row-block resident reduction prototype";
+          "accepted by the default Softmax row-block resident reduction policy";
     } else {
       record.reasonCode = "accepted_dma_prefetch_row_resident";
       record.reason = "accepted by the opt-in DMA-prefetch row-resident "
@@ -3634,7 +3640,8 @@ static bool transformReductionResidencyPlan(
     SPMPromotionReport *report,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
   bool useSoftmaxExpCache =
-      getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP", false) &&
+      getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP",
+                 isStandaloneSoftmaxKernel()) &&
       plan.bufferRole == ReductionBufferRole::ResidentRowBlock &&
       plan.source == "Softmax x row block";
   if (useSoftmaxExpCache) {
@@ -5350,7 +5357,8 @@ struct ConvertMemoryToSPM
           report = &reports[funcOp.getOperation()];
 
         if (isRowBlockDmaProducerPassMode(rowResidentProducerPass) &&
-            getEnvBool("TRITON_SPM_SOFTMAX_INTERNAL_ROW_BLOCK", false)) {
+            getEnvBool("TRITON_SPM_SOFTMAX_INTERNAL_ROW_BLOCK",
+                       isStandaloneSoftmaxKernel())) {
           int64_t rowBlock =
               getEnvInt64("TRITON_SPM_SOFTMAX_ROW_BLOCK",
                           getEnvInt64("SOFTMAX_SPM_ROW_BLOCK", 2));
