@@ -451,6 +451,10 @@ def make_aot_launcher(constants, signature, ids, kernel_name):
         "1" if flash_head_resident_v_env is not None and
         flash_head_resident_v_env != "0" else "0"
     )
+    flash_head_resident_chunk_rows = int(
+        os.getenv("TRITON_SPM_FLASH_HEAD_RESIDENT_CHUNK_ROWS", "128"), 0)
+    if flash_head_resident_chunk_rows <= 0:
+        flash_head_resident_chunk_rows = 1
 
     def _alloc_case(arg_index, tier):
         if tier == 1:
@@ -535,9 +539,11 @@ static inline void {kernel_name}_head_dma_wait(void)
             {kernel_name}_arg_bytes[0] / ((size_t)gridX * (size_t)gridY);
         size_t row_bytes = q_tile_bytes / 16;
         size_t seq_rows = row_bytes != 0 ? head_bytes / row_bytes : 0;
+        size_t head_dma_chunk_rows = (size_t){flash_head_resident_chunk_rows};
 
         if (head_bytes >= 8192 && gridX >= 2 &&
-            row_bytes != 0 && seq_rows != 0 && row_bytes * seq_rows == head_bytes) {{
+            row_bytes != 0 && seq_rows != 0 && head_dma_chunk_rows != 0 &&
+            row_bytes * seq_rows == head_bytes) {{
             int resident_k = {flash_head_resident_k};
             int resident_v = {flash_head_resident_v};
             uintptr_t spm_base = (uintptr_t)SPM_BASE;
@@ -560,17 +566,26 @@ static inline void {kernel_name}_head_dma_wait(void)
                 for (int32_t z = 0; z < gridZ; ++z) {{
                     for (int32_t y = 0; y < gridY; ++y) {{
                         size_t head_offset = (size_t)y * head_bytes;
-                        if (resident_k)
-                            {kernel_name}_head_dma_enqueue_2d(
-                                (void *)k_spm,
-                                (const void *)((const char *)arg1 + head_offset),
-                                row_bytes, seq_rows, row_bytes, row_bytes);
-                        if (resident_v)
-                            {kernel_name}_head_dma_enqueue_2d(
-                                (void *)v_spm,
-                                (const void *)((const char *)arg2 + head_offset),
-                                row_bytes, seq_rows, row_bytes, row_bytes);
-                        {kernel_name}_head_dma_wait();
+                        for (size_t row = 0; row < seq_rows;
+                             row += head_dma_chunk_rows) {{
+                            size_t rows = seq_rows - row;
+                            if (rows > head_dma_chunk_rows)
+                                rows = head_dma_chunk_rows;
+                            size_t byte_offset = row * row_bytes;
+                            if (resident_k)
+                                {kernel_name}_head_dma_enqueue_2d(
+                                    (void *)(k_spm + byte_offset),
+                                    (const void *)((const char *)arg1 +
+                                                   head_offset + byte_offset),
+                                    row_bytes, rows, row_bytes, row_bytes);
+                            if (resident_v)
+                                {kernel_name}_head_dma_enqueue_2d(
+                                    (void *)(v_spm + byte_offset),
+                                    (const void *)((const char *)arg2 +
+                                                   head_offset + byte_offset),
+                                    row_bytes, rows, row_bytes, row_bytes);
+                            {kernel_name}_head_dma_wait();
+                        }}
 
                         void *k_arg = resident_k ? (void *)(k_spm - head_offset) : arg1;
                         void *v_arg = resident_v ? (void *)(v_spm - head_offset) : arg2;
