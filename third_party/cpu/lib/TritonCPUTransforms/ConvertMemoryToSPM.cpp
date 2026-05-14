@@ -766,6 +766,10 @@ static SmallVector<TiledLoadInfo> findTiledLoads(scf::ForOp forOp) {
 
 enum class ReductionProducerPass {
   FillOnFirstPass,
+  // Experimental LayerNorm-centered cache. It is correct, but current 128x512
+  // and 512x1024 measurements lose to cache because the SPM read/write traffic
+  // replaces a cache-hot final x read. Keep opt-in for negative evidence only.
+  DerivedValueCache,
   // Ablation/coverage-only: measured weaker than fill-on-first-pass and
   // rejected by the P3 profitability model. Keep for negative evidence, not
   // as a recommended schedule.
@@ -800,6 +804,8 @@ static StringRef stringifyProducerPass(ReductionProducerPass pass) {
   switch (pass) {
   case ReductionProducerPass::FillOnFirstPass:
     return "fill_on_first_pass";
+  case ReductionProducerPass::DerivedValueCache:
+    return "derived_value_cache";
   case ReductionProducerPass::ProducerStore:
     return "producer_store";
   case ReductionProducerPass::DmaPrefetch:
@@ -890,6 +896,9 @@ static ReductionProducerPass parseReductionProducerPass(StringRef mode) {
     return ReductionProducerPass::FillOnFirstPass;
   if (mode == "fill_on_first_pass" || mode == "first" || mode == "first_pass")
     return ReductionProducerPass::FillOnFirstPass;
+  if (mode == "derived_value_cache" || mode == "derived" ||
+      mode == "layernorm_centered")
+    return ReductionProducerPass::DerivedValueCache;
   if (mode == "producer_store" || mode == "second" || mode == "second_pass" ||
       mode == "consumer_store")
     return ReductionProducerPass::ProducerStore;
@@ -906,6 +915,18 @@ static void applyConfiguredProducerPass(ReductionResidencyPlan &plan,
       parseReductionProducerPass(producerPassMode);
   if (producerPass == ReductionProducerPass::FillOnFirstPass)
     return;
+
+  if (producerPass == ReductionProducerPass::DerivedValueCache) {
+    plan.producerPass = ReductionProducerPass::DerivedValueCache;
+    plan.copyIn = "CPU/vector store of derived per-element value";
+    plan.copyOut = "none";
+    plan.overhead =
+        "a later reduction pass writes a derived per-element value into SPM";
+    plan.benefit =
+        "the final pass reuses the derived value instead of rereading and "
+        "recomputing it";
+    return;
+  }
 
   if (producerPass == ReductionProducerPass::ProducerStore) {
     // Historical ablation path. This materializes the row from the first
@@ -1628,6 +1649,11 @@ makeReductionResidencyRecord(const ReductionResidencyPlan &plan,
     record.reason =
         "accepted by the opt-in producer-store row-resident reduction "
         "prototype";
+  } else if (plan.producerPass == ReductionProducerPass::DerivedValueCache) {
+    record.reasonCode = "accepted_derived_value_cache_row_resident";
+    record.reason =
+        "accepted by the opt-in derived-value row-resident reduction "
+        "prototype";
   } else if (plan.producerPass == ReductionProducerPass::DmaPrefetch) {
     if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
       record.reasonCode = "accepted_block_resident_fill_first";
@@ -2034,7 +2060,22 @@ static std::optional<ReductionResidencyPlan> matchLayerNormResidencyPlan(
     plan.expectedMarkers.push_back("no_dma_descriptors");
     plan.expectedMarkers.push_back("no_fence_iorw");
     plan.hasLowering = true;
-    applyConfiguredProducerPass(plan, producerPassMode);
+    // Opt-in experimental variant: cache x - mean from the variance loop and
+    // reuse it during normalize. This mirrors softmax's derived-value idea, but
+    // is not profitable for the current LayerNorm shape/model and must not be
+    // enabled by default.
+    if (getEnvBool("TRITON_SPM_LAYERNORM_CACHE_CENTERED", false) &&
+        parseReductionProducerPass(producerPassMode) ==
+            ReductionProducerPass::FillOnFirstPass) {
+      applyConfiguredProducerPass(plan, "layernorm_centered");
+      plan.overhead =
+          "variance pass writes x - mean into SPM; no DMA wait";
+      plan.benefit =
+          "normalize reuses x - mean from SPM instead of rereading x and "
+          "recomputing the centered value";
+    } else {
+      applyConfiguredProducerPass(plan, producerPassMode);
+    }
     return plan;
   }
 
@@ -2789,6 +2830,153 @@ static scf::ForOp cloneLoopWithRowResidentX(ReductionLoopResidencyUse loopInfo,
       Value spmVal = emitSpmReadWithStrides(
           b, loc, xSpmAddr, loopInfo.xLoad.vecTy, spmMemStrides);
       mapping.map(xRead.getResult(), spmVal);
+      continue;
+    }
+
+    b.clone(op, mapping);
+  }
+
+  auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
+  SmallVector<Value> yieldVals;
+  for (Value val : oldYield.getOperands())
+    yieldVals.push_back(mapping.lookupOrDefault(val));
+  scf::YieldOp::create(b, loc, yieldVals);
+
+  for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+    forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
+  forOp.erase();
+
+  return newForOp;
+}
+
+static arith::SubFOp findSubOfXInLoop(scf::ForOp forOp,
+                                      vector::TransferReadOp xRead) {
+  arith::SubFOp found;
+  forOp.getBody()->walk([&](arith::SubFOp subOp) {
+    if (subOp.getLhs() != xRead.getResult())
+      return WalkResult::advance();
+    found = subOp;
+    return WalkResult::interrupt();
+  });
+  return found;
+}
+
+static scf::ForOp cloneLoopWritingDerivedX(ReductionLoopResidencyUse loopInfo,
+                                           int64_t valueSpmAddress,
+                                           unsigned elemBytes) {
+  scf::ForOp forOp = loopInfo.forOp;
+  vector::TransferReadOp xRead = loopInfo.xLoad.readOp;
+  arith::SubFOp derivedOp = findSubOfXInLoop(forOp, xRead);
+  if (!derivedOp)
+    return nullptr;
+
+  Location loc = forOp.getLoc();
+  OpBuilder b(forOp);
+  SmallVector<int64_t, 2> spmMemStrides =
+      getDefaultSpmMemStrides(loopInfo.xLoad.vecTy);
+  int64_t spmStepBytes = elemBytes;
+
+  auto newForOp =
+      scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                         forOp.getStep(), forOp.getInitArgs());
+
+  Block *newBody = newForOp.getBody();
+  Block *oldBody = forOp.getBody();
+
+  IRMapping mapping;
+  mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  for (auto [oldArg, newArg] :
+       llvm::zip_equal(forOp.getRegionIterArgs(), newForOp.getRegionIterArgs()))
+    mapping.map(oldArg, newArg);
+
+  if (!newBody->empty() && newBody->mightHaveTerminator())
+    newBody->getTerminator()->erase();
+  b.setInsertionPointToStart(newBody);
+
+  Value elemOffset =
+      arith::SubIOp::create(b, loc, toI64(b, loc, newForOp.getInductionVar()),
+                            toI64(b, loc, newForOp.getLowerBound()));
+  Value byteOffset =
+      arith::MulIOp::create(b, loc, elemOffset, i64Cst(b, loc, spmStepBytes));
+  Value valueSpmAddr = arith::AddIOp::create(
+      b, loc, i64Cst(b, loc, valueSpmAddress), byteOffset);
+
+  for (auto &op : oldBody->getOperations()) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+
+    Operation *cloned = b.clone(op, mapping);
+    if (&op == derivedOp.getOperation()) {
+      emitSpmWriteWithStrides(b, loc, valueSpmAddr, cloned->getResult(0),
+                              spmMemStrides);
+    }
+  }
+
+  auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
+  SmallVector<Value> yieldVals;
+  for (Value val : oldYield.getOperands())
+    yieldVals.push_back(mapping.lookupOrDefault(val));
+  scf::YieldOp::create(b, loc, yieldVals);
+
+  for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+    forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
+  forOp.erase();
+
+  return newForOp;
+}
+
+static scf::ForOp cloneLoopReadingDerivedX(ReductionLoopResidencyUse loopInfo,
+                                           int64_t valueSpmAddress,
+                                           unsigned elemBytes) {
+  scf::ForOp forOp = loopInfo.forOp;
+  vector::TransferReadOp xRead = loopInfo.xLoad.readOp;
+  arith::SubFOp derivedOp = findSubOfXInLoop(forOp, xRead);
+  if (!derivedOp)
+    return nullptr;
+
+  Location loc = forOp.getLoc();
+  OpBuilder b(forOp);
+  SmallVector<int64_t, 2> spmMemStrides =
+      getDefaultSpmMemStrides(loopInfo.xLoad.vecTy);
+  int64_t spmStepBytes = elemBytes;
+
+  auto newForOp =
+      scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                         forOp.getStep(), forOp.getInitArgs());
+
+  Block *newBody = newForOp.getBody();
+  Block *oldBody = forOp.getBody();
+
+  IRMapping mapping;
+  mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  for (auto [oldArg, newArg] :
+       llvm::zip_equal(forOp.getRegionIterArgs(), newForOp.getRegionIterArgs()))
+    mapping.map(oldArg, newArg);
+
+  if (!newBody->empty() && newBody->mightHaveTerminator())
+    newBody->getTerminator()->erase();
+  b.setInsertionPointToStart(newBody);
+
+  Value elemOffset =
+      arith::SubIOp::create(b, loc, toI64(b, loc, newForOp.getInductionVar()),
+                            toI64(b, loc, newForOp.getLowerBound()));
+  Value byteOffset =
+      arith::MulIOp::create(b, loc, elemOffset, i64Cst(b, loc, spmStepBytes));
+  Value valueSpmAddr = arith::AddIOp::create(
+      b, loc, i64Cst(b, loc, valueSpmAddress), byteOffset);
+
+  for (auto &op : oldBody->getOperations()) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+
+    if (&op == xRead.getOperation()) {
+      continue;
+    }
+
+    if (&op == derivedOp.getOperation()) {
+      Value derivedVal = emitSpmReadWithStrides(
+          b, loc, valueSpmAddr, loopInfo.xLoad.vecTy, spmMemStrides);
+      mapping.map(derivedOp.getResult(), derivedVal);
       continue;
     }
 
@@ -3742,6 +3930,35 @@ static bool transformReductionResidencyPlan(
           cloneLoopWithRowResidentX(consumer, allocRow->address, plan.elemBytes,
                                     /*fillSpmFromOriginalRead=*/false);
       rowResidentHandledLoops.insert(newConsumer.getOperation());
+    }
+  } else if (plan.producerPass == ReductionProducerPass::DerivedValueCache) {
+    if (plan.consumers.size() < 2)
+      return reject("unsupported_pattern",
+                    "derived-value row residency needs materializer and "
+                    "consumer loops");
+    rowResidentHandledLoops.insert(plan.producer.forOp.getOperation());
+    scf::ForOp newMaterializer =
+        cloneLoopWritingDerivedX(plan.consumers[0], allocRow->address,
+                                 plan.elemBytes);
+    if (!newMaterializer)
+      return reject("unsupported_reduction_residency_plan",
+                    "derived-value materializer loop did not contain a "
+                    "supported x-derived value");
+    rowResidentHandledLoops.insert(newMaterializer.getOperation());
+    scf::ForOp newConsumer =
+        cloneLoopReadingDerivedX(plan.consumers[1], allocRow->address,
+                                 plan.elemBytes);
+    if (!newConsumer)
+      return reject("unsupported_reduction_residency_plan",
+                    "derived-value consumer loop did not contain a supported "
+                    "x-derived value");
+    rowResidentHandledLoops.insert(newConsumer.getOperation());
+    for (const ReductionLoopResidencyUse &consumer :
+         ArrayRef<ReductionLoopResidencyUse>(plan.consumers).drop_front(2)) {
+      scf::ForOp extraConsumer =
+          cloneLoopWithRowResidentX(consumer, allocRow->address, plan.elemBytes,
+                                    /*fillSpmFromOriginalRead=*/false);
+      rowResidentHandledLoops.insert(extraConsumer.getOperation());
     }
   } else if (plan.producerPass == ReductionProducerPass::ProducerStore) {
     if (plan.consumers.empty())
