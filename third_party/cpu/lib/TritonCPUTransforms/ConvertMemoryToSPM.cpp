@@ -140,8 +140,18 @@ static bool isStandaloneSoftmaxKernel() {
   return false;
 }
 
+static bool isStandaloneLayerNormKernel() {
+  if (const char *kernel = std::getenv("TRITON_KERNEL_NAME"))
+    return StringRef(kernel) == "layer_norm";
+  return false;
+}
+
+static bool hasEnv(StringRef name) {
+  return std::getenv(name.str().c_str()) != nullptr;
+}
+
 static std::optional<bool> getEnvBoolOverride(StringRef name) {
-  if (std::getenv(name.str().c_str()))
+  if (hasEnv(name))
     return getEnvBool(name);
   return std::nullopt;
 }
@@ -259,6 +269,21 @@ static Value toI64(OpBuilder &b, Location loc, Value val) {
   if (ty.isIndex())
     return arith::IndexCastOp::create(b, loc, b.getI64Type(), val);
   return arith::ExtSIOp::create(b, loc, b.getI64Type(), val);
+}
+
+static Value toI32(OpBuilder &b, Location loc, Value val) {
+  Type ty = val.getType();
+  if (ty.isInteger(32))
+    return val;
+  if (ty.isIndex())
+    return arith::IndexCastOp::create(b, loc, b.getI32Type(), val);
+  if (auto intTy = dyn_cast<IntegerType>(ty)) {
+    if (intTy.getWidth() < 32)
+      return arith::ExtSIOp::create(b, loc, b.getI32Type(), val);
+    if (intTy.getWidth() > 32)
+      return arith::TruncIOp::create(b, loc, b.getI32Type(), val);
+  }
+  return {};
 }
 
 /// Byte size of a vector tile.
@@ -889,6 +914,15 @@ struct ReductionResidencyPlan {
 static bool isRowBlockDmaProducerPassMode(StringRef mode) {
   return mode == "row_block_dma" || mode == "dma_row_block" ||
          mode == "row_block_dma_prefetch";
+}
+
+static std::string getDefaultRowResidentProducerPass(StringRef mode) {
+  if (isStandaloneLayerNormKernel() &&
+      !hasEnv("TRITON_SPM_ROW_RESIDENT_PRODUCER_PASS") &&
+      (mode.empty() || mode == "fill_on_first_pass" || mode == "first" ||
+       mode == "first_pass"))
+    return "row_block_dma";
+  return mode.str();
 }
 
 static ReductionProducerPass parseReductionProducerPass(StringRef mode) {
@@ -1658,7 +1692,11 @@ makeReductionResidencyRecord(const ReductionResidencyPlan &plan,
     if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
       record.reasonCode = "accepted_block_resident_fill_first";
       record.reason =
-          "accepted by the default Softmax row-block resident reduction policy";
+          plan.source == "Softmax x row block"
+              ? "accepted by the default Softmax row-block resident reduction "
+                "policy"
+              : "accepted by the default LayerNorm row-block resident "
+                "reduction policy";
     } else {
       record.reasonCode = "accepted_dma_prefetch_row_resident";
       record.reason = "accepted by the opt-in DMA-prefetch row-resident "
@@ -1931,9 +1969,8 @@ static bool isSupportedRowResidentXLoad(TiledLoadInfo load, scf::ForOp forOp,
          canComputePrologueDramAddr(load.readOp, forOp);
 }
 
-static bool isSupportedSoftmaxRowBlockXLoad(TiledLoadInfo load,
-                                            scf::ForOp forOp,
-                                            unsigned &elemBytes) {
+static bool isSupportedRowBlockXLoad(TiledLoadInfo load, scf::ForOp forOp,
+                                     unsigned &elemBytes) {
   vector::TransferReadOp readOp = load.readOp;
   auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
   if (!memRefTy || load.vecTy.getRank() != 2 || memRefTy.getRank() != 2 ||
@@ -1953,6 +1990,18 @@ static bool isSupportedSoftmaxRowBlockXLoad(TiledLoadInfo load,
   elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
   return stepBytes && *stepBytes == static_cast<int64_t>(elemBytes) &&
          canComputePrologueDramAddr(readOp, forOp);
+}
+
+static bool isSupportedSoftmaxRowBlockXLoad(TiledLoadInfo load,
+                                            scf::ForOp forOp,
+                                            unsigned &elemBytes) {
+  return isSupportedRowBlockXLoad(load, forOp, elemBytes);
+}
+
+static bool isSupportedLayerNormRowBlockXLoad(TiledLoadInfo load,
+                                              scf::ForOp forOp,
+                                              unsigned &elemBytes) {
+  return isSupportedRowBlockXLoad(load, forOp, elemBytes);
 }
 
 static std::optional<ReductionResidencyPlan> matchLayerNormResidencyPlan(
@@ -1996,17 +2045,32 @@ static std::optional<ReductionResidencyPlan> matchLayerNormResidencyPlan(
     if (!normXLoad)
       continue;
 
+    bool rowBlockPlan = isRowBlockDmaProducerPassMode(producerPassMode);
     unsigned elemBytes = 0;
     unsigned elemBytesVar = 0;
     unsigned elemBytesNorm = 0;
-    if (!isSupportedRowResidentXLoad(meanLoads[0], meanLoop, elemBytes) ||
-        !isSupportedRowResidentXLoad(varLoads[0], varLoop, elemBytesVar) ||
-        !isSupportedRowResidentXLoad(*normXLoad, normLoop, elemBytesNorm) ||
-        elemBytes != elemBytesVar || elemBytes != elemBytesNorm) {
+    bool supportedLoads =
+        rowBlockPlan
+            ? (isSupportedLayerNormRowBlockXLoad(meanLoads[0], meanLoop,
+                                                 elemBytes) &&
+               isSupportedLayerNormRowBlockXLoad(varLoads[0], varLoop,
+                                                 elemBytesVar) &&
+               isSupportedLayerNormRowBlockXLoad(*normXLoad, normLoop,
+                                                 elemBytesNorm))
+            : (isSupportedRowResidentXLoad(meanLoads[0], meanLoop, elemBytes) &&
+               isSupportedRowResidentXLoad(varLoads[0], varLoop,
+                                           elemBytesVar) &&
+               isSupportedRowResidentXLoad(*normXLoad, normLoop,
+                                           elemBytesNorm));
+    if (!supportedLoads || elemBytes != elemBytesVar ||
+        elemBytes != elemBytesNorm) {
       rejectReasonCode = "unsupported_pattern";
-      rejectReason =
-          "candidate requires rank-1 contiguous fp32 x loads with static "
-          "BLOCK_N-sized loop steps";
+      rejectReason = rowBlockPlan
+                         ? "row-block DMA candidate requires rank-2 "
+                           "col-major fp32 x tiles with static "
+                           "BLOCK_N-sized column steps"
+                         : "candidate requires rank-1 contiguous fp32 x "
+                           "loads with static BLOCK_N-sized loop steps";
       return std::nullopt;
     }
 
@@ -2030,7 +2094,7 @@ static std::optional<ReductionResidencyPlan> matchLayerNormResidencyPlan(
     int64_t rowBytes = trips * meanLoads[0].tileBytes;
     int64_t rowElements = trips * meanLoads[0].vecTy.getNumElements();
     ReductionResidencyPlan plan;
-    plan.source = "LayerNorm x row";
+    plan.source = rowBlockPlan ? "LayerNorm x row block" : "LayerNorm x row";
     plan.sourceArg = meanArg;
     plan.producer = ReductionLoopResidencyUse{"mean", meanLoop, meanLoads[0]};
     plan.consumers.push_back(
@@ -2040,7 +2104,13 @@ static std::optional<ReductionResidencyPlan> matchLayerNormResidencyPlan(
     plan.loops.push_back(meanLoop);
     plan.loops.push_back(varLoop);
     plan.loops.push_back(normLoop);
-    plan.shape.push_back(rowElements);
+    if (rowBlockPlan) {
+      plan.scope = "program-row-block";
+      plan.shape.push_back(trips * meanLoads[0].vecTy.getShape()[0]);
+      plan.shape.push_back(meanLoads[0].vecTy.getShape()[1]);
+    } else {
+      plan.shape.push_back(rowElements);
+    }
     plan.trips = trips;
     plan.bytes = rowBytes;
     plan.elemBytes = elemBytes;
@@ -2068,8 +2138,7 @@ static std::optional<ReductionResidencyPlan> matchLayerNormResidencyPlan(
         parseReductionProducerPass(producerPassMode) ==
             ReductionProducerPass::FillOnFirstPass) {
       applyConfiguredProducerPass(plan, "layernorm_centered");
-      plan.overhead =
-          "variance pass writes x - mean into SPM; no DMA wait";
+      plan.overhead = "variance pass writes x - mean into SPM; no DMA wait";
       plan.benefit =
           "normalize reuses x - mean from SPM instead of rereading x and "
           "recomputing the centered value";
@@ -2250,6 +2319,15 @@ static Value constantVector(OpBuilder &b, Location loc, VectorType ty,
                                    DenseElementsAttr::get(ty, elemAttr));
 }
 
+static Value constantScalarFloat(OpBuilder &b, Location loc, Type elemTy,
+                                 double value) {
+  auto floatTy = dyn_cast<FloatType>(elemTy);
+  if (!floatTy)
+    return {};
+  return arith::ConstantOp::create(b, loc, elemTy,
+                                   b.getFloatAttr(floatTy, value));
+}
+
 static triton::MakeTensorPtrOp findLoopInitMakeTensorPtr(scf::ForOp forOp) {
   if (forOp.getInitArgs().empty())
     return {};
@@ -2260,6 +2338,12 @@ static std::optional<int64_t> firstStaticDim(ValueRange values) {
   if (values.empty())
     return std::nullopt;
   return getConstantIntValue(values.front());
+}
+
+static std::optional<int64_t> staticDim(ValueRange values, unsigned index) {
+  if (index >= values.size())
+    return std::nullopt;
+  return getConstantIntValue(values[index]);
 }
 
 static Value emitTensorPtrTransferRead(OpBuilder &b, Location loc,
@@ -2324,9 +2408,33 @@ static Value emitLeadingDimReduction(OpBuilder &b, Location loc, Value input,
   return result;
 }
 
+static Value splatVectorAcrossTrailingDim(OpBuilder &b, Location loc,
+                                          Value input, VectorType dstTy) {
+  auto srcTy = dyn_cast<VectorType>(input.getType());
+  if (!srcTy || srcTy.getRank() != 1 || dstTy.getRank() != 2 ||
+      srcTy.getShape()[0] != dstTy.getShape()[0])
+    return {};
+
+  Value result = constantVector(b, loc, dstTy, 0.0);
+  for (int64_t col = 0; col < dstTy.getShape()[0]; ++col) {
+    Value elem = vector::ExtractOp::create(b, loc, input, col);
+    for (int64_t row = 0; row < dstTy.getShape()[1]; ++row)
+      result = vector::InsertOp::create(b, loc, elem, result,
+                                        ArrayRef<int64_t>{col, row});
+  }
+  return result;
+}
+
 static Value emitTensorPtrAdvance(OpBuilder &b, Location loc, Value ptr,
                                   Value colStep, Value rowStep) {
   SmallVector<Value, 2> offsets{colStep, rowStep};
+  return triton::AdvanceOp::create(b, loc, ptr.getType(), ptr, offsets)
+      .getResult();
+}
+
+static Value emitTensorPtrAdvance1D(OpBuilder &b, Location loc, Value ptr,
+                                    Value step) {
+  SmallVector<Value, 1> offsets{step};
   return triton::AdvanceOp::create(b, loc, ptr.getType(), ptr, offsets)
       .getResult();
 }
@@ -2559,6 +2667,261 @@ static void rejectUnsupportedRowBlockGroup(std::string &rejectReasonCode,
       "containing max/sum/normalize Softmax loops";
 }
 
+static bool lowerCanonicalLayerNormToRowBlockGroup(
+    ArrayRef<scf::ForOp> topLevelLoops, FunctionOpInterface funcOp,
+    int64_t rowBlock, int64_t rowGroupBlocks) {
+  if (rowBlock <= 1 || rowGroupBlocks <= 0 || topLevelLoops.size() < 3)
+    return false;
+
+  std::string rejectCode;
+  std::string rejectReason;
+  auto plan = matchLayerNormResidencyPlan(topLevelLoops, funcOp, rejectCode,
+                                          rejectReason,
+                                          /*producerPassMode=*/"");
+  if (!plan || plan->producer.xLoad.vecTy.getRank() != 1 ||
+      plan->consumers.size() < 2)
+    return false;
+
+  scf::ForOp meanLoop = plan->producer.forOp;
+  scf::ForOp varLoop = plan->consumers[0].forOp;
+  scf::ForOp normLoop = plan->consumers[1].forOp;
+  if (meanLoop->getBlock() != varLoop->getBlock() ||
+      meanLoop->getBlock() != normLoop->getBlock())
+    return false;
+
+  auto xMakeTensorPtr = findLoopInitMakeTensorPtr(meanLoop);
+  if (!xMakeTensorPtr)
+    return false;
+  auto gammaMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 2
+          ? normLoop.getInitArgs()[1].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  auto betaMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 3
+          ? normLoop.getInitArgs()[2].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  auto outMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 4
+          ? normLoop.getInitArgs()[3].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  if (!gammaMakeTensorPtr || !betaMakeTensorPtr || !outMakeTensorPtr)
+    return false;
+
+  auto flatXShape = firstStaticDim(xMakeTensorPtr.getShape());
+  auto flatXStride = firstStaticDim(xMakeTensorPtr.getStrides());
+  auto gammaShape = firstStaticDim(gammaMakeTensorPtr.getShape());
+  auto gammaStride = firstStaticDim(gammaMakeTensorPtr.getStrides());
+  auto betaShape = firstStaticDim(betaMakeTensorPtr.getShape());
+  auto betaStride = firstStaticDim(betaMakeTensorPtr.getStrides());
+  auto flatOutShape = firstStaticDim(outMakeTensorPtr.getShape());
+  auto flatOutStride = firstStaticDim(outMakeTensorPtr.getStrides());
+  if (!flatXShape || !flatOutShape || flatXShape != flatOutShape ||
+      !flatXStride || !flatOutStride || *flatXStride != 1 ||
+      *flatOutStride != 1 || !gammaShape || !betaShape ||
+      gammaShape != betaShape || !gammaStride || !betaStride ||
+      *gammaStride != 1 || *betaStride != 1)
+    return false;
+  if (*flatXShape % plan->shape.front() != 0 ||
+      *gammaShape != plan->shape.front())
+    return false;
+
+  int64_t cols = plan->shape.front();
+  int64_t rows = *flatXShape / cols;
+  if (rows % (rowBlock * rowGroupBlocks) != 0)
+    return false;
+
+  Location loc = meanLoop.getLoc();
+  InsertedBeforeGuard guard(meanLoop.getOperation());
+  OpBuilder b(meanLoop);
+
+  Value c0I32 = i32Cst(b, loc, 0);
+  Value c1I32 = i32Cst(b, loc, 1);
+  Value c0RowStepI32 = i32Cst(b, loc, 0);
+  Value cRowBlockI32 = i32Cst(b, loc, rowBlock);
+  Value cRowGroupBlocksI32 = i32Cst(b, loc, rowGroupBlocks);
+  Value cRowsI64 = i64Cst(b, loc, rows);
+  Value cColsI64 = i64Cst(b, loc, cols);
+  Value c1I64 = i64Cst(b, loc, 1);
+  Value pid = triton::GetProgramIdOp::create(b, loc, triton::ProgramIDDim::X)
+                  .getResult();
+  Value rowsPerProgram = i32Cst(b, loc, rowBlock * rowGroupBlocks);
+  Value groupRowBase = arith::MulIOp::create(b, loc, pid, rowsPerProgram);
+
+  auto outer = scf::ForOp::create(b, loc, c0I32, cRowGroupBlocksI32, c1I32);
+  Block *outerBody = outer.getBody();
+  Operation *outerTerminator = setInsertionPointBeforeTerminator(b, outerBody);
+
+  Value rbOffset =
+      arith::MulIOp::create(b, loc, outer.getInductionVar(), cRowBlockI32);
+  Value rowBase = arith::AddIOp::create(b, loc, groupRowBase, rbOffset);
+  auto oldVecTy = plan->producer.xLoad.vecTy;
+  auto elemTy = oldVecTy.getElementType();
+  auto rowBlockVecTy =
+      VectorType::get({oldVecTy.getShape()[0], rowBlock}, elemTy);
+  auto rowVecTy = VectorType::get({rowBlock}, elemTy);
+  auto rowBlockMemRefTy =
+      MemRefType::get({cols, rows}, elemTy,
+                      StridedLayoutAttr::get(b.getContext(), 0, {1, cols}));
+  auto paramMemRefTy = MemRefType::get(
+      {cols}, elemTy, StridedLayoutAttr::get(b.getContext(), 0, {1}));
+
+  SmallVector<Value> rowBlockShapeVals{cColsI64, cRowsI64};
+  SmallVector<Value> rowBlockStrideVals{c1I64, cColsI64};
+  SmallVector<Value> paramShapeVals{cColsI64};
+  SmallVector<Value> paramStrideVals{c1I64};
+  SmallVector<Value> rowBlockOffsets{c0I32, rowBase};
+  SmallVector<Value> paramOffsets{c0I32};
+  SmallVector<int32_t> rowBlockTensorShape{
+      static_cast<int32_t>(oldVecTy.getShape()[0]),
+      static_cast<int32_t>(rowBlock)};
+  SmallVector<int32_t> paramTensorShape{
+      static_cast<int32_t>(oldVecTy.getShape()[0])};
+  SmallVector<int32_t> rowBlockOrder{0, 1};
+  SmallVector<int32_t> paramOrder{0};
+  Value xPtr = triton::MakeTensorPtrOp::create(
+      b, loc, xMakeTensorPtr.getBase(), rowBlockShapeVals, rowBlockStrideVals,
+      rowBlockOffsets, rowBlockTensorShape, rowBlockOrder);
+  Value gammaPtr = triton::MakeTensorPtrOp::create(
+      b, loc, gammaMakeTensorPtr.getBase(), paramShapeVals, paramStrideVals,
+      paramOffsets, paramTensorShape, paramOrder);
+  Value betaPtr = triton::MakeTensorPtrOp::create(
+      b, loc, betaMakeTensorPtr.getBase(), paramShapeVals, paramStrideVals,
+      paramOffsets, paramTensorShape, paramOrder);
+  Value outPtr = triton::MakeTensorPtrOp::create(
+      b, loc, outMakeTensorPtr.getBase(), rowBlockShapeVals, rowBlockStrideVals,
+      rowBlockOffsets, rowBlockTensorShape, rowBlockOrder);
+  Value sumInit = constantVector(b, loc, rowVecTy, 0.0);
+
+  auto meanNew = scf::ForOp::create(
+      b, loc, meanLoop.getLowerBound(), meanLoop.getUpperBound(),
+      meanLoop.getStep(), ValueRange{xPtr, sumInit});
+  Operation *meanTerminator =
+      setInsertionPointBeforeTerminator(b, meanNew.getBody());
+  Value meanTile = emitTensorPtrTransferRead(
+      b, loc, meanNew.getRegionIterArgs()[0], rowBlockMemRefTy, rowBlockVecTy);
+  if (!meanTile) {
+    guard.cleanup();
+    return false;
+  }
+  Value tileSum =
+      emitLeadingDimReduction(b, loc, meanTile, vector::CombiningKind::ADD);
+  if (!tileSum) {
+    guard.cleanup();
+    return false;
+  }
+  Value sumAcc =
+      arith::AddFOp::create(b, loc, meanNew.getRegionIterArgs()[1], tileSum);
+  Value meanPtr = emitTensorPtrAdvance(b, loc, meanNew.getRegionIterArgs()[0],
+                                       meanLoop.getStep(), c0RowStepI32);
+  scf::YieldOp::create(b, loc, ValueRange{meanPtr, sumAcc});
+  if (meanTerminator)
+    meanTerminator->erase();
+  b.setInsertionPointAfter(meanNew);
+
+  Value denom = constantVector(b, loc, rowVecTy, static_cast<double>(cols));
+  Value mean = arith::DivFOp::create(b, loc, meanNew.getResult(1), denom);
+  Value meanBroadcast =
+      vector::BroadcastOp::create(b, loc, rowBlockVecTy, mean);
+
+  auto varNew = scf::ForOp::create(b, loc, varLoop.getLowerBound(),
+                                   varLoop.getUpperBound(), varLoop.getStep(),
+                                   ValueRange{xPtr, sumInit});
+  Operation *varTerminator =
+      setInsertionPointBeforeTerminator(b, varNew.getBody());
+  Value varTile = emitTensorPtrTransferRead(
+      b, loc, varNew.getRegionIterArgs()[0], rowBlockMemRefTy, rowBlockVecTy);
+  if (!varTile) {
+    guard.cleanup();
+    return false;
+  }
+  Value centered = arith::SubFOp::create(b, loc, varTile, meanBroadcast);
+  Value squared = arith::MulFOp::create(b, loc, centered, centered);
+  Value tileVar =
+      emitLeadingDimReduction(b, loc, squared, vector::CombiningKind::ADD);
+  if (!tileVar) {
+    guard.cleanup();
+    return false;
+  }
+  Value varAcc =
+      arith::AddFOp::create(b, loc, varNew.getRegionIterArgs()[1], tileVar);
+  Value varPtr = emitTensorPtrAdvance(b, loc, varNew.getRegionIterArgs()[0],
+                                      varLoop.getStep(), c0RowStepI32);
+  scf::YieldOp::create(b, loc, ValueRange{varPtr, varAcc});
+  if (varTerminator)
+    varTerminator->erase();
+  b.setInsertionPointAfter(varNew);
+
+  Value var = arith::DivFOp::create(b, loc, varNew.getResult(1), denom);
+  Value eps = constantVector(b, loc, rowVecTy, 1e-5);
+  Value varPlusEps = arith::AddFOp::create(b, loc, var, eps);
+  Value sqrt = math::SqrtOp::create(b, loc, varPlusEps);
+  Value one = constantVector(b, loc, rowVecTy, 1.0);
+  Value invStd = arith::DivFOp::create(b, loc, one, sqrt);
+  Value invStdBroadcast =
+      vector::BroadcastOp::create(b, loc, rowBlockVecTy, invStd);
+
+  auto normNew = scf::ForOp::create(
+      b, loc, normLoop.getLowerBound(), normLoop.getUpperBound(),
+      normLoop.getStep(), ValueRange{xPtr, gammaPtr, betaPtr, outPtr});
+  Operation *normTerminator =
+      setInsertionPointBeforeTerminator(b, normNew.getBody());
+  Value normTile = emitTensorPtrTransferRead(
+      b, loc, normNew.getRegionIterArgs()[0], rowBlockMemRefTy, rowBlockVecTy);
+  if (!normTile) {
+    guard.cleanup();
+    return false;
+  }
+  Value gammaTile = emitTensorPtrTransferRead(
+      b, loc, normNew.getRegionIterArgs()[1], paramMemRefTy, oldVecTy);
+  Value betaTile = emitTensorPtrTransferRead(
+      b, loc, normNew.getRegionIterArgs()[2], paramMemRefTy, oldVecTy);
+  if (!gammaTile || !betaTile) {
+    guard.cleanup();
+    return false;
+  }
+  Value gammaBroadcast =
+      splatVectorAcrossTrailingDim(b, loc, gammaTile, rowBlockVecTy);
+  Value betaBroadcast =
+      splatVectorAcrossTrailingDim(b, loc, betaTile, rowBlockVecTy);
+  if (!gammaBroadcast || !betaBroadcast) {
+    guard.cleanup();
+    return false;
+  }
+  Value normCentered = arith::SubFOp::create(b, loc, normTile, meanBroadcast);
+  Value normalized =
+      arith::MulFOp::create(b, loc, normCentered, invStdBroadcast);
+  Value scaled = arith::MulFOp::create(b, loc, normalized, gammaBroadcast);
+  Value shifted = arith::AddFOp::create(b, loc, scaled, betaBroadcast);
+  if (!emitTensorPtrTransferWrite(b, loc, normNew.getRegionIterArgs()[3],
+                                  rowBlockMemRefTy, shifted)) {
+    guard.cleanup();
+    return false;
+  }
+  Value normXPtr = emitTensorPtrAdvance(b, loc, normNew.getRegionIterArgs()[0],
+                                        normLoop.getStep(), c0RowStepI32);
+  Value gammaNext = emitTensorPtrAdvance1D(
+      b, loc, normNew.getRegionIterArgs()[1], normLoop.getStep());
+  Value betaNext = emitTensorPtrAdvance1D(
+      b, loc, normNew.getRegionIterArgs()[2], normLoop.getStep());
+  Value normOutPtr = emitTensorPtrAdvance(
+      b, loc, normNew.getRegionIterArgs()[3], normLoop.getStep(), c0RowStepI32);
+  scf::YieldOp::create(b, loc,
+                       ValueRange{normXPtr, gammaNext, betaNext, normOutPtr});
+  if (normTerminator)
+    normTerminator->erase();
+  b.setInsertionPointAfter(normNew);
+  if (!outerTerminator)
+    scf::YieldOp::create(b, loc);
+
+  if (!eraseContiguousOps(meanLoop.getOperation(), normLoop.getOperation())) {
+    guard.cleanup();
+    return false;
+  }
+
+  guard.commit();
+  return true;
+}
+
 static std::optional<ReductionResidencyPlan>
 matchSoftmaxRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
                                        FunctionOpInterface funcOp,
@@ -2615,6 +2978,69 @@ matchSoftmaxRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
   }
 
   rejectUnsupportedRowBlockGroup(rejectReasonCode, rejectReason);
+  return std::nullopt;
+}
+
+static std::optional<ReductionResidencyPlan>
+matchLayerNormRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
+                                         FunctionOpInterface funcOp,
+                                         std::string &rejectReasonCode,
+                                         std::string &rejectReason,
+                                         StringRef producerPassMode) {
+  if (!isRowBlockDmaProducerPassMode(producerPassMode))
+    return std::nullopt;
+
+  for (scf::ForOp outerLoop : topLevelLoops) {
+    SmallVector<scf::ForOp, 3> childLoops = collectDirectChildLoops(outerLoop);
+    if (childLoops.size() < 3)
+      continue;
+
+    std::string childRejectCode;
+    std::string childRejectReason;
+    auto plan =
+        matchLayerNormResidencyPlan(childLoops, funcOp, childRejectCode,
+                                    childRejectReason, producerPassMode);
+    if (!plan)
+      continue;
+
+    auto lbCst = getConstantIntValue(outerLoop.getLowerBound());
+    auto ubCst = getConstantIntValue(outerLoop.getUpperBound());
+    auto stepCst = getConstantIntValue(outerLoop.getStep());
+    if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
+        (*ubCst - *lbCst) % *stepCst != 0) {
+      rejectReasonCode = "dynamic_shape_or_stride";
+      rejectReason = "outer row-block loop bounds/step are not static with "
+                     "exact trip count";
+      return std::nullopt;
+    }
+
+    int64_t outerTrips = (*ubCst - *lbCst) / *stepCst;
+    if (outerTrips <= 1) {
+      rejectReasonCode = "unsupported_pattern";
+      rejectReason =
+          "outer row-block loop needs at least two trips for A/B DMA "
+          "double-buffering";
+      return std::nullopt;
+    }
+
+    plan->rowBlockGroupLoop = outerLoop;
+    plan->rowBlockGroupTrips = outerTrips;
+    plan->scope = "program-row-block-group";
+    plan->requiredSpmSlots = 2;
+    plan->overhead =
+        "row-block group schedule waits for the current DMA-filled row block "
+        "and prefetches the next row block into the alternate SPM slot while "
+        "mean/variance/normalize compute consumes the current slot";
+    plan->benefit =
+        "x[row_block, :] is DMA-filled once per row block and reused by all "
+        "LayerNorm passes while the next row block is in flight";
+    return plan;
+  }
+
+  rejectReasonCode = "unsupported_pattern";
+  rejectReason =
+      "row-block DMA group candidate requires one outer row-block loop "
+      "containing mean/variance/normalize LayerNorm loops";
   return std::nullopt;
 }
 
@@ -2692,12 +3118,13 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
   }
 
   if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
+    std::string reason =
+        "P3 static model accepts " + plan.source +
+        " residency for the measured row-block DMA schedule: bounded "
+        "double-buffered row-block lifetime, coarse DMA copies, zero measured "
+        "bank conflicts, and comparison against the best legal cache baseline";
     return makeD3ProfitabilityEvidence(
-        "accept", "accepted_block_resident_fill_first",
-        "P3 static model accepts Softmax block residency only for the "
-        "measured row-block DMA schedule: bounded double-buffered row-block "
-        "lifetime, coarse DMA copies, zero measured bank conflicts, and "
-        "comparison against the best legal cache baseline",
+        "accept", "accepted_block_resident_fill_first", reason,
         rowResidentDescriptors, rowResidentWaits, copyBytes, spmWriteBytes,
         spmReadBytes, avoidedBytes, liveSpmBytes, estimatedExtraOps,
         measuredBankConflicts, plan.uses);
@@ -3238,6 +3665,143 @@ static bool emitFullRowBlockDma(OpBuilder &b, Location loc, Value rowSpmAddr,
   return true;
 }
 
+static Value makeRank1TensorPtr(OpBuilder &b, Location loc, Value base,
+                                int64_t elements, Value offset,
+                                int64_t tileElems) {
+  SmallVector<Value> shapeVals{i64Cst(b, loc, elements)};
+  SmallVector<Value> strideVals{i64Cst(b, loc, 1)};
+  SmallVector<Value> offsets{offset};
+  SmallVector<int32_t> tensorShape{static_cast<int32_t>(tileElems)};
+  SmallVector<int32_t> order{0};
+  return triton::MakeTensorPtrOp::create(b, loc, base, shapeVals, strideVals,
+                                         offsets, tensorShape, order);
+}
+
+static Value extractTensorPtrIndex(OpBuilder &b, Location loc, Value tensorPtr,
+                                   unsigned index) {
+  auto indices = triton::cpu::ExtractIndicesOp::create(b, loc, tensorPtr);
+  if (index >= indices.getNumResults())
+    return {};
+  return indices.getResult()[index];
+}
+
+static Value emitSpmRowLoopRead(OpBuilder &b, Location loc, scf::ForOp loop,
+                                Value rowSpmBase, VectorType rowVecTy,
+                                unsigned elemBytes) {
+  Value elemOffset =
+      arith::SubIOp::create(b, loc, toI64(b, loc, loop.getInductionVar()),
+                            toI64(b, loc, loop.getLowerBound()));
+  Value byteOffset =
+      arith::MulIOp::create(b, loc, elemOffset, i64Cst(b, loc, elemBytes));
+  Value spmAddr = arith::AddIOp::create(b, loc, rowSpmBase, byteOffset);
+  SmallVector<int64_t, 2> rowSpmStrides{1};
+  return emitSpmReadWithStrides(b, loc, spmAddr, rowVecTy, rowSpmStrides);
+}
+
+static Value emitVectorReduceAdd(OpBuilder &b, Location loc, Value vector) {
+  return vector::ReductionOp::create(b, loc, vector::CombiningKind::ADD, vector)
+      .getResult();
+}
+
+static Value emitLayerNormMeanLoopFromSpm(OpBuilder &b, Location loc,
+                                          scf::ForOp oldLoop, Value rowSpmBase,
+                                          VectorType rowVecTy,
+                                          unsigned elemBytes) {
+  Value sumInit = constantScalarFloat(b, loc, rowVecTy.getElementType(), 0.0);
+  if (!sumInit)
+    return {};
+
+  auto meanLoop = scf::ForOp::create(b, loc, oldLoop.getLowerBound(),
+                                     oldLoop.getUpperBound(), oldLoop.getStep(),
+                                     ValueRange{sumInit});
+  Operation *terminator =
+      setInsertionPointBeforeTerminator(b, meanLoop.getBody());
+
+  Value xVal =
+      emitSpmRowLoopRead(b, loc, meanLoop, rowSpmBase, rowVecTy, elemBytes);
+  Value tileSum = emitVectorReduceAdd(b, loc, xVal);
+  Value sumAcc =
+      arith::AddFOp::create(b, loc, meanLoop.getRegionIterArgs()[0], tileSum);
+  scf::YieldOp::create(b, loc, ValueRange{sumAcc});
+  if (terminator)
+    terminator->erase();
+  b.setInsertionPointAfter(meanLoop);
+  return meanLoop.getResult(0);
+}
+
+static Value emitLayerNormVarianceLoopFromSpm(OpBuilder &b, Location loc,
+                                              scf::ForOp oldLoop,
+                                              Value rowSpmBase,
+                                              VectorType rowVecTy,
+                                              unsigned elemBytes, Value mean) {
+  Value varInit = constantScalarFloat(b, loc, rowVecTy.getElementType(), 0.0);
+  if (!varInit)
+    return {};
+
+  auto varLoop = scf::ForOp::create(b, loc, oldLoop.getLowerBound(),
+                                    oldLoop.getUpperBound(), oldLoop.getStep(),
+                                    ValueRange{varInit});
+  Operation *terminator =
+      setInsertionPointBeforeTerminator(b, varLoop.getBody());
+
+  Value xVal =
+      emitSpmRowLoopRead(b, loc, varLoop, rowSpmBase, rowVecTy, elemBytes);
+  Value meanVec = vector::BroadcastOp::create(b, loc, rowVecTy, mean);
+  Value centered = arith::SubFOp::create(b, loc, xVal, meanVec);
+  Value squared = arith::MulFOp::create(b, loc, centered, centered);
+  Value tileVar = emitVectorReduceAdd(b, loc, squared);
+  Value varAcc =
+      arith::AddFOp::create(b, loc, varLoop.getRegionIterArgs()[0], tileVar);
+  scf::YieldOp::create(b, loc, ValueRange{varAcc});
+  if (terminator)
+    terminator->erase();
+  b.setInsertionPointAfter(varLoop);
+  return varLoop.getResult(0);
+}
+
+static bool emitLayerNormNormalizeLoopFromSpm(
+    OpBuilder &b, Location loc, scf::ForOp oldLoop, Value rowSpmBase,
+    VectorType rowVecTy, unsigned elemBytes, Value gammaPtr, Value betaPtr,
+    Value outPtr, MemRefType paramMemRefTy, MemRefType outMemRefTy, Value mean,
+    Value invStd) {
+  auto normLoop = scf::ForOp::create(b, loc, oldLoop.getLowerBound(),
+                                     oldLoop.getUpperBound(), oldLoop.getStep(),
+                                     ValueRange{gammaPtr, betaPtr, outPtr});
+  Operation *terminator =
+      setInsertionPointBeforeTerminator(b, normLoop.getBody());
+
+  Value xVal =
+      emitSpmRowLoopRead(b, loc, normLoop, rowSpmBase, rowVecTy, elemBytes);
+  Value gammaTile = emitTensorPtrTransferRead(
+      b, loc, normLoop.getRegionIterArgs()[0], paramMemRefTy, rowVecTy);
+  Value betaTile = emitTensorPtrTransferRead(
+      b, loc, normLoop.getRegionIterArgs()[1], paramMemRefTy, rowVecTy);
+  if (!gammaTile || !betaTile)
+    return false;
+
+  Value meanVec = vector::BroadcastOp::create(b, loc, rowVecTy, mean);
+  Value invStdVec = vector::BroadcastOp::create(b, loc, rowVecTy, invStd);
+  Value centered = arith::SubFOp::create(b, loc, xVal, meanVec);
+  Value normalized = arith::MulFOp::create(b, loc, centered, invStdVec);
+  Value scaled = arith::MulFOp::create(b, loc, normalized, gammaTile);
+  Value shifted = arith::AddFOp::create(b, loc, scaled, betaTile);
+  if (!emitTensorPtrTransferWrite(b, loc, normLoop.getRegionIterArgs()[2],
+                                  outMemRefTy, shifted))
+    return false;
+
+  Value gammaNext = emitTensorPtrAdvance1D(
+      b, loc, normLoop.getRegionIterArgs()[0], normLoop.getStep());
+  Value betaNext = emitTensorPtrAdvance1D(
+      b, loc, normLoop.getRegionIterArgs()[1], normLoop.getStep());
+  Value outNext = emitTensorPtrAdvance1D(
+      b, loc, normLoop.getRegionIterArgs()[2], normLoop.getStep());
+  scf::YieldOp::create(b, loc, ValueRange{gammaNext, betaNext, outNext});
+  if (terminator)
+    terminator->erase();
+  b.setInsertionPointAfter(normLoop);
+  return true;
+}
+
 static Operation *cloneBlockPrefixThrough(OpBuilder &b, Operation *target,
                                           IRMapping &mapping) {
   Block *block = target->getBlock();
@@ -3252,7 +3816,7 @@ static Operation *cloneBlockPrefixThrough(OpBuilder &b, Operation *target,
   return clonedTarget;
 }
 
-static bool lowerSoftmaxRowBlockGroupDma(
+static bool lowerReductionRowBlockGroupDma(
     ReductionResidencyPlan &plan, int64_t rowSpmAddress0,
     int64_t rowSpmAddress1,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops,
@@ -3445,6 +4009,290 @@ static bool lowerSoftmaxRowBlockGroupDma(
   return true;
 }
 
+static bool lowerSoftmaxRowBlockGroupDma(
+    ReductionResidencyPlan &plan, int64_t rowSpmAddress0,
+    int64_t rowSpmAddress1,
+    llvm::DenseSet<Operation *> &rowResidentHandledLoops,
+    int64_t expSpmAddress = -1) {
+  return lowerReductionRowBlockGroupDma(plan, rowSpmAddress0, rowSpmAddress1,
+                                        rowResidentHandledLoops, expSpmAddress);
+}
+
+static bool lowerLayerNormRowBlockGroupDma(
+    ReductionResidencyPlan &plan, int64_t rowSpmAddress0,
+    int64_t rowSpmAddress1,
+    llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
+  scf::ForOp outerLoop = plan.rowBlockGroupLoop;
+  if (!outerLoop || plan.consumers.size() < 2)
+    return false;
+  if (!outerLoop.getInitArgs().empty())
+    return false;
+  auto oldOuterYield =
+      dyn_cast<scf::YieldOp>(outerLoop.getBody()->getTerminator());
+  if (!oldOuterYield || oldOuterYield.getNumOperands() != 0)
+    return false;
+
+  vector::TransferReadOp xRead = plan.producer.xLoad.readOp;
+  auto xMemRefTy = dyn_cast<MemRefType>(xRead.getBase().getType());
+  VectorType rowBlockVecTy = plan.producer.xLoad.vecTy;
+  if (!xMemRefTy || rowBlockVecTy.getRank() != 2 ||
+      !hasColMajorRowBlockDmaLayout(rowBlockVecTy, xMemRefTy))
+    return false;
+
+  auto xMakeTensorPtr =
+      plan.producer.forOp
+          .getTiedLoopInit(plan.producer.forOp.getRegionIterArgs().front())
+          ->get()
+          .template getDefiningOp<triton::MakeTensorPtrOp>();
+  if (!xMakeTensorPtr)
+    return false;
+
+  scf::ForOp meanLoop = plan.producer.forOp;
+  scf::ForOp varLoop = plan.consumers[0].forOp;
+  scf::ForOp normLoop = plan.consumers[1].forOp;
+  auto gammaMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 2
+          ? normLoop.getInitArgs()[1].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  auto betaMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 3
+          ? normLoop.getInitArgs()[2].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  auto outMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 4
+          ? normLoop.getInitArgs()[3].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  if (!gammaMakeTensorPtr || !betaMakeTensorPtr || !outMakeTensorPtr)
+    return false;
+
+  auto xColsShape = staticDim(xMakeTensorPtr.getShape(), 0);
+  auto xRowsShape = staticDim(xMakeTensorPtr.getShape(), 1);
+  auto xColStride = staticDim(xMakeTensorPtr.getStrides(), 0);
+  auto xRowStride = staticDim(xMakeTensorPtr.getStrides(), 1);
+  auto gammaShape = firstStaticDim(gammaMakeTensorPtr.getShape());
+  auto gammaStride = firstStaticDim(gammaMakeTensorPtr.getStrides());
+  auto betaShape = firstStaticDim(betaMakeTensorPtr.getShape());
+  auto betaStride = firstStaticDim(betaMakeTensorPtr.getStrides());
+  auto outColsShape = staticDim(outMakeTensorPtr.getShape(), 0);
+  auto outRowsShape = staticDim(outMakeTensorPtr.getShape(), 1);
+  auto outColStride = staticDim(outMakeTensorPtr.getStrides(), 0);
+  auto outRowStride = staticDim(outMakeTensorPtr.getStrides(), 1);
+  if (!xColsShape || !xRowsShape || !xColStride || !xRowStride ||
+      *xColStride != 1 || !outColsShape || !outRowsShape || !outColStride ||
+      !outRowStride || *outColStride != 1 || xColsShape != outColsShape ||
+      xRowsShape != outRowsShape || xRowStride != xColsShape ||
+      outRowStride != outColsShape || !gammaShape || !betaShape ||
+      gammaShape != betaShape || !gammaStride || !betaStride ||
+      *gammaStride != 1 || *betaStride != 1)
+    return false;
+
+  int64_t rowElems = plan.trips * rowBlockVecTy.getShape()[0];
+  if (*gammaShape != rowElems || *xColsShape != rowElems)
+    return false;
+  int64_t totalRows = *xRowsShape;
+  int64_t rowBlock = rowBlockVecTy.getShape()[1];
+  int64_t rowsPerGroup = rowBlock * plan.rowBlockGroupTrips;
+  if (totalRows <= 0 || rowBlock <= 0 || rowsPerGroup <= 0 ||
+      totalRows % rowsPerGroup != 0)
+    return false;
+
+  Location loc = outerLoop.getLoc();
+  InsertedBeforeGuard guard(outerLoop.getOperation());
+  OpBuilder b(outerLoop);
+
+  IRMapping firstPtrMapping;
+  firstPtrMapping.map(outerLoop.getInductionVar(), outerLoop.getLowerBound());
+  for (auto [iterArg, initArg] :
+       llvm::zip_equal(outerLoop.getRegionIterArgs(), outerLoop.getInitArgs()))
+    firstPtrMapping.map(iterArg, initArg);
+  Operation *firstTensorPtrOp = cloneBlockPrefixThrough(
+      b, xMakeTensorPtr.getOperation(), firstPtrMapping);
+  if (!firstTensorPtrOp) {
+    guard.cleanup();
+    return false;
+  }
+  Value firstDramAddr = computeTensorPtrDramAddr(
+      b, loc, firstTensorPtrOp->getResult(0), xMemRefTy);
+  if (!firstDramAddr ||
+      !emitFullRowBlockDma(b, loc, i64Cst(b, loc, rowSpmAddress0),
+                           firstDramAddr, rowBlockVecTy, xMemRefTy,
+                           plan.trips)) {
+    guard.cleanup();
+    return false;
+  }
+
+  SmallVector<Value> outerInitArgs(outerLoop.getInitArgs());
+  outerInitArgs.push_back(i64Cst(b, loc, 0));
+  auto newOuter = scf::ForOp::create(b, loc, outerLoop.getLowerBound(),
+                                     outerLoop.getUpperBound(),
+                                     outerLoop.getStep(), outerInitArgs);
+
+  Block *newOuterBody = newOuter.getBody();
+  IRMapping outerMapping;
+  outerMapping.map(outerLoop.getInductionVar(), newOuter.getInductionVar());
+  unsigned oldOuterArgs = outerLoop.getRegionIterArgs().size();
+  for (unsigned i = 0; i < oldOuterArgs; ++i)
+    outerMapping.map(outerLoop.getRegionIterArgs()[i],
+                     newOuter.getRegionIterArgs()[i]);
+  Value bufIdx = newOuter.getRegionIterArgs()[oldOuterArgs];
+
+  b.setInsertionPointToStart(newOuterBody);
+  if (!newOuterBody->empty() && newOuterBody->mightHaveTerminator())
+    newOuterBody->getTerminator()->erase();
+
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  Value zero = i64Cst(b, loc, 0);
+  Value isZero =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
+  Value spmBuf0 = i64Cst(b, loc, rowSpmAddress0);
+  Value spmBuf1 = i64Cst(b, loc, rowSpmAddress1);
+  Value currentSpm = arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
+  Value nextSpm = arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
+
+  Value iv = newOuter.getInductionVar();
+  Value step = newOuter.getStep();
+  Value ub = newOuter.getUpperBound();
+  Value nextIv = arith::AddIOp::create(b, loc, iv, step);
+  Value hasNext =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+
+  auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
+  b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  IRMapping nextPtrMapping;
+  nextPtrMapping.map(outerLoop.getInductionVar(), nextIv);
+  for (auto [iterArg, newIterArg] :
+       llvm::zip_equal(outerLoop.getRegionIterArgs(),
+                       newOuter.getRegionIterArgs().take_front(oldOuterArgs)))
+    nextPtrMapping.map(iterArg, newIterArg);
+  Operation *nextTensorPtrOp =
+      cloneBlockPrefixThrough(b, xMakeTensorPtr.getOperation(), nextPtrMapping);
+  if (!nextTensorPtrOp) {
+    guard.cleanup();
+    return false;
+  }
+  Value nextDramAddr = computeTensorPtrDramAddr(
+      b, loc, nextTensorPtrOp->getResult(0), xMemRefTy);
+  if (!nextDramAddr ||
+      !emitFullRowBlockDma(b, loc, nextSpm, nextDramAddr, rowBlockVecTy,
+                           xMemRefTy, plan.trips)) {
+    guard.cleanup();
+    return false;
+  }
+  b.setInsertionPointAfter(ifOp);
+
+  Value c0I32 = i32Cst(b, loc, 0);
+  Value c1I32 = i32Cst(b, loc, 1);
+  Value cRowBlockI32 = i32Cst(b, loc, rowBlock);
+  Operation *currentTensorPtrOp =
+      cloneBlockPrefixThrough(b, xMakeTensorPtr.getOperation(), outerMapping);
+  if (!currentTensorPtrOp) {
+    guard.cleanup();
+    return false;
+  }
+  Value currentRowBaseIdx =
+      extractTensorPtrIndex(b, loc, currentTensorPtrOp->getResult(0), 1);
+  if (!currentRowBaseIdx) {
+    guard.cleanup();
+    return false;
+  }
+  Value rowBlockStart = toI32(b, loc, currentRowBaseIdx);
+  if (!rowBlockStart) {
+    guard.cleanup();
+    return false;
+  }
+  auto rowLoop =
+      scf::ForOp::create(b, loc, c0I32, cRowBlockI32, c1I32, ValueRange{});
+  setInsertionPointBeforeTerminator(b, rowLoop.getBody());
+
+  Value rowInBlock = rowLoop.getInductionVar();
+  Value rowOffsetBytes =
+      arith::MulIOp::create(b, loc, toI64(b, loc, rowInBlock),
+                            i64Cst(b, loc, rowElems * plan.elemBytes));
+  Value rowSpmBase = arith::AddIOp::create(b, loc, currentSpm, rowOffsetBytes);
+  Value globalRow = arith::AddIOp::create(b, loc, rowBlockStart, rowInBlock);
+  Value rowBaseElem = arith::MulIOp::create(
+      b, loc, globalRow, i32Cst(b, loc, static_cast<int32_t>(rowElems)));
+  Value zeroOffset = c0I32;
+
+  auto elemTy = rowBlockVecTy.getElementType();
+  auto rowVecTy = VectorType::get({rowBlockVecTy.getShape()[0]}, elemTy);
+  auto rowSpmReadBytes = plan.elemBytes;
+  auto paramMemRefTy = MemRefType::get(
+      {rowElems}, elemTy, StridedLayoutAttr::get(b.getContext(), 0, {1}));
+  int64_t flatOutElements = (*outColsShape) * (*outRowsShape);
+  auto outMemRefTy =
+      MemRefType::get({flatOutElements}, elemTy,
+                      StridedLayoutAttr::get(b.getContext(), 0, {1}));
+
+  Value gammaPtr =
+      makeRank1TensorPtr(b, loc, gammaMakeTensorPtr.getBase(), rowElems,
+                         zeroOffset, rowVecTy.getShape()[0]);
+  Value betaPtr =
+      makeRank1TensorPtr(b, loc, betaMakeTensorPtr.getBase(), rowElems,
+                         zeroOffset, rowVecTy.getShape()[0]);
+  Value outPtr =
+      makeRank1TensorPtr(b, loc, outMakeTensorPtr.getBase(), flatOutElements,
+                         rowBaseElem, rowVecTy.getShape()[0]);
+
+  Value rowSum = emitLayerNormMeanLoopFromSpm(b, loc, meanLoop, rowSpmBase,
+                                              rowVecTy, rowSpmReadBytes);
+  if (!rowSum) {
+    guard.cleanup();
+    return false;
+  }
+  Value denom =
+      constantScalarFloat(b, loc, elemTy, static_cast<double>(rowElems));
+  if (!denom) {
+    guard.cleanup();
+    return false;
+  }
+  Value mean = arith::DivFOp::create(b, loc, rowSum, denom);
+
+  Value rowVarSum = emitLayerNormVarianceLoopFromSpm(
+      b, loc, varLoop, rowSpmBase, rowVecTy, rowSpmReadBytes, mean);
+  if (!rowVarSum) {
+    guard.cleanup();
+    return false;
+  }
+  Value variance = arith::DivFOp::create(b, loc, rowVarSum, denom);
+  Value eps = constantScalarFloat(b, loc, elemTy, 1e-5);
+  Value one = constantScalarFloat(b, loc, elemTy, 1.0);
+  if (!eps || !one) {
+    guard.cleanup();
+    return false;
+  }
+  Value varPlusEps = arith::AddFOp::create(b, loc, variance, eps);
+  Value sqrt = math::SqrtOp::create(b, loc, varPlusEps);
+  Value invStd = arith::DivFOp::create(b, loc, one, sqrt);
+
+  if (!emitLayerNormNormalizeLoopFromSpm(
+          b, loc, normLoop, rowSpmBase, rowVecTy, rowSpmReadBytes, gammaPtr,
+          betaPtr, outPtr, paramMemRefTy, outMemRefTy, mean, invStd)) {
+    guard.cleanup();
+    return false;
+  }
+
+  b.setInsertionPointAfter(rowLoop);
+
+  SmallVector<Value> yieldVals;
+  Value oneI64 = i64Cst(b, loc, 1);
+  Value flipped = arith::SubIOp::create(b, loc, oneI64, bufIdx);
+  yieldVals.push_back(flipped);
+  scf::YieldOp::create(b, loc, yieldVals);
+
+  for (unsigned i = 0; i < outerLoop.getNumResults(); ++i)
+    outerLoop.getResult(i).replaceAllUsesWith(newOuter.getResult(i));
+  rowResidentHandledLoops.insert(newOuter.getOperation());
+  rowResidentHandledLoops.insert(outerLoop.getOperation());
+  for (scf::ForOp loop : plan.loops)
+    rowResidentHandledLoops.insert(loop.getOperation());
+
+  guard.commit();
+  outerLoop.erase();
+  return true;
+}
+
 static void markResidencyPlanLoopsHandled(
     const ReductionResidencyPlan &plan,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
@@ -3478,8 +4326,8 @@ struct FunctionScopeAttentionSpmState {
     int64_t aligned = usedBytes;
     int64_t remainder = aligned % alignment;
     if (remainder != 0) {
-      if (aligned > std::numeric_limits<int64_t>::max() -
-                        (alignment - remainder))
+      if (aligned >
+          std::numeric_limits<int64_t>::max() - (alignment - remainder))
         return std::nullopt;
       aligned += alignment - remainder;
     }
@@ -3511,8 +4359,10 @@ static bool isEligibleAttentionQKRead(vector::TransferReadOp readOp) {
   return getStaticStrides(memRefTy, strides);
 }
 
-static SPMPromotionRecord makeAttentionQKTileRecord(
-    StringRef source, VectorType shapeTy, int64_t bytes, int64_t spmAddress) {
+static SPMPromotionRecord makeAttentionQKTileRecord(StringRef source,
+                                                    VectorType shapeTy,
+                                                    int64_t bytes,
+                                                    int64_t spmAddress) {
   SPMPromotionRecord record;
   record.source = source.str();
   record.scope = "function-scope QK tile";
@@ -3532,8 +4382,9 @@ static SPMPromotionRecord makeAttentionQKTileRecord(
   return record;
 }
 
-static void markAttentionQKContractionAccepted(
-    SPMPromotionReport *report, vector::ContractionOp contractOp) {
+static void
+markAttentionQKContractionAccepted(SPMPromotionReport *report,
+                                   vector::ContractionOp contractOp) {
   if (!report)
     return;
 
@@ -3543,7 +4394,7 @@ static void markAttentionQKContractionAccepted(
     return;
 
   SmallVector<int64_t, 3> mnk = {accTy.getDimSize(0), accTy.getDimSize(1),
-                                lhsTy.getDimSize(1)};
+                                 lhsTy.getDimSize(1)};
   for (SPMContractionReport &entry : report->contractions) {
     if (entry.operation != contractOp->getName().getStringRef().str())
       continue;
@@ -3564,9 +4415,10 @@ static void markAttentionQKContractionAccepted(
   }
 }
 
-static bool transformFunctionScopeAttentionQKContract(
-    vector::ContractionOp contractOp, FunctionScopeAttentionSpmState &state,
-    SPMPromotionReport *report) {
+static bool
+transformFunctionScopeAttentionQKContract(vector::ContractionOp contractOp,
+                                          FunctionScopeAttentionSpmState &state,
+                                          SPMPromotionReport *report) {
   if (!isFunctionScopeLocalConsumerQK(contractOp))
     return false;
 
@@ -3705,8 +4557,9 @@ getFunctionScopePVGeneratedOperandIndex(vector::ContractionOp contractOp) {
   return std::nullopt;
 }
 
-static SPMPromotionRecord makeAttentionPVGeneratedRecord(
-    VectorType shapeTy, int64_t bytes, int64_t spmAddress) {
+static SPMPromotionRecord makeAttentionPVGeneratedRecord(VectorType shapeTy,
+                                                         int64_t bytes,
+                                                         int64_t spmAddress) {
   SPMPromotionRecord record;
   record.source = "attention PV generated tile";
   record.scope = "function-scope PV generated operand";
@@ -3736,9 +4589,9 @@ static SPMPromotionRecord makeAttentionPVGeneratedRecord(
   return record;
 }
 
-static void markAttentionPVContractionAccepted(
-    SPMPromotionReport *report, vector::ContractionOp contractOp,
-    unsigned generatedOperandIndex) {
+static void markAttentionPVContractionAccepted(SPMPromotionReport *report,
+                                               vector::ContractionOp contractOp,
+                                               unsigned generatedOperandIndex) {
   if (!report)
     return;
 
@@ -3748,7 +4601,7 @@ static void markAttentionPVContractionAccepted(
     return;
 
   SmallVector<int64_t, 3> mnk = {accTy.getDimSize(0), accTy.getDimSize(1),
-                                lhsTy.getDimSize(1)};
+                                 lhsTy.getDimSize(1)};
   for (SPMContractionReport &entry : report->contractions) {
     if (entry.operation != contractOp->getName().getStringRef().str())
       continue;
@@ -3757,20 +4610,18 @@ static void markAttentionPVContractionAccepted(
     if (entry.outputRelation != "memory_store")
       continue;
 
-    bool expectedSources =
-        generatedOperandIndex == 0
-            ? (entry.lhs.source == "generated_contraction" ||
-               entry.lhs.source == "generated_local") &&
-                  entry.rhs.source == "memory_backed"
-            : (entry.rhs.source == "generated_contraction" ||
-               entry.rhs.source == "generated_local") &&
-                  entry.lhs.source == "memory_backed";
+    bool expectedSources = generatedOperandIndex == 0
+                               ? (entry.lhs.source == "generated_contraction" ||
+                                  entry.lhs.source == "generated_local") &&
+                                     entry.rhs.source == "memory_backed"
+                               : (entry.rhs.source == "generated_contraction" ||
+                                  entry.rhs.source == "generated_local") &&
+                                     entry.lhs.source == "memory_backed";
     if (!expectedSources)
       continue;
 
     entry.status = "accepted";
-    entry.scheduleStatus =
-        "accepted_attention_pv_generated_operand_residency";
+    entry.scheduleStatus = "accepted_attention_pv_generated_operand_residency";
     entry.reasonCode = "accepted_attention_pv_generated_operand_residency";
     entry.reason =
         "PV consumes a generated softmax/probability tile; opt-in conservative "
@@ -3821,10 +4672,9 @@ static bool transformFunctionScopeAttentionPVGeneratedContract(
   return true;
 }
 
-static bool
-transformFunctionScopeAttentionPVGenerated(FunctionOpInterface funcOp,
-                                           FunctionScopeAttentionSpmState &state,
-                                           SPMPromotionReport *report) {
+static bool transformFunctionScopeAttentionPVGenerated(
+    FunctionOpInterface funcOp, FunctionScopeAttentionSpmState &state,
+    SPMPromotionReport *report) {
   SmallVector<vector::ContractionOp, 4> contracts;
   funcOp->walk([&](vector::ContractionOp contractOp) {
     contracts.push_back(contractOp);
@@ -3843,8 +4693,7 @@ static bool transformReductionResidencyPlan(
     SPMPromotionReport *report,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
   bool useSoftmaxExpCache =
-      getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP",
-                 isStandaloneSoftmaxKernel()) &&
+      getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP", isStandaloneSoftmaxKernel()) &&
       plan.bufferRole == ReductionBufferRole::ResidentRowBlock &&
       plan.source == "Softmax x row block";
   if (useSoftmaxExpCache) {
@@ -3915,9 +4764,15 @@ static bool transformReductionResidencyPlan(
                       "SPM capacity cannot fit the row-block exp-cache buffer");
       expSpmAddress = allocExp->address;
     }
-    if (!lowerSoftmaxRowBlockGroupDma(plan, allocRow->address,
-                                      allocRow1->address,
-                                      rowResidentHandledLoops, expSpmAddress))
+    bool lowered = false;
+    if (plan.source == "LayerNorm x row block")
+      lowered = lowerLayerNormRowBlockGroupDma(
+          plan, allocRow->address, allocRow1->address, rowResidentHandledLoops);
+    else
+      lowered = lowerSoftmaxRowBlockGroupDma(
+          plan, allocRow->address, allocRow1->address, rowResidentHandledLoops,
+          expSpmAddress);
+    if (!lowered)
       return reject("unsupported_reduction_residency_plan",
                     "row-block group DMA double-buffer lowering failed");
   } else if (plan.producerPass == ReductionProducerPass::FillOnFirstPass) {
@@ -3937,17 +4792,15 @@ static bool transformReductionResidencyPlan(
                     "derived-value row residency needs materializer and "
                     "consumer loops");
     rowResidentHandledLoops.insert(plan.producer.forOp.getOperation());
-    scf::ForOp newMaterializer =
-        cloneLoopWritingDerivedX(plan.consumers[0], allocRow->address,
-                                 plan.elemBytes);
+    scf::ForOp newMaterializer = cloneLoopWritingDerivedX(
+        plan.consumers[0], allocRow->address, plan.elemBytes);
     if (!newMaterializer)
       return reject("unsupported_reduction_residency_plan",
                     "derived-value materializer loop did not contain a "
                     "supported x-derived value");
     rowResidentHandledLoops.insert(newMaterializer.getOperation());
-    scf::ForOp newConsumer =
-        cloneLoopReadingDerivedX(plan.consumers[1], allocRow->address,
-                                 plan.elemBytes);
+    scf::ForOp newConsumer = cloneLoopReadingDerivedX(
+        plan.consumers[1], allocRow->address, plan.elemBytes);
     if (!newConsumer)
       return reject("unsupported_reduction_residency_plan",
                     "derived-value consumer loop did not contain a supported "
@@ -5591,8 +6444,11 @@ struct ConvertMemoryToSPM
         SPMPromotionReport *report = nullptr;
         if (promotionReport)
           report = &reports[funcOp.getOperation()];
+        std::string effectiveRowResidentProducerPass =
+            getDefaultRowResidentProducerPass(rowResidentProducerPass);
+        StringRef producerPassMode(effectiveRowResidentProducerPass);
 
-        if (isRowBlockDmaProducerPassMode(rowResidentProducerPass) &&
+        if (isRowBlockDmaProducerPassMode(producerPassMode) &&
             getEnvBool("TRITON_SPM_SOFTMAX_INTERNAL_ROW_BLOCK",
                        isStandaloneSoftmaxKernel())) {
           int64_t rowBlock =
@@ -5609,22 +6465,51 @@ struct ConvertMemoryToSPM
                 topLevelLoops.push_back(forOp);
             }
           }
+        } else if (isRowBlockDmaProducerPassMode(producerPassMode) &&
+                   getEnvBool("TRITON_SPM_LAYERNORM_INTERNAL_ROW_BLOCK",
+                              isStandaloneLayerNormKernel())) {
+          int64_t rowBlock = getEnvInt64("TRITON_SPM_LAYERNORM_ROW_BLOCK",
+                                         getEnvInt64("SPM_ROW_BLOCK", 2));
+          int64_t rowGroupBlocks =
+              getEnvInt64("TRITON_SPM_LAYERNORM_ROW_GROUP_BLOCKS",
+                          getEnvInt64("SPM_ROW_GROUP_BLOCKS", 8));
+          if (lowerCanonicalLayerNormToRowBlockGroup(
+                  topLevelLoops, funcOp, rowBlock, rowGroupBlocks)) {
+            topLevelLoops.clear();
+            for (Operation &op : entryBlock) {
+              if (auto forOp = dyn_cast<scf::ForOp>(&op))
+                topLevelLoops.push_back(forOp);
+            }
+          }
         }
 
         std::string rejectReasonCode;
         std::string rejectReason;
-        auto plan = matchSoftmaxRowBlockGroupResidencyPlan(
-            topLevelLoops, funcOp, rejectReasonCode, rejectReason,
-            rowResidentProducerPass);
+        std::optional<ReductionResidencyPlan> plan;
+        if (isStandaloneLayerNormKernel()) {
+          plan = matchLayerNormRowBlockGroupResidencyPlan(
+              topLevelLoops, funcOp, rejectReasonCode, rejectReason,
+              producerPassMode);
+        }
+        if (!plan) {
+          plan = matchSoftmaxRowBlockGroupResidencyPlan(
+              topLevelLoops, funcOp, rejectReasonCode, rejectReason,
+              producerPassMode);
+        }
+        if (!plan && !isStandaloneLayerNormKernel()) {
+          plan = matchLayerNormRowBlockGroupResidencyPlan(
+              topLevelLoops, funcOp, rejectReasonCode, rejectReason,
+              producerPassMode);
+        }
         if (!plan) {
           plan = matchLayerNormResidencyPlan(topLevelLoops, funcOp,
                                              rejectReasonCode, rejectReason,
-                                             rowResidentProducerPass);
+                                             producerPassMode);
         }
         if (!plan) {
           plan =
               matchSoftmaxResidencyPlan(topLevelLoops, funcOp, rejectReasonCode,
-                                        rejectReason, rowResidentProducerPass);
+                                        rejectReason, producerPassMode);
         }
         if (!plan) {
           if (report && !rejectReasonCode.empty()) {

@@ -241,23 +241,29 @@ class CPUBackend(BaseBackend):
                 window_k = int(os.getenv("TRITON_SPM_WINDOW_K", "8"), 0)
                 kernel_hint = os.getenv("TRITON_KERNEL_NAME", "")
                 softmax_default_spm = kernel_hint == "softmax"
+                layernorm_default_spm = kernel_hint == "layer_norm"
+                row_resident_default_spm = (
+                    softmax_default_spm or layernorm_default_spm
+                )
                 enable_reductions = (
                     os.getenv("TRITON_ENABLE_SPM_REDUCTIONS", "0") == "1"
                 )
                 enable_row_resident_reductions = env_bool(
                     "TRITON_ENABLE_SPM_ROW_RESIDENT_REDUCTIONS",
-                    softmax_default_spm)
+                    row_resident_default_spm)
                 row_resident_max_bytes = env_int(
                     "TRITON_SPM_ROW_RESIDENT_MAX_BYTES",
-                    65536 if softmax_default_spm else 4096)
+                    65536 if row_resident_default_spm else 4096)
                 row_resident_producer_pass = os.getenv(
                     "TRITON_SPM_ROW_RESIDENT_PRODUCER_PASS",
-                    "row_block_dma" if softmax_default_spm else "fill_on_first_pass")
+                    "row_block_dma"
+                    if row_resident_default_spm
+                    else "fill_on_first_pass")
                 enable_promotion_profitability = env_bool(
                     "TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY",
-                    softmax_default_spm)
+                    row_resident_default_spm)
                 promotion_report = env_bool(
-                    "TRITON_SPM_PROMOTION_REPORT", softmax_default_spm)
+                    "TRITON_SPM_PROMOTION_REPORT", row_resident_default_spm)
                 cpu.passes.ttcpuir.add_spm_tensor_placement(
                     pm, enable_reductions
                     and not enable_row_resident_reductions
