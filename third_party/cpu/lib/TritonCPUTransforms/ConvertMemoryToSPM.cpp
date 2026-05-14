@@ -766,7 +766,14 @@ static SmallVector<TiledLoadInfo> findTiledLoads(scf::ForOp forOp) {
 
 enum class ReductionProducerPass {
   FillOnFirstPass,
+  // Ablation/coverage-only: measured weaker than fill-on-first-pass and
+  // rejected by the P3 profitability model. Keep for negative evidence, not
+  // as a recommended schedule.
   ProducerStore,
+  // Chunk-DMA is ablation/coverage-only for one-row reductions. It issues many
+  // tiny descriptors/waits and is rejected by the P3 profitability model.
+  // Row-block DMA uses the same enum value with ResidentRowBlock and remains
+  // the supported Softmax DMA schedule.
   DmaPrefetch,
 };
 
@@ -901,6 +908,10 @@ static void applyConfiguredProducerPass(ReductionResidencyPlan &plan,
     return;
 
   if (producerPass == ReductionProducerPass::ProducerStore) {
+    // Historical ablation path. This materializes the row from the first
+    // consumer pass instead of the producer pass; it is useful for explaining
+    // why "fewer SPM reads" is not enough, but should not be selected for a
+    // paper/default schedule.
     if (plan.consumers.empty())
       return;
     plan.producerPass = ReductionProducerPass::ProducerStore;
@@ -915,6 +926,10 @@ static void applyConfiguredProducerPass(ReductionResidencyPlan &plan,
   }
 
   bool preferRowBlock = isRowBlockDmaProducerPassMode(producerPassMode);
+  // `dma_prefetch` without row-block mode is the historical chunk-DMA
+  // ablation path. It is intentionally still lowerable for coverage, but it is
+  // not recommended: current LayerNorm evidence shows descriptor/wait overhead
+  // dominates. `row_block_dma` is the supported Softmax DMA schedule.
   plan.producerPass = ReductionProducerPass::DmaPrefetch;
   plan.bufferRole = preferRowBlock ? ReductionBufferRole::ResidentRowBlock
                                    : ReductionBufferRole::ResidentRow;
@@ -5101,6 +5116,10 @@ struct ReductionLoadPlan {
 static bool transformReductionLoop(scf::ForOp forOp,
                                    ArrayRef<TiledLoadInfo> loads,
                                    int64_t spmBase, int64_t spmSize) {
+  // Historical streaming-reduction coverage path. It double-buffers chunks,
+  // but each chunk has too little residency/reuse for current LayerNorm-like
+  // kernels and is rejected by the P3 profitability model. Do not use this as
+  // a recommended reduction schedule; prefer row/block-resident plans or cache.
   if (loads.empty())
     return false;
 
