@@ -1981,167 +1981,6 @@ static bool isSupportedRowBlockXLoad(TiledLoadInfo load, scf::ForOp forOp,
          canComputePrologueDramAddr(readOp, forOp);
 }
 
-static bool isSupportedSoftmaxRowBlockXLoad(TiledLoadInfo load,
-                                            scf::ForOp forOp,
-                                            unsigned &elemBytes) {
-  return isSupportedRowBlockXLoad(load, forOp, elemBytes);
-}
-
-static bool isSupportedLayerNormRowBlockXLoad(TiledLoadInfo load,
-                                              scf::ForOp forOp,
-                                              unsigned &elemBytes) {
-  return isSupportedRowBlockXLoad(load, forOp, elemBytes);
-}
-
-static std::optional<ReductionResidencyPlan> matchLayerNormResidencyPlan(
-    ArrayRef<scf::ForOp> loops, FunctionOpInterface funcOp,
-    std::string &rejectReasonCode, std::string &rejectReason,
-    StringRef producerPassMode) {
-  if (loops.size() < 3) {
-    rejectReasonCode = "unsupported_pattern";
-    rejectReason = "expected three top-level LayerNorm row loops";
-    return std::nullopt;
-  }
-
-  for (size_t i = 0; i + 2 < loops.size(); ++i) {
-    scf::ForOp meanLoop = loops[i];
-    scf::ForOp varLoop = loops[i + 1];
-    scf::ForOp normLoop = loops[i + 2];
-    if (!sameStaticLoopShape(meanLoop, varLoop) ||
-        !sameStaticLoopShape(meanLoop, normLoop))
-      continue;
-
-    SmallVector<TiledLoadInfo> meanLoads = findTiledLoads(meanLoop);
-    SmallVector<TiledLoadInfo> varLoads = findTiledLoads(varLoop);
-    SmallVector<TiledLoadInfo> normLoads = findTiledLoads(normLoop);
-    if (meanLoads.size() != 1 || varLoads.size() != 1 || normLoads.size() < 3)
-      continue;
-
-    BlockArgument meanArg =
-        traceFunctionArgument(meanLoads[0].readOp.getBase(), funcOp);
-    BlockArgument varArg =
-        traceFunctionArgument(varLoads[0].readOp.getBase(), funcOp);
-    if (!meanArg || !varArg || meanArg != varArg)
-      continue;
-
-    std::optional<TiledLoadInfo> normXLoad;
-    for (TiledLoadInfo load : normLoads) {
-      if (traceFunctionArgument(load.readOp.getBase(), funcOp) == meanArg) {
-        normXLoad = load;
-        break;
-      }
-    }
-    if (!normXLoad)
-      continue;
-
-    bool rowBlockPlan = isRowBlockDmaProducerPassMode(producerPassMode);
-    unsigned elemBytes = 0;
-    unsigned elemBytesVar = 0;
-    unsigned elemBytesNorm = 0;
-    bool supportedLoads =
-        rowBlockPlan
-            ? (isSupportedLayerNormRowBlockXLoad(meanLoads[0], meanLoop,
-                                                 elemBytes) &&
-               isSupportedLayerNormRowBlockXLoad(varLoads[0], varLoop,
-                                                 elemBytesVar) &&
-               isSupportedLayerNormRowBlockXLoad(*normXLoad, normLoop,
-                                                 elemBytesNorm))
-            : (isSupportedRowResidentXLoad(meanLoads[0], meanLoop, elemBytes) &&
-               isSupportedRowResidentXLoad(varLoads[0], varLoop,
-                                           elemBytesVar) &&
-               isSupportedRowResidentXLoad(*normXLoad, normLoop,
-                                           elemBytesNorm));
-    if (!supportedLoads || elemBytes != elemBytesVar ||
-        elemBytes != elemBytesNorm) {
-      rejectReasonCode = "unsupported_pattern";
-      rejectReason = rowBlockPlan
-                         ? "row-block DMA candidate requires rank-2 "
-                           "col-major fp32 x tiles with static "
-                           "BLOCK_N-sized column steps"
-                         : "candidate requires rank-1 contiguous fp32 x "
-                           "loads with static BLOCK_N-sized loop steps";
-      return std::nullopt;
-    }
-
-    auto lbCst = getConstantIntValue(meanLoop.getLowerBound());
-    auto ubCst = getConstantIntValue(meanLoop.getUpperBound());
-    auto stepCst = getConstantIntValue(meanLoop.getStep());
-    if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
-        (*ubCst - *lbCst) % *stepCst != 0) {
-      rejectReasonCode = "dynamic_shape_or_stride";
-      rejectReason = "loop bounds/step are not static with exact trip count";
-      return std::nullopt;
-    }
-
-    int64_t trips = (*ubCst - *lbCst) / *stepCst;
-    if (trips <= 0) {
-      rejectReasonCode = "unsupported_pattern";
-      rejectReason = "loop trip count must be positive";
-      return std::nullopt;
-    }
-
-    int64_t rowBytes = trips * meanLoads[0].tileBytes;
-    int64_t rowElements = trips * meanLoads[0].vecTy.getNumElements();
-    ReductionResidencyPlan plan;
-    plan.source = rowBlockPlan ? "LayerNorm x row block" : "LayerNorm x row";
-    plan.sourceArg = meanArg;
-    plan.producer = ReductionLoopResidencyUse{"mean", meanLoop, meanLoads[0]};
-    plan.consumers.push_back(
-        ReductionLoopResidencyUse{"variance", varLoop, varLoads[0]});
-    plan.consumers.push_back(
-        ReductionLoopResidencyUse{"normalize", normLoop, *normXLoad});
-    plan.loops.push_back(meanLoop);
-    plan.loops.push_back(varLoop);
-    plan.loops.push_back(normLoop);
-    if (rowBlockPlan) {
-      plan.scope = "program-row-block";
-      plan.shape.push_back(trips * meanLoads[0].vecTy.getShape()[0]);
-      plan.shape.push_back(meanLoads[0].vecTy.getShape()[1]);
-    } else {
-      plan.shape.push_back(rowElements);
-    }
-    plan.trips = trips;
-    plan.bytes = rowBytes;
-    plan.elemBytes = elemBytes;
-    plan.uses = 3;
-    plan.requiredSpmSlots = 1;
-    plan.producerPass = ReductionProducerPass::FillOnFirstPass;
-    plan.bufferRole = ReductionBufferRole::ResidentRow;
-    plan.rotationPolicy = ReductionRotationPolicy::None;
-    plan.copyInMode = ReductionCopyInMode::CpuDirect;
-    plan.copyIn = "CPU/vector store";
-    plan.copyOut = "none";
-    plan.overhead =
-        "first reduction pass writes each loaded x chunk into SPM; no DMA wait";
-    plan.benefit =
-        "x[row, :] is materialized once and reused by variance and normalize";
-    plan.expectedMarkers.push_back("addrspace(3)");
-    plan.expectedMarkers.push_back("no_dma_descriptors");
-    plan.expectedMarkers.push_back("no_fence_iorw");
-    plan.hasLowering = true;
-    // Opt-in experimental variant: cache x - mean from the variance loop and
-    // reuse it during normalize. This mirrors softmax's derived-value idea, but
-    // is not profitable for the current LayerNorm shape/model and must not be
-    // enabled by default.
-    if (getEnvBool("TRITON_SPM_LAYERNORM_CACHE_CENTERED", false) &&
-        parseReductionProducerPass(producerPassMode) ==
-            ReductionProducerPass::FillOnFirstPass) {
-      applyConfiguredProducerPass(plan, "layernorm_centered");
-      plan.overhead = "variance pass writes x - mean into SPM; no DMA wait";
-      plan.benefit =
-          "normalize reuses x - mean from SPM instead of rereading x and "
-          "recomputing the centered value";
-    } else {
-      applyConfiguredProducerPass(plan, producerPassMode);
-    }
-    return plan;
-  }
-
-  rejectReasonCode = "unsupported_pattern";
-  rejectReason = "no LayerNorm-style row-resident candidate matched";
-  return std::nullopt;
-}
-
 static bool loopContainsTransferWrite(scf::ForOp forOp) {
   bool found = false;
   forOp.getBody()->walk([&](vector::TransferWriteOp) {
@@ -2151,41 +1990,62 @@ static bool loopContainsTransferWrite(scf::ForOp forOp) {
   return found;
 }
 
-static std::optional<ReductionResidencyPlan> matchSoftmaxResidencyPlan(
-    ArrayRef<scf::ForOp> loops, FunctionOpInterface funcOp,
-    std::string &rejectReasonCode, std::string &rejectReason,
-    StringRef producerPassMode) {
+// Per-kind metadata used by the shared row-resident reduction matcher.
+struct ReductionPatternKind {
+  StringRef displayName;     // "Softmax" / "LayerNorm"
+  StringRef producerName;    // producer loop pass name
+  StringRef consumer0Name;   // first consumer pass name
+  StringRef consumer1Name;   // second consumer pass name
+  unsigned minNormLoads;     // minimum tile loads expected in the norm loop
+  bool requireNormWrite;     // norm loop must contain a vector.transfer_write
+  StringRef rowReuseBenefit; // "...reused by exp/sum and normalize/store"
+};
+
+// Match a (producer, consumer0, consumer1) row-resident reduction pattern.
+// Shared by Softmax (max → exp_sum → normalize_store) and LayerNorm (mean →
+// variance → normalize). The per-kind names, plan strings, and norm-loop
+// requirements come from `kind`.
+static std::optional<ReductionResidencyPlan>
+matchRowResidentReductionPlan(ArrayRef<scf::ForOp> loops,
+                              FunctionOpInterface funcOp,
+                              const ReductionPatternKind &kind,
+                              std::string &rejectReasonCode,
+                              std::string &rejectReason,
+                              StringRef producerPassMode) {
   if (loops.size() < 3) {
     rejectReasonCode = "unsupported_pattern";
-    rejectReason = "expected three top-level Softmax row loops";
+    rejectReason = ("expected three top-level " + kind.displayName +
+                    " row loops").str();
     return std::nullopt;
   }
 
   for (size_t i = 0; i + 2 < loops.size(); ++i) {
-    scf::ForOp maxLoop = loops[i];
-    scf::ForOp sumLoop = loops[i + 1];
-    scf::ForOp normLoop = loops[i + 2];
-    if (!sameStaticLoopShape(maxLoop, sumLoop) ||
-        !sameStaticLoopShape(maxLoop, normLoop))
+    scf::ForOp producerLoop = loops[i];
+    scf::ForOp consumer0Loop = loops[i + 1];
+    scf::ForOp consumer1Loop = loops[i + 2];
+    if (!sameStaticLoopShape(producerLoop, consumer0Loop) ||
+        !sameStaticLoopShape(producerLoop, consumer1Loop))
       continue;
 
-    SmallVector<TiledLoadInfo> maxLoads = findTiledLoads(maxLoop);
-    SmallVector<TiledLoadInfo> sumLoads = findTiledLoads(sumLoop);
-    SmallVector<TiledLoadInfo> normLoads = findTiledLoads(normLoop);
-    if (maxLoads.size() != 1 || sumLoads.size() != 1 || normLoads.empty() ||
-        !loopContainsTransferWrite(normLoop))
+    SmallVector<TiledLoadInfo> producerLoads = findTiledLoads(producerLoop);
+    SmallVector<TiledLoadInfo> consumer0Loads = findTiledLoads(consumer0Loop);
+    SmallVector<TiledLoadInfo> normLoads = findTiledLoads(consumer1Loop);
+    if (producerLoads.size() != 1 || consumer0Loads.size() != 1 ||
+        normLoads.size() < kind.minNormLoads)
+      continue;
+    if (kind.requireNormWrite && !loopContainsTransferWrite(consumer1Loop))
       continue;
 
-    BlockArgument maxArg =
-        traceFunctionArgument(maxLoads[0].readOp.getBase(), funcOp);
-    BlockArgument sumArg =
-        traceFunctionArgument(sumLoads[0].readOp.getBase(), funcOp);
-    if (!maxArg || !sumArg || maxArg != sumArg)
+    BlockArgument producerArg =
+        traceFunctionArgument(producerLoads[0].readOp.getBase(), funcOp);
+    BlockArgument consumer0Arg =
+        traceFunctionArgument(consumer0Loads[0].readOp.getBase(), funcOp);
+    if (!producerArg || !consumer0Arg || producerArg != consumer0Arg)
       continue;
 
     std::optional<TiledLoadInfo> normXLoad;
     for (TiledLoadInfo load : normLoads) {
-      if (traceFunctionArgument(load.readOp.getBase(), funcOp) == maxArg) {
+      if (traceFunctionArgument(load.readOp.getBase(), funcOp) == producerArg) {
         normXLoad = load;
         break;
       }
@@ -2195,23 +2055,16 @@ static std::optional<ReductionResidencyPlan> matchSoftmaxResidencyPlan(
 
     bool rowBlockPlan = isRowBlockDmaProducerPassMode(producerPassMode);
     unsigned elemBytes = 0;
-    unsigned elemBytesSum = 0;
-    unsigned elemBytesNorm = 0;
-    bool supportedLoads =
-        rowBlockPlan
-            ? (isSupportedSoftmaxRowBlockXLoad(maxLoads[0], maxLoop,
-                                               elemBytes) &&
-               isSupportedSoftmaxRowBlockXLoad(sumLoads[0], sumLoop,
-                                               elemBytesSum) &&
-               isSupportedSoftmaxRowBlockXLoad(*normXLoad, normLoop,
-                                               elemBytesNorm))
-            : (isSupportedRowResidentXLoad(maxLoads[0], maxLoop, elemBytes) &&
-               isSupportedRowResidentXLoad(sumLoads[0], sumLoop,
-                                           elemBytesSum) &&
-               isSupportedRowResidentXLoad(*normXLoad, normLoop,
-                                           elemBytesNorm));
-    if (!supportedLoads || elemBytes != elemBytesSum ||
-        elemBytes != elemBytesNorm) {
+    unsigned elemBytes1 = 0;
+    unsigned elemBytes2 = 0;
+    auto checkLoad = [&](TiledLoadInfo load, scf::ForOp forOp, unsigned &eb) {
+      return rowBlockPlan ? isSupportedRowBlockXLoad(load, forOp, eb)
+                          : isSupportedRowResidentXLoad(load, forOp, eb);
+    };
+    bool supportedLoads = checkLoad(producerLoads[0], producerLoop, elemBytes) &&
+                          checkLoad(consumer0Loads[0], consumer0Loop, elemBytes1) &&
+                          checkLoad(*normXLoad, consumer1Loop, elemBytes2);
+    if (!supportedLoads || elemBytes != elemBytes1 || elemBytes != elemBytes2) {
       rejectReasonCode = "unsupported_pattern";
       rejectReason = rowBlockPlan
                          ? "row-block DMA candidate requires rank-2 "
@@ -2222,9 +2075,9 @@ static std::optional<ReductionResidencyPlan> matchSoftmaxResidencyPlan(
       return std::nullopt;
     }
 
-    auto lbCst = getConstantIntValue(maxLoop.getLowerBound());
-    auto ubCst = getConstantIntValue(maxLoop.getUpperBound());
-    auto stepCst = getConstantIntValue(maxLoop.getStep());
+    auto lbCst = getConstantIntValue(producerLoop.getLowerBound());
+    auto ubCst = getConstantIntValue(producerLoop.getUpperBound());
+    auto stepCst = getConstantIntValue(producerLoop.getStep());
     if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
         (*ubCst - *lbCst) % *stepCst != 0) {
       rejectReasonCode = "dynamic_shape_or_stride";
@@ -2239,23 +2092,25 @@ static std::optional<ReductionResidencyPlan> matchSoftmaxResidencyPlan(
       return std::nullopt;
     }
 
-    int64_t rowBytes = trips * maxLoads[0].tileBytes;
-    int64_t rowElements = trips * maxLoads[0].vecTy.getNumElements();
+    int64_t rowBytes = trips * producerLoads[0].tileBytes;
+    int64_t rowElements = trips * producerLoads[0].vecTy.getNumElements();
     ReductionResidencyPlan plan;
-    plan.source = rowBlockPlan ? "Softmax x row block" : "Softmax x row";
-    plan.sourceArg = maxArg;
-    plan.producer = ReductionLoopResidencyUse{"max", maxLoop, maxLoads[0]};
-    plan.consumers.push_back(
-        ReductionLoopResidencyUse{"exp_sum", sumLoop, sumLoads[0]});
-    plan.consumers.push_back(
-        ReductionLoopResidencyUse{"normalize_store", normLoop, *normXLoad});
-    plan.loops.push_back(maxLoop);
-    plan.loops.push_back(sumLoop);
-    plan.loops.push_back(normLoop);
+    plan.source = (kind.displayName +
+                   (rowBlockPlan ? " x row block" : " x row")).str();
+    plan.sourceArg = producerArg;
+    plan.producer = ReductionLoopResidencyUse{kind.producerName.str(),
+                                              producerLoop, producerLoads[0]};
+    plan.consumers.push_back(ReductionLoopResidencyUse{
+        kind.consumer0Name.str(), consumer0Loop, consumer0Loads[0]});
+    plan.consumers.push_back(ReductionLoopResidencyUse{
+        kind.consumer1Name.str(), consumer1Loop, *normXLoad});
+    plan.loops.push_back(producerLoop);
+    plan.loops.push_back(consumer0Loop);
+    plan.loops.push_back(consumer1Loop);
     if (rowBlockPlan) {
       plan.scope = "program-row-block";
-      plan.shape.push_back(trips * maxLoads[0].vecTy.getShape()[0]);
-      plan.shape.push_back(maxLoads[0].vecTy.getShape()[1]);
+      plan.shape.push_back(trips * producerLoads[0].vecTy.getShape()[0]);
+      plan.shape.push_back(producerLoads[0].vecTy.getShape()[1]);
     } else {
       plan.shape.push_back(rowElements);
     }
@@ -2272,19 +2127,79 @@ static std::optional<ReductionResidencyPlan> matchSoftmaxResidencyPlan(
     plan.copyOut = "none";
     plan.overhead =
         "first reduction pass writes each loaded x chunk into SPM; no DMA wait";
-    plan.benefit = "x[row, :] is materialized once and reused by exp/sum and "
-                   "normalize/store";
+    plan.benefit = kind.rowReuseBenefit.str();
     plan.expectedMarkers.push_back("addrspace(3)");
     plan.expectedMarkers.push_back("no_dma_descriptors");
     plan.expectedMarkers.push_back("no_fence_iorw");
     plan.hasLowering = true;
-    applyConfiguredProducerPass(plan, producerPassMode);
     return plan;
   }
 
   rejectReasonCode = "unsupported_pattern";
-  rejectReason = "no Softmax-style row-resident candidate matched";
+  rejectReason =
+      ("no " + kind.displayName + "-style row-resident candidate matched").str();
   return std::nullopt;
+}
+
+static std::optional<ReductionResidencyPlan> matchLayerNormResidencyPlan(
+    ArrayRef<scf::ForOp> loops, FunctionOpInterface funcOp,
+    std::string &rejectReasonCode, std::string &rejectReason,
+    StringRef producerPassMode) {
+  static constexpr ReductionPatternKind kLayerNormKind = {
+      /*displayName=*/"LayerNorm",
+      /*producerName=*/"mean",
+      /*consumer0Name=*/"variance",
+      /*consumer1Name=*/"normalize",
+      /*minNormLoads=*/3,
+      /*requireNormWrite=*/false,
+      /*rowReuseBenefit=*/
+      "x[row, :] is materialized once and reused by variance and normalize",
+  };
+  auto plan = matchRowResidentReductionPlan(loops, funcOp, kLayerNormKind,
+                                            rejectReasonCode, rejectReason,
+                                            producerPassMode);
+  if (!plan)
+    return plan;
+  // Opt-in experimental variant: cache x - mean from the variance loop and
+  // reuse it during normalize. Mirrors softmax's derived-value idea, but is
+  // not profitable for the current LayerNorm shape/model and must not be
+  // enabled by default.
+  if (getEnvBool("TRITON_SPM_LAYERNORM_CACHE_CENTERED", false) &&
+      parseReductionProducerPass(producerPassMode) ==
+          ReductionProducerPass::FillOnFirstPass) {
+    applyConfiguredProducerPass(*plan, "layernorm_centered");
+    plan->overhead = "variance pass writes x - mean into SPM; no DMA wait";
+    plan->benefit =
+        "normalize reuses x - mean from SPM instead of rereading x and "
+        "recomputing the centered value";
+  } else {
+    applyConfiguredProducerPass(*plan, producerPassMode);
+  }
+  return plan;
+}
+
+static std::optional<ReductionResidencyPlan> matchSoftmaxResidencyPlan(
+    ArrayRef<scf::ForOp> loops, FunctionOpInterface funcOp,
+    std::string &rejectReasonCode, std::string &rejectReason,
+    StringRef producerPassMode) {
+  static constexpr ReductionPatternKind kSoftmaxKind = {
+      /*displayName=*/"Softmax",
+      /*producerName=*/"max",
+      /*consumer0Name=*/"exp_sum",
+      /*consumer1Name=*/"normalize_store",
+      /*minNormLoads=*/1,
+      /*requireNormWrite=*/true,
+      /*rowReuseBenefit=*/
+      "x[row, :] is materialized once and reused by exp/sum and "
+      "normalize/store",
+  };
+  auto plan = matchRowResidentReductionPlan(loops, funcOp, kSoftmaxKind,
+                                            rejectReasonCode, rejectReason,
+                                            producerPassMode);
+  if (!plan)
+    return plan;
+  applyConfiguredProducerPass(*plan, producerPassMode);
+  return plan;
 }
 
 static SmallVector<scf::ForOp, 3> collectDirectChildLoops(scf::ForOp outer) {
@@ -2428,18 +2343,49 @@ static Value emitTensorPtrAdvance1D(OpBuilder &b, Location loc, Value ptr,
       .getResult();
 }
 
-static bool eraseContiguousOps(Operation *start, Operation *end) {
-  SmallVector<Operation *> eraseOps;
-  for (Operation *op = start; op;) {
-    Operation *next = op->getNextNode();
-    eraseOps.push_back(op);
-    if (op == end)
-      break;
-    op = next;
-  }
-  if (eraseOps.empty() || eraseOps.back() != end)
+// Erase the contiguous block-resident range from `anchors.front()` through
+// `anchors.back()`, requiring (1) all entries in `anchors` to appear in
+// order within that range, and (2) every non-anchor op in the range to have
+// every use confined to the range. The second check makes the erasure
+// genuinely safe: a future pass that hoists a value out from between the
+// anchors will be refused rather than silently destroyed. Returns false
+// (without erasing) if either check fails.
+static bool eraseAdjacentOpsInOrder(ArrayRef<Operation *> anchors) {
+  if (anchors.empty())
     return false;
-  for (Operation *op : llvm::reverse(eraseOps))
+  Block *block = anchors.front()->getBlock();
+  for (Operation *anchor : anchors) {
+    if (anchor->getBlock() != block)
+      return false;
+  }
+  SmallVector<Operation *> toErase;
+  llvm::SmallPtrSet<Operation *, 16> toEraseSet;
+  size_t expectedIdx = 0;
+  for (Operation *cursor = anchors.front(); cursor;
+       cursor = cursor->getNextNode()) {
+    toErase.push_back(cursor);
+    toEraseSet.insert(cursor);
+    if (expectedIdx < anchors.size() && cursor == anchors[expectedIdx])
+      ++expectedIdx;
+    if (cursor == anchors.back())
+      break;
+  }
+  if (expectedIdx != anchors.size() || toErase.empty() ||
+      toErase.back() != anchors.back())
+    return false;
+  llvm::SmallPtrSet<Operation *, 4> anchorSet(anchors.begin(), anchors.end());
+  for (Operation *op : toErase) {
+    if (anchorSet.contains(op))
+      continue;
+    for (Value result : op->getResults()) {
+      for (Operation *user : result.getUsers()) {
+        Operation *userInBlock = block->findAncestorOpInBlock(*user);
+        if (!userInBlock || !toEraseSet.contains(userInBlock))
+          return false;
+      }
+    }
+  }
+  for (Operation *op : llvm::reverse(toErase))
     op->erase();
   return true;
 }
@@ -2639,21 +2585,14 @@ lowerCanonicalSoftmaxToRowBlockGroup(ArrayRef<scf::ForOp> topLevelLoops,
   if (!outerTerminator)
     scf::YieldOp::create(b, loc);
 
-  if (!eraseContiguousOps(maxLoop.getOperation(), normLoop.getOperation())) {
+  if (!eraseAdjacentOpsInOrder({maxLoop.getOperation(), sumLoop.getOperation(),
+                                normLoop.getOperation()})) {
     guard.cleanup();
     return false;
   }
 
   guard.commit();
   return true;
-}
-
-static void rejectUnsupportedRowBlockGroup(std::string &rejectReasonCode,
-                                           std::string &rejectReason) {
-  rejectReasonCode = "unsupported_pattern";
-  rejectReason =
-      "row-block DMA group candidate requires one outer row-block loop "
-      "containing max/sum/normalize Softmax loops";
 }
 
 static bool lowerCanonicalLayerNormToRowBlockGroup(
@@ -2902,7 +2841,8 @@ static bool lowerCanonicalLayerNormToRowBlockGroup(
   if (!outerTerminator)
     scf::YieldOp::create(b, loc);
 
-  if (!eraseContiguousOps(meanLoop.getOperation(), normLoop.getOperation())) {
+  if (!eraseAdjacentOpsInOrder({meanLoop.getOperation(), varLoop.getOperation(),
+                                normLoop.getOperation()})) {
     guard.cleanup();
     return false;
   }
@@ -2911,12 +2851,24 @@ static bool lowerCanonicalLayerNormToRowBlockGroup(
   return true;
 }
 
+// Shared row-block-group matcher. `childMatcher` runs the kernel-specific
+// inner-loop matcher (softmax or layernorm). `kindName` names the kernel in
+// the overhead/benefit strings; `consumerStagesLabel` is the prose listing of
+// the three child stages used in the overhead message.
+using InnerReductionMatcher =
+    llvm::function_ref<std::optional<ReductionResidencyPlan>(
+        ArrayRef<scf::ForOp>, FunctionOpInterface, std::string &,
+        std::string &, StringRef)>;
+
 static std::optional<ReductionResidencyPlan>
-matchSoftmaxRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
-                                       FunctionOpInterface funcOp,
-                                       std::string &rejectReasonCode,
-                                       std::string &rejectReason,
-                                       StringRef producerPassMode) {
+matchRowBlockGroupReductionPlan(ArrayRef<scf::ForOp> topLevelLoops,
+                                FunctionOpInterface funcOp,
+                                InnerReductionMatcher childMatcher,
+                                StringRef kindName,
+                                StringRef consumerStagesLabel,
+                                std::string &rejectReasonCode,
+                                std::string &rejectReason,
+                                StringRef producerPassMode) {
   if (!isRowBlockDmaProducerPassMode(producerPassMode))
     return std::nullopt;
 
@@ -2927,8 +2879,8 @@ matchSoftmaxRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
 
     std::string childRejectCode;
     std::string childRejectReason;
-    auto plan = matchSoftmaxResidencyPlan(childLoops, funcOp, childRejectCode,
-                                          childRejectReason, producerPassMode);
+    auto plan = childMatcher(childLoops, funcOp, childRejectCode,
+                             childRejectReason, producerPassMode);
     if (!plan)
       continue;
 
@@ -2946,9 +2898,8 @@ matchSoftmaxRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
     int64_t outerTrips = (*ubCst - *lbCst) / *stepCst;
     if (outerTrips <= 1) {
       rejectReasonCode = "unsupported_pattern";
-      rejectReason =
-          "outer row-block loop needs at least two trips for A/B DMA "
-          "double-buffering";
+      rejectReason = "outer row-block loop needs at least two trips for A/B "
+                     "DMA double-buffering";
       return std::nullopt;
     }
 
@@ -2957,17 +2908,31 @@ matchSoftmaxRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
     plan->scope = "program-row-block-group";
     plan->requiredSpmSlots = 2;
     plan->overhead =
-        "row-block group schedule waits for the current DMA-filled row block "
-        "and prefetches the next row block into the alternate SPM slot while "
-        "max/sum/normalize compute consumes the current slot";
+        ("row-block group schedule waits for the current DMA-filled row block "
+         "and prefetches the next row block into the alternate SPM slot while "
+         + consumerStagesLabel + " compute consumes the current slot").str();
     plan->benefit =
-        "x[row_block, :] is DMA-filled once per row block and reused by all "
-        "Softmax passes while the next row block is in flight";
+        ("x[row_block, :] is DMA-filled once per row block and reused by all " +
+         kindName + " passes while the next row block is in flight").str();
     return plan;
   }
 
-  rejectUnsupportedRowBlockGroup(rejectReasonCode, rejectReason);
+  rejectReasonCode = "unsupported_pattern";
+  rejectReason = ("row-block DMA group candidate requires one outer row-block "
+                  "loop containing " + consumerStagesLabel + " " + kindName +
+                  " loops").str();
   return std::nullopt;
+}
+
+static std::optional<ReductionResidencyPlan>
+matchSoftmaxRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
+                                       FunctionOpInterface funcOp,
+                                       std::string &rejectReasonCode,
+                                       std::string &rejectReason,
+                                       StringRef producerPassMode) {
+  return matchRowBlockGroupReductionPlan(
+      topLevelLoops, funcOp, matchSoftmaxResidencyPlan, "Softmax",
+      "max/sum/normalize", rejectReasonCode, rejectReason, producerPassMode);
 }
 
 static std::optional<ReductionResidencyPlan>
@@ -2976,61 +2941,10 @@ matchLayerNormRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
                                          std::string &rejectReasonCode,
                                          std::string &rejectReason,
                                          StringRef producerPassMode) {
-  if (!isRowBlockDmaProducerPassMode(producerPassMode))
-    return std::nullopt;
-
-  for (scf::ForOp outerLoop : topLevelLoops) {
-    SmallVector<scf::ForOp, 3> childLoops = collectDirectChildLoops(outerLoop);
-    if (childLoops.size() < 3)
-      continue;
-
-    std::string childRejectCode;
-    std::string childRejectReason;
-    auto plan =
-        matchLayerNormResidencyPlan(childLoops, funcOp, childRejectCode,
-                                    childRejectReason, producerPassMode);
-    if (!plan)
-      continue;
-
-    auto lbCst = getConstantIntValue(outerLoop.getLowerBound());
-    auto ubCst = getConstantIntValue(outerLoop.getUpperBound());
-    auto stepCst = getConstantIntValue(outerLoop.getStep());
-    if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
-        (*ubCst - *lbCst) % *stepCst != 0) {
-      rejectReasonCode = "dynamic_shape_or_stride";
-      rejectReason = "outer row-block loop bounds/step are not static with "
-                     "exact trip count";
-      return std::nullopt;
-    }
-
-    int64_t outerTrips = (*ubCst - *lbCst) / *stepCst;
-    if (outerTrips <= 1) {
-      rejectReasonCode = "unsupported_pattern";
-      rejectReason =
-          "outer row-block loop needs at least two trips for A/B DMA "
-          "double-buffering";
-      return std::nullopt;
-    }
-
-    plan->rowBlockGroupLoop = outerLoop;
-    plan->rowBlockGroupTrips = outerTrips;
-    plan->scope = "program-row-block-group";
-    plan->requiredSpmSlots = 2;
-    plan->overhead =
-        "row-block group schedule waits for the current DMA-filled row block "
-        "and prefetches the next row block into the alternate SPM slot while "
-        "mean/variance/normalize compute consumes the current slot";
-    plan->benefit =
-        "x[row_block, :] is DMA-filled once per row block and reused by all "
-        "LayerNorm passes while the next row block is in flight";
-    return plan;
-  }
-
-  rejectReasonCode = "unsupported_pattern";
-  rejectReason =
-      "row-block DMA group candidate requires one outer row-block loop "
-      "containing mean/variance/normalize LayerNorm loops";
-  return std::nullopt;
+  return matchRowBlockGroupReductionPlan(
+      topLevelLoops, funcOp, matchLayerNormResidencyPlan, "LayerNorm",
+      "mean/variance/normalize", rejectReasonCode, rejectReason,
+      producerPassMode);
 }
 
 static SPMProfitabilityEvidence
@@ -3538,6 +3452,33 @@ static Value mapOrDefault(IRMapping &mapping, Value value) {
   return value;
 }
 
+// Identify the `exp(x - max)` chain following the x read in `oldBody`.
+// On success, *subOut and *expOut point to the unique arith.subf / math.exp
+// pair such that x is consumed only by sub, and sub is consumed only by exp.
+// Returns false when the chain is ambiguous or absent.
+static bool findSoftmaxExpChain(Block *oldBody, vector::TransferReadOp xRead,
+                                Operation **subOut, Operation **expOut) {
+  *subOut = nullptr;
+  *expOut = nullptr;
+  Value xVal = xRead.getResult();
+  if (!xVal.hasOneUse())
+    return false;
+  Operation *user = *xVal.getUsers().begin();
+  auto subOp = dyn_cast<arith::SubFOp>(user);
+  if (!subOp || subOp->getBlock() != oldBody ||
+      subOp.getOperand(0) != xVal)
+    return false;
+  if (!subOp.getResult().hasOneUse())
+    return false;
+  Operation *subUser = *subOp.getResult().getUsers().begin();
+  auto expOp = dyn_cast<math::ExpOp>(subUser);
+  if (!expOp || expOp->getBlock() != oldBody)
+    return false;
+  *subOut = subOp.getOperation();
+  *expOut = expOp.getOperation();
+  return true;
+}
+
 static bool cloneLoopBodyWithRowBlockSpm(
     OpBuilder &b, Location loc, scf::ForOp oldLoop, scf::ForOp newLoop,
     TiledLoadInfo xLoad, Value rowSpmBase, unsigned elemBytes,
@@ -3546,6 +3487,16 @@ static bool cloneLoopBodyWithRowBlockSpm(
     bool readExpFromSpm = false) {
   Block *oldBody = oldLoop.getBody();
   Block *newBody = newLoop.getBody();
+
+  // Classify the sub/exp chain before mutating any IR so we can bail out
+  // cleanly if the canonical form doesn't match.
+  Operation *subOp = nullptr;
+  Operation *expOp = nullptr;
+  if (writeExpToSpm || readExpFromSpm) {
+    if (!findSoftmaxExpChain(oldBody, xLoad.readOp, &subOp, &expOp))
+      return false;
+  }
+
   mapping.map(oldLoop.getInductionVar(), newLoop.getInductionVar());
   for (auto [oldArg, newArg] : llvm::zip_equal(oldLoop.getRegionIterArgs(),
                                                newLoop.getRegionIterArgs()))
@@ -3566,35 +3517,13 @@ static bool cloneLoopBodyWithRowBlockSpm(
   if (expSpmBase && (writeExpToSpm || readExpFromSpm))
     expSpmAddr = arith::AddIOp::create(b, loc, expSpmBase, byteOffset);
 
-  // When readExpFromSpm is set, identify the sub+exp chain after the x read
-  // so we can skip them and use the exp buffer value directly.
-  Operation *subOp = nullptr;
-  Operation *expOp = nullptr;
-  if (readExpFromSpm) {
-    for (auto &op : oldBody->getOperations()) {
-      if (&op == xLoad.readOp.getOperation())
-        continue;
-      if (isa<arith::SubFOp>(op) &&
-          op.getOperand(0) == xLoad.readOp.getResult()) {
-        subOp = &op;
-        continue;
-      }
-      if (subOp && isa<math::ExpOp>(op) &&
-          op.getOperand(0) == subOp->getResult(0)) {
-        expOp = &op;
-        break;
-      }
-    }
-  }
-
   for (auto &op : oldBody->getOperations()) {
     if (isa<scf::YieldOp>(op))
       continue;
 
     if (&op == xLoad.readOp.getOperation()) {
-      if (readExpFromSpm && expSpmAddr) {
-        // Skip the x read entirely; the exp value comes from SPM.
-        mapping.map(xLoad.readOp.getResult(), xSpmAddr); // placeholder
+      if (readExpFromSpm) {
+        // x's only user is subOp, which we drop below; no need to read x.
         continue;
       }
       Value spmVal =
@@ -3603,13 +3532,10 @@ static bool cloneLoopBodyWithRowBlockSpm(
       continue;
     }
 
-    if (readExpFromSpm && subOp && &op == subOp) {
-      // Skip sub; it's part of the replaced exp(x - max) chain.
+    if (readExpFromSpm && &op == subOp)
       continue;
-    }
 
-    if (readExpFromSpm && expOp && &op == expOp) {
-      // Replace exp(x - max) with a read from the exp SPM buffer.
+    if (readExpFromSpm && &op == expOp) {
       Value expVal = emitSpmReadWithStrides(b, loc, expSpmAddr, xLoad.vecTy,
                                             spmMemStrides);
       mapping.map(expOp->getResult(0), expVal);
@@ -3618,8 +3544,7 @@ static bool cloneLoopBodyWithRowBlockSpm(
 
     Operation *cloned = b.clone(op, mapping);
 
-    if (writeExpToSpm && expSpmAddr && isa<math::ExpOp>(op)) {
-      // Write the exp result to the exp SPM buffer.
+    if (writeExpToSpm && &op == expOp) {
       Value expResult = cloned->getResult(0);
       emitSpmWriteWithStrides(b, loc, expSpmAddr, expResult, spmMemStrides);
     }
@@ -3690,6 +3615,117 @@ static Value emitSpmRowLoopRead(OpBuilder &b, Location loc, scf::ForOp loop,
 static Value emitVectorReduceAdd(OpBuilder &b, Location loc, Value vector) {
   return vector::ReductionOp::create(b, loc, vector::CombiningKind::ADD, vector)
       .getResult();
+}
+
+struct LayerNormStatsValues {
+  Value sum;
+  Value sumSquares;
+};
+
+// Stats from the shifted one-pass formulation: each tile contributes
+// (x - shift) and (x - shift)^2 to two running sums, where `shift` is a
+// representative row value (we use x[0]). Translation-invariance of
+// variance lets us recover mean and variance from these without ever
+// summing the raw x values (and thus without raw-sumsq cancellation).
+struct LayerNormShiftedStats {
+  Value shift;     // c (scalar)
+  Value sumDelta;  // sum_d  = sum_i (x_i - c)
+  Value sumDelta2; // sum_d2 = sum_i (x_i - c)^2
+};
+
+static std::optional<LayerNormShiftedStats>
+emitLayerNormShiftedSumLoopFromSpm(OpBuilder &b, Location loc,
+                                   scf::ForOp oldLoop, Value rowSpmBase,
+                                   VectorType rowVecTy, unsigned elemBytes) {
+  if (!dyn_cast<FloatType>(rowVecTy.getElementType()))
+    return std::nullopt;
+
+  // Load the first tile once, extract x[0] as the shift, and fold its
+  // (x - shift) / (x - shift)^2 contributions into the running stats so the
+  // stats loop can skip this tile (no redundant SPM read per row).
+  SmallVector<int64_t, 1> rowSpmStrides{1};
+  Value firstTile =
+      emitSpmReadWithStrides(b, loc, rowSpmBase, rowVecTy, rowSpmStrides);
+  Value shift = vector::ExtractOp::create(b, loc, firstTile,
+                                          ArrayRef<int64_t>{0});
+  Value shiftVec = vector::BroadcastOp::create(b, loc, rowVecTy, shift);
+  Value firstDelta = arith::SubFOp::create(b, loc, firstTile, shiftVec);
+  Value firstSumDelta = emitVectorReduceAdd(b, loc, firstDelta);
+  Value firstDelta2 = arith::MulFOp::create(b, loc, firstDelta, firstDelta);
+  Value firstSumDelta2 = emitVectorReduceAdd(b, loc, firstDelta2);
+
+  // Start the stats loop one step past the original lower bound. If the row
+  // is a single tile this loop has zero trips and the first-tile sums fall
+  // straight through as the result.
+  Value oldLower = oldLoop.getLowerBound();
+  Value oldStep = oldLoop.getStep();
+  Value newLower = arith::AddIOp::create(b, loc, oldLower, oldStep);
+  auto statsLoop = scf::ForOp::create(
+      b, loc, newLower, oldLoop.getUpperBound(), oldStep,
+      ValueRange{firstSumDelta, firstSumDelta2});
+  Operation *terminator =
+      setInsertionPointBeforeTerminator(b, statsLoop.getBody());
+
+  // SPM offsets stay anchored to the ORIGINAL lower bound, not the loop's
+  // shifted lower bound — otherwise the first iteration would re-read the
+  // first tile we just folded in above.
+  Value elemOffset = arith::SubIOp::create(
+      b, loc, toI64(b, loc, statsLoop.getInductionVar()),
+      toI64(b, loc, oldLower));
+  Value byteOffset =
+      arith::MulIOp::create(b, loc, elemOffset, i64Cst(b, loc, elemBytes));
+  Value spmAddr = arith::AddIOp::create(b, loc, rowSpmBase, byteOffset);
+  Value xVal = emitSpmReadWithStrides(b, loc, spmAddr, rowVecTy, rowSpmStrides);
+  Value delta = arith::SubFOp::create(b, loc, xVal, shiftVec);
+  Value tileSumDelta = emitVectorReduceAdd(b, loc, delta);
+  Value delta2 = arith::MulFOp::create(b, loc, delta, delta);
+  Value tileSumDelta2 = emitVectorReduceAdd(b, loc, delta2);
+  Value sumAcc = arith::AddFOp::create(b, loc,
+                                       statsLoop.getRegionIterArgs()[0],
+                                       tileSumDelta);
+  Value sum2Acc = arith::AddFOp::create(b, loc,
+                                        statsLoop.getRegionIterArgs()[1],
+                                        tileSumDelta2);
+  scf::YieldOp::create(b, loc, ValueRange{sumAcc, sum2Acc});
+  if (terminator)
+    terminator->erase();
+  b.setInsertionPointAfter(statsLoop);
+
+  return LayerNormShiftedStats{shift, statsLoop.getResult(0),
+                               statsLoop.getResult(1)};
+}
+
+static std::optional<LayerNormStatsValues>
+emitLayerNormSumAndSquareLoopFromSpm(OpBuilder &b, Location loc,
+                                     scf::ForOp oldLoop, Value rowSpmBase,
+                                     VectorType rowVecTy,
+                                     unsigned elemBytes) {
+  Value zero = constantScalarFloat(b, loc, rowVecTy.getElementType(), 0.0);
+  if (!zero)
+    return std::nullopt;
+
+  auto statsLoop = scf::ForOp::create(
+      b, loc, oldLoop.getLowerBound(), oldLoop.getUpperBound(),
+      oldLoop.getStep(), ValueRange{zero, zero});
+  Operation *terminator =
+      setInsertionPointBeforeTerminator(b, statsLoop.getBody());
+
+  Value xVal =
+      emitSpmRowLoopRead(b, loc, statsLoop, rowSpmBase, rowVecTy, elemBytes);
+  Value tileSum = emitVectorReduceAdd(b, loc, xVal);
+  Value squared = arith::MulFOp::create(b, loc, xVal, xVal);
+  Value tileSumSquares = emitVectorReduceAdd(b, loc, squared);
+  Value sumAcc = arith::AddFOp::create(b, loc,
+                                       statsLoop.getRegionIterArgs()[0],
+                                       tileSum);
+  Value sumSquaresAcc = arith::AddFOp::create(
+      b, loc, statsLoop.getRegionIterArgs()[1], tileSumSquares);
+  scf::YieldOp::create(b, loc, ValueRange{sumAcc, sumSquaresAcc});
+  if (terminator)
+    terminator->erase();
+  b.setInsertionPointAfter(statsLoop);
+
+  return LayerNormStatsValues{statsLoop.getResult(0), statsLoop.getResult(1)};
 }
 
 static Value emitLayerNormMeanLoopFromSpm(OpBuilder &b, Location loc,
@@ -3960,12 +3996,15 @@ static bool lowerReductionRowBlockGroupDma(
             b, loc, mapOrDefault(outerMapping, forOp.getLowerBound()),
             mapOrDefault(outerMapping, forOp.getUpperBound()),
             mapOrDefault(outerMapping, forOp.getStep()), initArgs);
-        cloneLoopBodyWithRowBlockSpm(b, loc, forOp, newLoop, loopUse->xLoad,
-                                     currentSpm, plan.elemBytes, spmStepBytes,
-                                     spmMemStrides, outerMapping,
-                                     cacheExp ? expSpmBase : nullptr,
-                                     /*writeExpToSpm=*/cacheExp && isExpSumLoop,
-                                     /*readExpFromSpm=*/cacheExp && isNormLoop);
+        if (!cloneLoopBodyWithRowBlockSpm(
+                b, loc, forOp, newLoop, loopUse->xLoad, currentSpm,
+                plan.elemBytes, spmStepBytes, spmMemStrides, outerMapping,
+                cacheExp ? expSpmBase : nullptr,
+                /*writeExpToSpm=*/cacheExp && isExpSumLoop,
+                /*readExpFromSpm=*/cacheExp && isNormLoop)) {
+          guard.cleanup();
+          return false;
+        }
         b.setInsertionPointAfter(newLoop);
         for (auto [oldResult, newResult] :
              llvm::zip_equal(forOp.getResults(), newLoop.getResults()))
@@ -4010,23 +4049,32 @@ static bool lowerSoftmaxRowBlockGroupDma(
 static bool lowerLayerNormRowBlockGroupDma(
     ReductionResidencyPlan &plan, int64_t rowSpmAddress0,
     int64_t rowSpmAddress1,
-    llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
+    llvm::DenseSet<Operation *> &rowResidentHandledLoops,
+    std::string &rejectReason) {
+  auto bail = [&](StringRef reason) {
+    rejectReason = reason.str();
+    return false;
+  };
+
   scf::ForOp outerLoop = plan.rowBlockGroupLoop;
   if (!outerLoop || plan.consumers.size() < 2)
-    return false;
+    return bail("LayerNorm row-block plan missing outer loop or consumers");
   if (!outerLoop.getInitArgs().empty())
-    return false;
+    return bail("outer row-block loop must not carry iter args");
   auto oldOuterYield =
       dyn_cast<scf::YieldOp>(outerLoop.getBody()->getTerminator());
   if (!oldOuterYield || oldOuterYield.getNumOperands() != 0)
-    return false;
+    return bail("outer row-block loop must yield no values");
 
   vector::TransferReadOp xRead = plan.producer.xLoad.readOp;
   auto xMemRefTy = dyn_cast<MemRefType>(xRead.getBase().getType());
   VectorType rowBlockVecTy = plan.producer.xLoad.vecTy;
-  if (!xMemRefTy || rowBlockVecTy.getRank() != 2 ||
-      !hasColMajorRowBlockDmaLayout(rowBlockVecTy, xMemRefTy))
-    return false;
+  if (!xMemRefTy)
+    return bail("x transfer_read base is not a memref");
+  if (rowBlockVecTy.getRank() != 2)
+    return bail("x tile must be rank-2 for row-block DMA");
+  if (!hasColMajorRowBlockDmaLayout(rowBlockVecTy, xMemRefTy))
+    return bail("x tile layout is not col-major row-block-DMA compatible");
 
   auto xMakeTensorPtr =
       plan.producer.forOp
@@ -4034,7 +4082,7 @@ static bool lowerLayerNormRowBlockGroupDma(
           ->get()
           .template getDefiningOp<triton::MakeTensorPtrOp>();
   if (!xMakeTensorPtr)
-    return false;
+    return bail("producer loop's x pointer is not a make_tensor_ptr");
 
   scf::ForOp meanLoop = plan.producer.forOp;
   scf::ForOp varLoop = plan.consumers[0].forOp;
@@ -4051,8 +4099,12 @@ static bool lowerLayerNormRowBlockGroupDma(
       normLoop.getInitArgs().size() >= 4
           ? normLoop.getInitArgs()[3].getDefiningOp<triton::MakeTensorPtrOp>()
           : triton::MakeTensorPtrOp();
-  if (!gammaMakeTensorPtr || !betaMakeTensorPtr || !outMakeTensorPtr)
-    return false;
+  if (!gammaMakeTensorPtr)
+    return bail("normalize loop is missing a gamma make_tensor_ptr operand");
+  if (!betaMakeTensorPtr)
+    return bail("normalize loop is missing a beta make_tensor_ptr operand");
+  if (!outMakeTensorPtr)
+    return bail("normalize loop is missing an output make_tensor_ptr operand");
 
   auto xColsShape = staticDim(xMakeTensorPtr.getShape(), 0);
   auto xRowsShape = staticDim(xMakeTensorPtr.getShape(), 1);
@@ -4066,24 +4118,38 @@ static bool lowerLayerNormRowBlockGroupDma(
   auto outRowsShape = staticDim(outMakeTensorPtr.getShape(), 1);
   auto outColStride = staticDim(outMakeTensorPtr.getStrides(), 0);
   auto outRowStride = staticDim(outMakeTensorPtr.getStrides(), 1);
-  if (!xColsShape || !xRowsShape || !xColStride || !xRowStride ||
-      *xColStride != 1 || !outColsShape || !outRowsShape || !outColStride ||
-      !outRowStride || *outColStride != 1 || xColsShape != outColsShape ||
-      xRowsShape != outRowsShape || xRowStride != xColsShape ||
-      outRowStride != outColsShape || !gammaShape || !betaShape ||
-      gammaShape != betaShape || !gammaStride || !betaStride ||
-      *gammaStride != 1 || *betaStride != 1)
-    return false;
+
+  if (!xColsShape || !xRowsShape)
+    return bail("x make_tensor_ptr shape dims must be static");
+  if (!xColStride || !xRowStride || *xColStride != 1)
+    return bail("x make_tensor_ptr must be col-major with col-stride 1");
+  if (!outColsShape || !outRowsShape)
+    return bail("output make_tensor_ptr shape dims must be static");
+  if (!outColStride || !outRowStride || *outColStride != 1)
+    return bail("output make_tensor_ptr must be col-major with col-stride 1");
+  if (xColsShape != outColsShape || xRowsShape != outRowsShape)
+    return bail("x and output tensor shapes must match");
+  if (xRowStride != xColsShape || outRowStride != outColsShape)
+    return bail("x/output row-stride must equal column count (contiguous rows)");
+  if (!gammaShape || !gammaStride || *gammaStride != 1)
+    return bail("gamma must be a contiguous rank-1 tensor with static shape");
+  if (!betaShape || !betaStride || *betaStride != 1)
+    return bail("beta must be a contiguous rank-1 tensor with static shape");
+  if (gammaShape != betaShape)
+    return bail("gamma and beta tensor lengths must match");
 
   int64_t rowElems = plan.trips * rowBlockVecTy.getShape()[0];
-  if (*gammaShape != rowElems || *xColsShape != rowElems)
-    return false;
+  if (*gammaShape != rowElems)
+    return bail("gamma length must equal the per-row element count");
+  if (*xColsShape != rowElems)
+    return bail("x column count must equal the per-row element count");
   int64_t totalRows = *xRowsShape;
   int64_t rowBlock = rowBlockVecTy.getShape()[1];
   int64_t rowsPerGroup = rowBlock * plan.rowBlockGroupTrips;
-  if (totalRows <= 0 || rowBlock <= 0 || rowsPerGroup <= 0 ||
-      totalRows % rowsPerGroup != 0)
-    return false;
+  if (totalRows <= 0 || rowBlock <= 0 || rowsPerGroup <= 0)
+    return bail("totalRows / rowBlock / rowsPerGroup must be positive");
+  if (totalRows % rowsPerGroup != 0)
+    return bail("total rows are not divisible by rowBlock * rowGroupBlocks");
 
   Location loc = outerLoop.getLoc();
   InsertedBeforeGuard guard(outerLoop.getOperation());
@@ -4098,16 +4164,19 @@ static bool lowerLayerNormRowBlockGroupDma(
       b, xMakeTensorPtr.getOperation(), firstPtrMapping);
   if (!firstTensorPtrOp) {
     guard.cleanup();
-    return false;
+    return bail("failed to clone first-iteration x make_tensor_ptr prefix");
   }
   Value firstDramAddr = computeTensorPtrDramAddr(
       b, loc, firstTensorPtrOp->getResult(0), xMemRefTy);
-  if (!firstDramAddr ||
-      !emitFullRowBlockDma(b, loc, i64Cst(b, loc, rowSpmAddress0),
+  if (!firstDramAddr) {
+    guard.cleanup();
+    return bail("could not compute first-iteration DRAM address");
+  }
+  if (!emitFullRowBlockDma(b, loc, i64Cst(b, loc, rowSpmAddress0),
                            firstDramAddr, rowBlockVecTy, xMemRefTy,
                            plan.trips)) {
     guard.cleanup();
-    return false;
+    return bail("first-iteration row-block DMA emission failed");
   }
 
   SmallVector<Value> outerInitArgs(outerLoop.getInitArgs());
@@ -4158,15 +4227,18 @@ static bool lowerLayerNormRowBlockGroupDma(
       cloneBlockPrefixThrough(b, xMakeTensorPtr.getOperation(), nextPtrMapping);
   if (!nextTensorPtrOp) {
     guard.cleanup();
-    return false;
+    return bail("failed to clone next-iteration x make_tensor_ptr prefix");
   }
   Value nextDramAddr = computeTensorPtrDramAddr(
       b, loc, nextTensorPtrOp->getResult(0), xMemRefTy);
-  if (!nextDramAddr ||
-      !emitFullRowBlockDma(b, loc, nextSpm, nextDramAddr, rowBlockVecTy,
+  if (!nextDramAddr) {
+    guard.cleanup();
+    return bail("could not compute next-iteration DRAM address");
+  }
+  if (!emitFullRowBlockDma(b, loc, nextSpm, nextDramAddr, rowBlockVecTy,
                            xMemRefTy, plan.trips)) {
     guard.cleanup();
-    return false;
+    return bail("next-iteration row-block DMA emission failed");
   }
   b.setInsertionPointAfter(ifOp);
 
@@ -4177,18 +4249,18 @@ static bool lowerLayerNormRowBlockGroupDma(
       cloneBlockPrefixThrough(b, xMakeTensorPtr.getOperation(), outerMapping);
   if (!currentTensorPtrOp) {
     guard.cleanup();
-    return false;
+    return bail("failed to clone current-iteration x make_tensor_ptr prefix");
   }
   Value currentRowBaseIdx =
       extractTensorPtrIndex(b, loc, currentTensorPtrOp->getResult(0), 1);
   if (!currentRowBaseIdx) {
     guard.cleanup();
-    return false;
+    return bail("could not extract current row-block start index");
   }
   Value rowBlockStart = toI32(b, loc, currentRowBaseIdx);
   if (!rowBlockStart) {
     guard.cleanup();
-    return false;
+    return bail("failed to truncate row-block start index to i32");
   }
   auto rowLoop =
       scf::ForOp::create(b, loc, c0I32, cRowBlockI32, c1I32, ValueRange{});
@@ -4224,32 +4296,87 @@ static bool lowerLayerNormRowBlockGroupDma(
       makeRank1TensorPtr(b, loc, outMakeTensorPtr.getBase(), flatOutElements,
                          rowBaseElem, rowVecTy.getShape()[0]);
 
-  Value rowSum = emitLayerNormMeanLoopFromSpm(b, loc, meanLoop, rowSpmBase,
-                                              rowVecTy, rowSpmReadBytes);
-  if (!rowSum) {
-    guard.cleanup();
-    return false;
-  }
   Value denom =
       constantScalarFloat(b, loc, elemTy, static_cast<double>(rowElems));
   if (!denom) {
     guard.cleanup();
-    return false;
+    return bail("element type must be a float type to emit row-element denom");
   }
-  Value mean = arith::DivFOp::create(b, loc, rowSum, denom);
+  Value mean;
+  Value variance;
+  // Default to the shifted one-pass formulation: compute sum_d = Σ(x - c)
+  // and sum_d2 = Σ(x - c)^2 with c = x[0] in a single pass over SPM, then
+  //   mean = c + sum_d / N
+  //   var  = max(sum_d2 / N - (sum_d / N)^2, 0)
+  // This is Var(x - c) which equals Var(x) by translation invariance, but
+  // the magnitudes inside the subtraction are O(σ² + (mean - c)²) instead
+  // of O(E[x²]), so it does not suffer the catastrophic cancellation that
+  // makes raw E[x²] - E[x]² unsafe for transformer-residual inputs with
+  // non-trivial means. The cost is one extra subtract per element vs. raw
+  // sumsq and no extra SPM read pass over x.
+  //
+  // Two opt-in alternatives stay available for ablation:
+  //   TRITON_SPM_LAYERNORM_ROW_BLOCK_CENTERED=1 — strict two-pass centered
+  //     formulation (debug / numerically conservative).
+  //   TRITON_SPM_LAYERNORM_ROW_BLOCK_SUMSQ=1   — raw E[x²] - E[x]² (benchmark
+  //     ablation only; numerically unsafe for general inputs).
+  bool useCentered =
+      getEnvBool("TRITON_SPM_LAYERNORM_ROW_BLOCK_CENTERED", false);
+  bool useRawSumSquares =
+      getEnvBool("TRITON_SPM_LAYERNORM_ROW_BLOCK_SUMSQ", false);
+  if (useRawSumSquares) {
+    std::optional<LayerNormStatsValues> stats =
+        emitLayerNormSumAndSquareLoopFromSpm(b, loc, meanLoop, rowSpmBase,
+                                             rowVecTy, rowSpmReadBytes);
+    if (!stats) {
+      guard.cleanup();
+      return bail("sum + sum-of-squares loop emission failed");
+    }
+    mean = arith::DivFOp::create(b, loc, stats->sum, denom);
+    Value meanSquared = arith::MulFOp::create(b, loc, mean, mean);
+    Value avgSquares = arith::DivFOp::create(b, loc, stats->sumSquares, denom);
+    variance = arith::SubFOp::create(b, loc, avgSquares, meanSquared);
+  } else if (useCentered) {
+    Value rowSum = emitLayerNormMeanLoopFromSpm(b, loc, meanLoop, rowSpmBase,
+                                                rowVecTy, rowSpmReadBytes);
+    if (!rowSum) {
+      guard.cleanup();
+      return bail("mean loop emission failed");
+    }
+    mean = arith::DivFOp::create(b, loc, rowSum, denom);
 
-  Value rowVarSum = emitLayerNormVarianceLoopFromSpm(
-      b, loc, varLoop, rowSpmBase, rowVecTy, rowSpmReadBytes, mean);
-  if (!rowVarSum) {
-    guard.cleanup();
-    return false;
+    Value rowVarSum = emitLayerNormVarianceLoopFromSpm(
+        b, loc, varLoop, rowSpmBase, rowVecTy, rowSpmReadBytes, mean);
+    if (!rowVarSum) {
+      guard.cleanup();
+      return bail("variance loop emission failed");
+    }
+    variance = arith::DivFOp::create(b, loc, rowVarSum, denom);
+  } else {
+    std::optional<LayerNormShiftedStats> stats =
+        emitLayerNormShiftedSumLoopFromSpm(b, loc, meanLoop, rowSpmBase,
+                                           rowVecTy, rowSpmReadBytes);
+    if (!stats) {
+      guard.cleanup();
+      return bail("shifted sum + sum-of-squares loop emission failed");
+    }
+    Value meanDelta = arith::DivFOp::create(b, loc, stats->sumDelta, denom);
+    mean = arith::AddFOp::create(b, loc, stats->shift, meanDelta);
+    Value avgDelta2 = arith::DivFOp::create(b, loc, stats->sumDelta2, denom);
+    Value meanDeltaSquared =
+        arith::MulFOp::create(b, loc, meanDelta, meanDelta);
+    Value rawVariance =
+        arith::SubFOp::create(b, loc, avgDelta2, meanDeltaSquared);
+    // Round-off can push the variance slightly negative when c is close to
+    // the mean and the data is near-constant; clamp to zero so sqrt is safe.
+    Value zeroVar = constantScalarFloat(b, loc, elemTy, 0.0);
+    variance = arith::MaxNumFOp::create(b, loc, rawVariance, zeroVar);
   }
-  Value variance = arith::DivFOp::create(b, loc, rowVarSum, denom);
   Value eps = constantScalarFloat(b, loc, elemTy, 1e-5);
   Value one = constantScalarFloat(b, loc, elemTy, 1.0);
   if (!eps || !one) {
     guard.cleanup();
-    return false;
+    return bail("element type must be a float type for eps/one constants");
   }
   Value varPlusEps = arith::AddFOp::create(b, loc, variance, eps);
   Value sqrt = math::SqrtOp::create(b, loc, varPlusEps);
@@ -4259,7 +4386,7 @@ static bool lowerLayerNormRowBlockGroupDma(
           b, loc, normLoop, rowSpmBase, rowVecTy, rowSpmReadBytes, gammaPtr,
           betaPtr, outPtr, paramMemRefTy, outMemRefTy, mean, invStd)) {
     guard.cleanup();
-    return false;
+    return bail("normalize loop emission failed");
   }
 
   b.setInsertionPointAfter(rowLoop);
@@ -4685,6 +4812,22 @@ static bool transformReductionResidencyPlan(
       getEnvBool("TRITON_SPM_SOFTMAX_CACHE_EXP", true) &&
       plan.bufferRole == ReductionBufferRole::ResidentRowBlock &&
       plan.source == "Softmax x row block";
+  // The exp-cache rewrite assumes a canonical `exp(x - max)` chain in the
+  // exp_sum and normalize loops. Validate that up front so a broken pattern
+  // degrades to the no-cache schedule instead of producing wrong IR.
+  if (useSoftmaxExpCache && plan.consumers.size() >= 2) {
+    Operation *subOp = nullptr;
+    Operation *expOp = nullptr;
+    for (unsigned idx : {0u, 1u}) {
+      scf::ForOp consumerLoop = plan.consumers[idx].forOp;
+      if (!findSoftmaxExpChain(consumerLoop.getBody(),
+                               plan.consumers[idx].xLoad.readOp, &subOp,
+                               &expOp)) {
+        useSoftmaxExpCache = false;
+        break;
+      }
+    }
+  }
   if (useSoftmaxExpCache) {
     plan.requiredSpmSlots = std::max<int64_t>(plan.requiredSpmSlots, 3);
     plan.overhead +=
@@ -4754,16 +4897,23 @@ static bool transformReductionResidencyPlan(
       expSpmAddress = allocExp->address;
     }
     bool lowered = false;
+    std::string loweringReason;
     if (plan.source == "LayerNorm x row block")
       lowered = lowerLayerNormRowBlockGroupDma(
-          plan, allocRow->address, allocRow1->address, rowResidentHandledLoops);
+          plan, allocRow->address, allocRow1->address, rowResidentHandledLoops,
+          loweringReason);
     else
       lowered = lowerSoftmaxRowBlockGroupDma(
           plan, allocRow->address, allocRow1->address, rowResidentHandledLoops,
           expSpmAddress);
-    if (!lowered)
-      return reject("unsupported_reduction_residency_plan",
-                    "row-block group DMA double-buffer lowering failed");
+    if (!lowered) {
+      std::string detail =
+          loweringReason.empty()
+              ? std::string("row-block group DMA double-buffer lowering failed")
+              : "row-block group DMA double-buffer lowering failed: " +
+                    loweringReason;
+      return reject("unsupported_reduction_residency_plan", detail);
+    }
   } else if (plan.producerPass == ReductionProducerPass::FillOnFirstPass) {
     scf::ForOp newProducer = cloneLoopWithRowResidentX(
         plan.producer, allocRow->address, plan.elemBytes,
