@@ -14,6 +14,11 @@
 //   3) Reduction/streaming double-buffering: single loop with one or more
 //      tiled loads sharing the loop IV.  Each load gets two SPM buffers; the
 //      next chunk is prefetched while the current chunk is consumed.
+//   4) Indirect tile gather (opt-in, embedding-bag style): a fixed-trip
+//      gather loop whose body reads a contiguous row `table[idx, :]` with
+//      idx loaded from a separate indices buffer.  The loop is preceded by
+//      L_MAX 1D DMAs that stage the rows into SPM, followed by a single
+//      dma_wait; the loop body is rewritten to read from SPM.
 //
 // Loads that don't match these patterns are left unchanged (cache path).
 //
@@ -4803,6 +4808,779 @@ static bool transformFunctionScopeAttentionPVGenerated(
   return changed;
 }
 
+//===----------------------------------------------------------------------===//
+// Function-scope indirect-tile gather staging.
+//
+// Recognizes the canonical embedding-bag IR idiom:
+//
+//   scf.for %k = c0 to L_MAX step c1 iter_args(%acc = ...) -> vector<Dxf32> {
+//     %idx_ptr = tt.addptr %indices_base, %k : !tt.ptr<i32>, i32
+//     %idx     = tt.load %idx_ptr : !tt.ptr<i32>
+//     %off     = arith.muli %idx, c_D : i32           // element offset
+//     %tp      = tt.make_tensor_ptr %table_base, [...], [%c1], [%off]
+//     %mr      = triton_cpu.extract_memref %tp
+//     %off_idx = triton_cpu.extract_indices %tp
+//     %v       = vector.transfer_read %mr[%off_idx]   : memref, vector<Dxf32>
+//     %new_acc = arith.addf %acc, %v
+//     scf.yield %new_acc
+//   }
+//
+// On match, the lowering allocates `L_MAX * D * elemBytes` in SPM, emits a
+// pre-loop DMA setup sequence that copies the L_MAX rows table[idx[k], :]
+// into `staged_rows[k, :]` in SPM (one 1D DMA per row, all enqueued before a
+// single wait), and rewrites the loop-body table read to come from SPM.
+//
+// v1 caveats (documented in docs/plans/embedding-bag-irregular-plan.md):
+//   - Fixed-length bags only: the recognizer requires a statically-known
+//     positive trip count.
+//   - No bag-level overlap.  A single dma_wait drains the L_MAX descriptors
+//     before the consume loop.
+//   - No duplicate-index reuse.  staged_rows[k] is written once and read by
+//     a single SPM transfer_read per k iteration.
+//===----------------------------------------------------------------------===//
+
+struct IndirectTileGatherInfo {
+  scf::ForOp forOp;
+  int64_t trips = 0;          // L_MAX
+  vector::TransferReadOp readOp;
+  triton::MakeTensorPtrOp tableMakeTensorPtr;
+  triton::cpu::ExtractMemRefOp tableExtractMemRef;
+  triton::cpu::ExtractIndicesOp tableExtractIndices;
+  Value tableBase;            // !tt.ptr<f32> function arg
+  arith::MulIOp rowOffsetMul; // arith.muli %idx, %c_D
+  triton::LoadOp idxLoad;     // tt.load that produced %idx
+  triton::AddPtrOp idxAdvance;// tt.addptr %indices_base_outside, %k
+  Value indicesBaseOutsideLoop; // value of the addptr base used inside loop
+  Value indicesBaseFuncArg;   // chased function arg (indices_ptr)
+  VectorType vecTy;           // vector<Dxf32>
+  int64_t rowElems = 0;       // D
+  int64_t rowBytes = 0;       // D * elemBytes
+  unsigned elemBytes = 0;
+};
+
+static BlockArgument chaseTritonPtrToFuncArg(Value value,
+                                             FunctionOpInterface funcOp,
+                                             unsigned depth = 0) {
+  if (!value || depth > 16)
+    return {};
+  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    if (blockArg.getOwner() == &funcOp.getFunctionBody().front())
+      return blockArg;
+    return {};
+  }
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp)
+    return {};
+  if (auto add = dyn_cast<triton::AddPtrOp>(defOp))
+    return chaseTritonPtrToFuncArg(add.getPtr(), funcOp, depth + 1);
+  return {};
+}
+
+/// Match the canonical indirect-tile gather pattern described above.  Returns
+/// std::nullopt and fills `reason{Code,Text}` on any failure so the caller
+/// can record a precise rejection.
+static std::optional<IndirectTileGatherInfo>
+matchIndirectTileGather(scf::ForOp forOp, FunctionOpInterface funcOp,
+                        std::string &reasonCode, std::string &reasonText) {
+  auto setReason = [&](StringRef code, StringRef text) {
+    reasonCode = code.str();
+    reasonText = text.str();
+    return std::optional<IndirectTileGatherInfo>{};
+  };
+
+  auto trips = getExactStaticTripCount(forOp);
+  if (!trips || *trips <= 0)
+    return setReason("dynamic_gather_bound",
+                     "indirect-tile gather requires a statically-known "
+                     "positive trip count");
+
+  // Find exactly one vector.transfer_read in the loop body whose source
+  // memref does not already live in SPM and whose result is consumed by an
+  // accumulator-shaped chain (typically arith.addf into the iter_arg yield).
+  SmallVector<vector::TransferReadOp, 4> readsInBody;
+  forOp.getBody()->walk([&](vector::TransferReadOp op) {
+    auto memRefTy = dyn_cast<MemRefType>(op.getBase().getType());
+    if (!memRefTy)
+      return;
+    if (memRefTy.getMemorySpaceAsInt() == SPM_ADDR_SPACE)
+      return;
+    readsInBody.push_back(op);
+  });
+  if (readsInBody.empty())
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires at least one DRAM "
+                     "vector.transfer_read in the loop body");
+  if (readsInBody.size() != 1)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires exactly one DRAM "
+                     "vector.transfer_read in the loop body");
+
+  vector::TransferReadOp readOp = readsInBody.front();
+  auto vecTy = dyn_cast<VectorType>(readOp.getType());
+  if (!vecTy || vecTy.getRank() != 1)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires a rank-1 vector.transfer_read");
+  Type elemTy = vecTy.getElementType();
+  if (!elemTy.isF32())
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather currently supports fp32 rows only");
+  unsigned elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
+  int64_t rowElems = vecTy.getNumElements();
+  int64_t rowBytes = rowElems * elemBytes;
+
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!memRefTy || memRefTy.getRank() != 1)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires a rank-1 memref base");
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides) || strides.size() != 1 ||
+      strides[0] != 1)
+    return setReason("non_static_row_bytes",
+                     "indirect-tile gather requires a unit-stride base memref");
+
+  // The memref must come from triton_cpu.extract_memref on a tt.make_tensor_ptr.
+  auto extractMR =
+      readOp.getBase().getDefiningOp<triton::cpu::ExtractMemRefOp>();
+  if (!extractMR)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires extract_memref on a "
+                     "tt.make_tensor_ptr");
+  auto makeTensorPtr =
+      extractMR.getSrc().getDefiningOp<triton::MakeTensorPtrOp>();
+  if (!makeTensorPtr)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires a tt.make_tensor_ptr "
+                     "source for the row read");
+
+  // The make_tensor_ptr's base must be a function argument (the table).
+  Value tableBase = makeTensorPtr.getBase();
+  BlockArgument tableArg = chaseTritonPtrToFuncArg(tableBase, funcOp);
+  if (!tableArg)
+    return setReason("table_base_not_function_argument",
+                     "indirect-tile gather requires the table base to be a "
+                     "function argument");
+
+  // The make_tensor_ptr must have a single offset that is `arith.muli %idx, %c_D`.
+  auto offsets = makeTensorPtr.getOffsets();
+  if (offsets.size() != 1)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires a single offset on the "
+                     "row tensor pointer");
+  auto rowOffsetMul = offsets.front().getDefiningOp<arith::MulIOp>();
+  if (!rowOffsetMul)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires the row offset to be "
+                     "arith.muli %idx, %c_D");
+  auto rhsConst = getConstantIntValue(rowOffsetMul.getRhs());
+  Value idxValue = rowOffsetMul.getLhs();
+  if (!rhsConst) {
+    rhsConst = getConstantIntValue(rowOffsetMul.getLhs());
+    idxValue = rowOffsetMul.getRhs();
+  }
+  if (!rhsConst)
+    return setReason("non_static_row_bytes",
+                     "indirect-tile gather requires the row-element width to "
+                     "be a compile-time constant");
+  if (*rhsConst != rowElems)
+    return setReason("non_static_row_bytes",
+                     "indirect-tile gather requires the row-element width on "
+                     "the muli to match the vector width");
+
+  // %idx must come from tt.load on a tt.addptr chain that:
+  //   - starts at a function argument distinct from the table base, and
+  //   - includes the loop induction variable somewhere on the inner addptr.
+  auto idxLoad = idxValue.getDefiningOp<triton::LoadOp>();
+  if (!idxLoad)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires the index to come from a "
+                     "tt.load");
+  auto idxAdvance = idxLoad.getPtr().getDefiningOp<triton::AddPtrOp>();
+  if (!idxAdvance)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires the index pointer to be "
+                     "advanced by tt.addptr");
+  if (idxAdvance->getParentRegion() != &forOp.getRegion())
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires the per-iteration "
+                     "tt.addptr to live inside the gather loop");
+  if (idxAdvance.getOffset() != forOp.getInductionVar())
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires the per-iteration "
+                     "tt.addptr offset to be the loop induction variable");
+
+  // The base of the inner addptr must be defined outside the loop (so its
+  // value is loop-invariant) and chase back to a different function arg.
+  Value indicesBaseOutside = idxAdvance.getPtr();
+  if (auto *baseDef = indicesBaseOutside.getDefiningOp())
+    if (baseDef->getParentRegion() == &forOp.getRegion())
+      return setReason("unsupported_pattern",
+                       "indirect-tile gather requires the indices base to be "
+                       "defined outside the gather loop");
+  BlockArgument indicesArg =
+      chaseTritonPtrToFuncArg(indicesBaseOutside, funcOp);
+  if (!indicesArg)
+    return setReason("index_not_function_argument",
+                     "indirect-tile gather requires the indices base to chase "
+                     "to a function argument");
+  if (indicesArg == tableArg)
+    return setReason("unsupported_pattern",
+                     "indirect-tile gather requires the indices and table to "
+                     "be distinct function arguments");
+
+  // No store inside the loop may target the table (read-only table).
+  bool sawAliasingStore = false;
+  forOp.getBody()->walk([&](vector::TransferWriteOp writeOp) {
+    auto writeMemRefTy = dyn_cast<MemRefType>(writeOp.getBase().getType());
+    if (writeMemRefTy && writeMemRefTy.getMemorySpaceAsInt() != SPM_ADDR_SPACE)
+      sawAliasingStore = true;
+  });
+  if (sawAliasingStore)
+    return setReason("table_aliased_with_store",
+                     "indirect-tile gather requires the table to be read-only "
+                     "within the gather loop");
+
+  IndirectTileGatherInfo info;
+  info.forOp = forOp;
+  info.trips = *trips;
+  info.readOp = readOp;
+  info.tableMakeTensorPtr = makeTensorPtr;
+  info.tableExtractMemRef = extractMR;
+  info.tableExtractIndices =
+      readOp.getIndices().empty()
+          ? triton::cpu::ExtractIndicesOp{}
+          : readOp.getIndices().front().getDefiningOp<
+              triton::cpu::ExtractIndicesOp>();
+  info.tableBase = tableBase;
+  info.rowOffsetMul = rowOffsetMul;
+  info.idxLoad = idxLoad;
+  info.idxAdvance = idxAdvance;
+  info.indicesBaseOutsideLoop = indicesBaseOutside;
+  info.indicesBaseFuncArg = indicesArg;
+  info.vecTy = vecTy;
+  info.rowElems = rowElems;
+  info.rowBytes = rowBytes;
+  info.elemBytes = elemBytes;
+  return info;
+}
+
+static SPMPromotionRecord
+makeIndirectTileGatherRecord(const IndirectTileGatherInfo &info,
+                             int64_t spmAddress) {
+  SPMPromotionRecord record;
+  record.source = "indirect table tile";
+  record.scope = "function-scope embedding-bag stage";
+  record.shape.push_back(info.trips);
+  record.shape.push_back(info.rowElems);
+  record.uses = info.trips;
+  record.copyIn = "DMA descriptor list";
+  record.copyOut = "none";
+  record.bytes = info.trips * info.rowBytes;
+  record.spmAddress = spmAddress;
+  record.overhead =
+      "L_MAX 1D DMA descriptors plus one dma_wait before the consume loop";
+  record.benefit =
+      "stages a bag's L_MAX irregular embedding rows into SPM so the consume "
+      "loop reads them densely from addrspace(3)";
+  record.reasonCode = "accepted_indirect_tile_staging";
+  record.reason =
+      "accepted by the opt-in indirect-tile gather staging prototype";
+  return record;
+}
+
+static bool transformFunctionScopeIndirectTileLoop(
+    scf::ForOp forOp, FunctionOpInterface funcOp,
+    FunctionScopeAttentionSpmState &state, SPMPromotionReport *report);
+
+//===----------------------------------------------------------------------===//
+// C2: double-buffered indirect-tile lowering (BAG_GROUP > 1).
+//
+// When the inner gather loop matched above is nested inside an outer scf.for
+// whose IV flows into the per-bag indices base, we can ping-pong row staging
+// across iterations of the outer loop:
+//
+//   prefetch bag 0 into tile0
+//   for local_b in [0, BAG_GROUP):
+//     dma_wait()                       // drains the previous prefetch
+//     if local_b + 1 < BAG_GROUP:
+//       prefetch bag local_b+1 into 1-cur_buf
+//     consume bag local_b from cur_buf
+//     cur_buf <- 1 - cur_buf
+//
+// Gated on TRITON_SPM_INDIRECT_TILE_DOUBLE_BUFFER=1 so the single-buffer
+// path stays the default until the overlap win is validated.
+//===----------------------------------------------------------------------===//
+static bool tryTransformDoubleBufferedIndirectTile(
+    IndirectTileGatherInfo &info,
+    FunctionScopeAttentionSpmState &state, SPMPromotionReport *report) {
+  if (!getEnvBool("TRITON_SPM_INDIRECT_TILE_DOUBLE_BUFFER", false))
+    return false;
+
+  scf::ForOp innerLoop = info.forOp;
+  Operation *baseDefOp = info.indicesBaseOutsideLoop.getDefiningOp();
+  if (!baseDefOp)
+    return false;
+
+  // Find the immediately-enclosing scf.for of the baseDef op; that is the
+  // outer bag loop.
+  scf::ForOp outerLoop;
+  for (Operation *p = baseDefOp->getParentOp(); p; p = p->getParentOp()) {
+    if (auto outerFor = dyn_cast<scf::ForOp>(p)) {
+      outerLoop = outerFor;
+      break;
+    }
+  }
+  if (!outerLoop)
+    return false;
+  if (innerLoop->getParentRegion() != &outerLoop.getRegion())
+    return false;
+
+  auto outerTrip = getExactStaticTripCount(outerLoop);
+  if (!outerTrip || *outerTrip <= 1)
+    return false;
+  auto outerStepCst = getConstantIntValue(outerLoop.getStep());
+  if (!outerStepCst || *outerStepCst != 1)
+    return false;
+  if (outerLoop.getNumRegionIterArgs() != 0)
+    return false;
+  if (!outerLoop.getInductionVar().getType().isInteger(32))
+    return false;
+
+  // Walk back through the per-bag indices-base computation, collecting all
+  // ops inside the outer body that need to be cloned (with outerIV remapped)
+  // when we issue the pre-loop prefetch and the in-loop next-bag prefetch.
+  Region &outerRegion = outerLoop.getRegion();
+  Value outerIv = outerLoop.getInductionVar();
+  SmallVector<Operation *, 8> deps;
+  DenseSet<Operation *> visited;
+  SmallVector<Value, 16> worklist{info.indicesBaseOutsideLoop};
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (v == outerIv)
+      continue;
+    if (isa<BlockArgument>(v))
+      continue;
+    Operation *defOp = v.getDefiningOp();
+    if (!defOp)
+      continue;
+    if (defOp->getParentRegion() != &outerRegion)
+      continue;
+    if (!visited.insert(defOp).second)
+      continue;
+    if (!isa<arith::AddIOp, arith::SubIOp, arith::MulIOp,
+             arith::IndexCastOp, arith::ExtSIOp, arith::TruncIOp,
+             triton::AddPtrOp, triton::LoadOp>(defOp))
+      return false;
+    deps.push_back(defOp);
+    for (Value op : defOp->getOperands())
+      worklist.push_back(op);
+  }
+  std::reverse(deps.begin(), deps.end());
+
+  // Reserve two SPM tiles for ping-pong staging.
+  int64_t rowBytes = info.rowBytes;
+  int64_t tileBytes = info.trips * rowBytes;
+  int64_t totalSpmBytes = 2 * tileBytes;
+  auto alloc = state.alloc(totalSpmBytes, /*alignment=*/64);
+  if (!alloc)
+    return false;
+  int64_t spmAddress = *alloc;
+
+  Location loc = innerLoop.getLoc();
+  OpBuilder b(outerLoop);
+
+  Value spmBaseI64 = i64Cst(b, loc, spmAddress);
+  Value tileBytesI64 = i64Cst(b, loc, tileBytes);
+  Value rowBytesI64 = i64Cst(b, loc, rowBytes);
+
+  // Hoist the table base pointer (loop-invariant).
+  Value zeroI32 = i32Cst(b, loc, 0);
+  SmallVector<Value> zeroOffsets(info.tableMakeTensorPtr.getOffsets().size(),
+                                 zeroI32);
+  Type tableTpTy = info.tableMakeTensorPtr.getType();
+  Value baseTablePtr = triton::MakeTensorPtrOp::create(
+      b, loc, tableTpTy, info.tableBase,
+      info.tableMakeTensorPtr.getShape(),
+      info.tableMakeTensorPtr.getStrides(), zeroOffsets,
+      info.tableMakeTensorPtr.getOrderAttr());
+  Type baseMemRefTy = info.tableExtractMemRef.getType();
+  Value baseMemRef = triton::cpu::ExtractMemRefOp::create(
+      b, loc, baseMemRefTy, baseTablePtr);
+  Value tableBaseIdx =
+      memref::ExtractAlignedPointerAsIndexOp::create(b, loc, baseMemRef);
+  Value tableBaseI64 =
+      arith::IndexCastOp::create(b, loc, b.getI64Type(), tableBaseIdx);
+
+  // Emit an L_MAX-row staging burst from `indicesBase` into `tileBase`.
+  // Caller owns the eventual dma_wait.
+  auto emitPrefetch = [&](OpBuilder &eb, Value tileBase, Value indicesBase) {
+    Value innerLb = innerLoop.getLowerBound();
+    Value innerUb = innerLoop.getUpperBound();
+    Value innerStep = innerLoop.getStep();
+    auto setupLoop = scf::ForOp::create(eb, loc, innerLb, innerUb, innerStep,
+                                        ValueRange{});
+    OpBuilder sb(setupLoop.getBody()->getTerminator());
+    Value k = setupLoop.getInductionVar();
+    Value idxKPtr = triton::AddPtrOp::create(
+        sb, loc, indicesBase.getType(), indicesBase, k);
+    Value idxVal = triton::LoadOp::create(
+        sb, loc, idxKPtr, /*mask=*/Value{}, /*other=*/Value{},
+        /*boundaryCheck=*/ArrayRef<int32_t>{},
+        /*padding=*/std::optional<triton::PaddingOption>{},
+        info.idxLoad.getCache(), info.idxLoad.getEvict(),
+        info.idxLoad.getIsVolatile());
+    Value idxI64 = toI64(sb, loc, idxVal);
+    Value srcOff = arith::MulIOp::create(sb, loc, idxI64, rowBytesI64);
+    Value srcAddr = arith::AddIOp::create(sb, loc, tableBaseI64, srcOff);
+
+    Value kI64 = toI64(sb, loc, k);
+    Value dstOff = arith::MulIOp::create(sb, loc, kI64, rowBytesI64);
+    Value dstAddr = arith::AddIOp::create(sb, loc, tileBase, dstOff);
+
+    triton::cpu::DmaEnqueue2DOp::create(
+        sb, loc, dstAddr, srcAddr,
+        /*width=*/rowBytesI64,
+        /*height=*/i64Cst(sb, loc, 1),
+        /*src_stride=*/rowBytesI64,
+        /*dst_stride=*/rowBytesI64);
+  };
+
+  // Pre-loop: prefetch bag 0 (substitute outerIv -> lb) into tile 0.
+  IRMapping iter0Map;
+  iter0Map.map(outerIv, outerLoop.getLowerBound());
+  for (Operation *op : deps)
+    b.clone(*op, iter0Map);
+  Value indicesBaseIter0 = iter0Map.lookup(info.indicesBaseOutsideLoop);
+  emitPrefetch(b, spmBaseI64, indicesBaseIter0);
+
+  // Build the replacement outer loop with a cur_buf i32 iter-arg (init 0).
+  // Note: scf::ForOp::create with non-empty iter_args does NOT auto-insert a
+  // terminator (it's the caller's responsibility to specify what to yield).
+  // Use a body builder callback to install a placeholder yield(init); we
+  // rewrite it to yield(1-cur_buf) once the body is fully populated.
+  Value zeroI32Init = i32Cst(b, loc, 0);
+  auto newOuter = scf::ForOp::create(
+      b, loc, outerLoop.getLowerBound(), outerLoop.getUpperBound(),
+      outerLoop.getStep(), ValueRange{zeroI32Init},
+      [](OpBuilder &bb, Location bbLoc, Value /*iv*/, ValueRange iters) {
+        scf::YieldOp::create(bb, bbLoc, ValueRange{iters[0]});
+      });
+
+  Block *oldBody = outerLoop.getBody();
+  Block *newBody = newOuter.getBody();
+  Value curBuf = newOuter.getRegionIterArgs()[0];
+  Value newIv = newOuter.getInductionVar();
+
+  // dma_wait at the top of each iteration: drains the prefetch issued in the
+  // previous iteration (or the pre-loop one for iter 0).
+  OpBuilder nb(newBody, newBody->begin());
+  triton::cpu::DmaWaitOp::create(nb, loc);
+
+  // Conditional next-bag prefetch.
+  Value oneI32 = i32Cst(nb, loc, 1);
+  Value nextIv = arith::AddIOp::create(nb, loc, newIv, oneI32);
+  Value ubVal = newOuter.getUpperBound();
+  Value cond = arith::CmpIOp::create(nb, loc, arith::CmpIPredicate::slt,
+                                     nextIv, ubVal);
+  auto ifOp = scf::IfOp::create(nb, loc, /*resultTypes=*/TypeRange{}, cond,
+                                /*withElseRegion=*/false);
+  {
+    OpBuilder ib(ifOp.thenBlock(), ifOp.thenBlock()->begin());
+    IRMapping nextMap;
+    nextMap.map(outerIv, nextIv);
+    for (Operation *op : deps)
+      ib.clone(*op, nextMap);
+    Value indicesBaseNext = nextMap.lookup(info.indicesBaseOutsideLoop);
+    Value oneI32Local = i32Cst(ib, loc, 1);
+    Value nextBufI32 = arith::SubIOp::create(ib, loc, oneI32Local, curBuf);
+    Value nextBufI64 =
+        arith::ExtSIOp::create(ib, loc, ib.getI64Type(), nextBufI32);
+    Value nextBufOff =
+        arith::MulIOp::create(ib, loc, nextBufI64, tileBytesI64);
+    Value nextTileBase =
+        arith::AddIOp::create(ib, loc, spmBaseI64, nextBufOff);
+    emitPrefetch(ib, nextTileBase, indicesBaseNext);
+  }
+
+  // Current tile base = spmBase + cur_buf * tileBytes.
+  Value curBufI64 =
+      arith::ExtSIOp::create(nb, loc, nb.getI64Type(), curBuf);
+  Value curBufOff = arith::MulIOp::create(nb, loc, curBufI64, tileBytesI64);
+  Value curTileBase = arith::AddIOp::create(nb, loc, spmBaseI64, curBufOff);
+
+  // Migrate the body of the old outer loop (skip its terminator), remapping
+  // the outer IV to the new IV.
+  IRMapping migrate;
+  migrate.map(outerIv, newIv);
+  scf::ForOp clonedInner;
+  for (Operation &op : *oldBody) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+    Operation *cloned = nb.clone(op, migrate);
+    if (&op == innerLoop.getOperation())
+      clonedInner = cast<scf::ForOp>(cloned);
+  }
+  if (!clonedInner) {
+    newOuter.erase();
+    return false;
+  }
+
+  // Inside the cloned inner loop, replace the DRAM transfer_read with an SPM
+  // read into curTileBase + k * rowBytes.
+  vector::TransferReadOp clonedReadOp;
+  clonedInner.getBody()->walk([&](vector::TransferReadOp readOp) {
+    auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+    if (!memRefTy)
+      return;
+    if (memRefTy.getMemorySpaceAsInt() == SPM_ADDR_SPACE)
+      return;
+    clonedReadOp = readOp;
+  });
+  if (!clonedReadOp) {
+    newOuter.erase();
+    return false;
+  }
+
+  OpBuilder rb(clonedReadOp);
+  Value kBody = clonedInner.getInductionVar();
+  Value kBodyI64 = toI64(rb, loc, kBody);
+  Value bodyOff = arith::MulIOp::create(rb, loc, kBodyI64, rowBytesI64);
+  Value rowSpmAddr = arith::AddIOp::create(rb, loc, curTileBase, bodyOff);
+  Value spmRead = emitSpmReadWithStrides(
+      rb, loc, rowSpmAddr, info.vecTy, getDefaultSpmMemStrides(info.vecTy));
+  clonedReadOp.getResult().replaceAllUsesWith(spmRead);
+  clonedReadOp.erase();
+
+  // Best-effort cleanup of the now-dead DRAM-side staging chain inside the
+  // cloned inner body.
+  auto eraseIfDead = [](Operation *op) {
+    if (op && op->use_empty())
+      op->erase();
+  };
+  auto lookupClonedOp = [&](Operation *orig) -> Operation * {
+    if (!orig || orig->getNumResults() == 0)
+      return nullptr;
+    Value v = migrate.lookupOrNull(orig->getResult(0));
+    return v ? v.getDefiningOp() : nullptr;
+  };
+  eraseIfDead(lookupClonedOp(info.tableExtractMemRef));
+  if (info.tableExtractIndices)
+    eraseIfDead(lookupClonedOp(info.tableExtractIndices));
+  eraseIfDead(lookupClonedOp(info.tableMakeTensorPtr));
+  eraseIfDead(lookupClonedOp(info.rowOffsetMul));
+  eraseIfDead(lookupClonedOp(info.idxLoad));
+  eraseIfDead(lookupClonedOp(info.idxAdvance));
+
+  // Replace the new outer loop's terminator yield (currently yields the
+  // single zero iter-arg) with `yield(1 - cur_buf)`.
+  scf::YieldOp oldYield = cast<scf::YieldOp>(newBody->getTerminator());
+  OpBuilder yb(oldYield);
+  Value oneI32Yield = i32Cst(yb, loc, 1);
+  Value flipBuf = arith::SubIOp::create(yb, loc, oneI32Yield, curBuf);
+  scf::YieldOp::create(yb, loc, ValueRange{flipBuf});
+  oldYield.erase();
+
+  // Drop the old outer scf.for (its body has been migrated).
+  outerLoop.erase();
+
+  if (report) {
+    SPMPromotionRecord record;
+    record.source = "indirect table tile (double-buffered)";
+    record.scope = "function-scope embedding-bag stage (BAG_GROUP)";
+    record.shape.push_back(info.trips);
+    record.shape.push_back(info.rowElems);
+    record.uses = info.trips * (*outerTrip);
+    record.copyIn = "DMA descriptor list (ping-pong)";
+    record.copyOut = "none";
+    record.bytes = 2 * tileBytes;
+    record.spmAddress = spmAddress;
+    record.overhead = "2 SPM tiles of L_MAX rows; per-bag dma_wait plus "
+                      "conditional next-bag prefetch into the inactive tile";
+    record.benefit = "overlaps next-bag row staging with current-bag consume "
+                     "by ping-ponging two SPM tiles across the outer bag loop";
+    record.reasonCode = "accepted_indirect_tile_double_buffered";
+    record.reason =
+        "accepted by the opt-in indirect-tile gather double-buffer prototype";
+    report->records.push_back(record);
+  }
+
+  return true;
+}
+
+static bool transformFunctionScopeIndirectTileLoop(
+    scf::ForOp forOp, FunctionOpInterface funcOp,
+    FunctionScopeAttentionSpmState &state, SPMPromotionReport *report) {
+  auto reject = [&](StringRef reasonCode, StringRef reason) {
+    if (report)
+      report->rejections.push_back(makePromotionRejection(
+          "indirect_tile_gather", reasonCode, reason));
+    return false;
+  };
+
+  std::string reasonCode;
+  std::string reasonText;
+  auto match = matchIndirectTileGather(forOp, funcOp, reasonCode, reasonText);
+  if (!match) {
+    if (!reasonCode.empty())
+      return reject(reasonCode, reasonText);
+    return false;
+  }
+  IndirectTileGatherInfo info = *match;
+
+  // C2: try the ping-pong / double-buffered lowering first when the inner
+  // gather sits inside an outer scf.for over bag groups.  C2 is opt-in via
+  // TRITON_SPM_INDIRECT_TILE_DOUBLE_BUFFER and has its own implicit
+  // amortization story (the SPM tile is reused across the outer bag loop),
+  // so it bypasses the C1 staged-bytes threshold below.  Falls through to
+  // the C1 single-buffer lowering if the outer pattern is not present.
+  if (tryTransformDoubleBufferedIndirectTile(info, state, report))
+    return true;
+
+  // Profitability gate (opt-in via TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY).
+  // The 1D-enqueue lowering pays one DMA descriptor + one SPM round-trip per
+  // staged row.  Below an amortization threshold the descriptor / wait /
+  // SPM-read cost outruns the cache miss it would have replaced.  The
+  // default threshold rejects the smoke and small presets and admits only the
+  // medium preset, matching the docs/plans/embedding-bag-irregular-plan.md
+  // honest-scope discussion.
+  int64_t totalStagedBytes = info.trips * info.rowBytes;
+  bool enableProfit =
+      getEnvBool("TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY", false);
+  if (enableProfit) {
+    int64_t minBytes =
+        getEnvInt64("TRITON_SPM_INDIRECT_TILE_MIN_BYTES", /*default=*/8192);
+    if (totalStagedBytes < minBytes)
+      return reject("indirect_tile_below_amortization_threshold",
+                    "indirect-tile gather staged bytes are below the "
+                    "profitability threshold; leave on the cache path");
+  }
+
+  // Reserve SPM for the staged rows.
+  auto alloc = state.alloc(totalStagedBytes, /*alignment=*/64);
+  if (!alloc)
+    return reject("indirect_tile_below_amortization_threshold",
+                  "indirect-tile gather staged rows do not fit in the "
+                  "available function-scope SPM budget");
+  int64_t spmAddress = *alloc;
+
+  OpBuilder b(forOp);
+  Location loc = forOp.getLoc();
+  Value spmBaseI64 = i64Cst(b, loc, spmAddress);
+  Value rowBytesI64 = i64Cst(b, loc, info.rowBytes);
+
+  // Derive the table base address as i64 (loop-invariant).  We rebuild a
+  // make_tensor_ptr with offset 0 so we can call extract_memref + get the
+  // aligned pointer outside the loop without having to introspect Triton's
+  // pointer encoding.
+  Value zeroI32 = i32Cst(b, loc, 0);
+  SmallVector<Value> zeroOffsets(info.tableMakeTensorPtr.getOffsets().size(),
+                                 zeroI32);
+  Type tableTpTy = info.tableMakeTensorPtr.getType();
+  Value baseTablePtr = triton::MakeTensorPtrOp::create(
+      b, loc, tableTpTy, info.tableBase, info.tableMakeTensorPtr.getShape(),
+      info.tableMakeTensorPtr.getStrides(), zeroOffsets,
+      info.tableMakeTensorPtr.getOrderAttr());
+  Type baseMemRefTy = info.tableExtractMemRef.getType();
+  Value baseMemRef = triton::cpu::ExtractMemRefOp::create(
+      b, loc, baseMemRefTy, baseTablePtr);
+  Value tableBaseIdx =
+      memref::ExtractAlignedPointerAsIndexOp::create(b, loc, baseMemRef);
+  Value tableBaseI64 =
+      arith::IndexCastOp::create(b, loc, b.getI64Type(), tableBaseIdx);
+
+  // Emit the DMA setup loop.  One 1D DMA per row, all enqueued first; one
+  // dma_wait at the end drains the L_MAX descriptors before the consume loop
+  // reads from SPM.  The descriptor count fits inside the engine's default
+  // 32-deep queue for the workloads listed in the plan (L_MAX in {8,16,32}).
+  Value lb = forOp.getLowerBound();
+  Value ub = forOp.getUpperBound();
+  Value step = forOp.getStep();
+  auto setupLoop = scf::ForOp::create(b, loc, lb, ub, step, ValueRange{});
+  {
+    OpBuilder sb(setupLoop.getBody()->getTerminator());
+    Value k = setupLoop.getInductionVar();
+    Value idxKPtr = triton::AddPtrOp::create(
+        sb, loc, info.indicesBaseOutsideLoop.getType(),
+        info.indicesBaseOutsideLoop, k);
+    Value idxVal = triton::LoadOp::create(
+        sb, loc, idxKPtr, /*mask=*/Value{}, /*other=*/Value{},
+        /*boundaryCheck=*/ArrayRef<int32_t>{},
+        /*padding=*/std::optional<triton::PaddingOption>{},
+        info.idxLoad.getCache(), info.idxLoad.getEvict(),
+        info.idxLoad.getIsVolatile());
+    Value idxI64 = toI64(sb, loc, idxVal);
+    Value srcOff = arith::MulIOp::create(sb, loc, idxI64, rowBytesI64);
+    Value srcAddr = arith::AddIOp::create(sb, loc, tableBaseI64, srcOff);
+
+    Value kI64 = toI64(sb, loc, k);
+    Value dstOff = arith::MulIOp::create(sb, loc, kI64, rowBytesI64);
+    Value dstAddr = arith::AddIOp::create(sb, loc, spmBaseI64, dstOff);
+
+    triton::cpu::DmaEnqueue2DOp::create(
+        sb, loc, dstAddr, srcAddr,
+        /*width=*/rowBytesI64,
+        /*height=*/i64Cst(sb, loc, 1),
+        /*src_stride=*/rowBytesI64,
+        /*dst_stride=*/rowBytesI64);
+  }
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  // Rewrite the per-iteration table read to come from SPM.  Insertion point
+  // is right before the existing read so the SPM transfer_read reuses the
+  // same body context (loop IV, etc.).
+  OpBuilder rb(info.readOp);
+  Value kBody = forOp.getInductionVar();
+  Value kBodyI64 = toI64(rb, loc, kBody);
+  Value bodyOff = arith::MulIOp::create(rb, loc, kBodyI64, rowBytesI64);
+  Value rowSpmAddr = arith::AddIOp::create(rb, loc, spmBaseI64, bodyOff);
+  Value spmRead = emitSpmReadWithStrides(
+      rb, loc, rowSpmAddr, info.vecTy, getDefaultSpmMemStrides(info.vecTy));
+
+  info.readOp.getResult().replaceAllUsesWith(spmRead);
+  vector::TransferReadOp deadRead = info.readOp;
+  deadRead.erase();
+  auto eraseIfDead = [](Operation *op) {
+    if (op && op->use_empty())
+      op->erase();
+  };
+  eraseIfDead(info.tableExtractMemRef);
+  if (info.tableExtractIndices)
+    eraseIfDead(info.tableExtractIndices);
+  eraseIfDead(info.tableMakeTensorPtr);
+  eraseIfDead(info.rowOffsetMul);
+  eraseIfDead(info.idxLoad);
+  eraseIfDead(info.idxAdvance);
+
+  if (report)
+    report->records.push_back(makeIndirectTileGatherRecord(info, spmAddress));
+  return true;
+}
+
+static bool transformFunctionScopeIndirectTile(
+    FunctionOpInterface funcOp, FunctionScopeAttentionSpmState &state,
+    SPMPromotionReport *report) {
+  bool changed = false;
+  // The C2 double-buffered lowering rewrites the outer bag-group scf.for in
+  // place, which invalidates any scf.for handles collected before the
+  // transform.  Re-walk after every successful transform so we never touch a
+  // stale Operation pointer.
+  while (true) {
+    SmallVector<scf::ForOp, 4> loops;
+    funcOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
+    bool advanced = false;
+    for (scf::ForOp forOp : loops) {
+      if (transformFunctionScopeIndirectTileLoop(forOp, funcOp, state,
+                                                 report)) {
+        advanced = true;
+        changed = true;
+        break;
+      }
+    }
+    if (!advanced)
+      break;
+  }
+  return changed;
+}
+
 static bool transformReductionResidencyPlan(
     ReductionResidencyPlan &plan, int64_t spmBase, int64_t spmSize,
     int64_t rowResidentMaxBytes, bool enablePromotionProfitability,
@@ -6553,7 +7331,10 @@ struct ConvertMemoryToSPM
         getEnvBool("TRITON_SPM_ATTENTION_QK_TILE", false);
     bool enableFunctionScopePVGenerated =
         getEnvBool("TRITON_SPM_ATTENTION_PV_GENERATED_TILE", false);
-    if (enableFunctionScopeQK || enableFunctionScopePVGenerated) {
+    bool enableFunctionScopeIndirectTile =
+        getEnvBool("TRITON_SPM_INDIRECT_TILE", false);
+    if (enableFunctionScopeQK || enableFunctionScopePVGenerated ||
+        enableFunctionScopeIndirectTile) {
       mod.walk([&](FunctionOpInterface funcOp) {
         if (funcOp.getFunctionBody().empty())
           return;
@@ -6565,6 +7346,8 @@ struct ConvertMemoryToSPM
           transformFunctionScopeAttentionQK(funcOp, state, report);
         if (enableFunctionScopePVGenerated)
           transformFunctionScopeAttentionPVGenerated(funcOp, state, report);
+        if (enableFunctionScopeIndirectTile)
+          transformFunctionScopeIndirectTile(funcOp, state, report);
       });
     }
 
