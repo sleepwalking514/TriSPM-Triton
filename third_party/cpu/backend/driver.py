@@ -41,6 +41,13 @@ if os.path.exists(sys_lib_dir):
     library_dirs.append(sys_lib_dir)
 
 
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 def compile_module_from_src(src, name):
     key = hashlib.md5(src.encode("utf-8")).hexdigest()
     cache = get_cache_manager(key)
@@ -385,14 +392,15 @@ PyMODINIT_FUNC PyInit___triton_cpu_launcher(void) {{
 
 
 def _read_tier_sidecar(kernel_name):
-    launcher_dir = os.getenv("KERNEL_AUX_FILE_DIR",
-                             os.getenv("KERNEL_LAUNCHER_DIR", "."))
-    path = os.path.join(launcher_dir, f"{kernel_name}_tiers.json")
     tiers: dict[int, int] = {}
-    if os.path.exists(path):
-        with open(path) as f:
-            data = json.load(f)
-        tiers = {int(index): int(tier) for index, tier in data.items()}
+    if _env_bool("TRITON_ENABLE_SPM_TENSOR_PLACEMENT", False):
+        launcher_dir = os.getenv("KERNEL_AUX_FILE_DIR",
+                                 os.getenv("KERNEL_LAUNCHER_DIR", "."))
+        path = os.path.join(launcher_dir, f"{kernel_name}_tiers.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+            tiers = {int(index): int(tier) for index, tier in data.items()}
 
     # Experiment-time override layered on top of the analysis pass result.
     # Format: "idx=tier,idx=tier" e.g. "0=2,1=2" forces args 0 and 1 to Tier 2.

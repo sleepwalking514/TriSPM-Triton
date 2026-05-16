@@ -228,8 +228,9 @@ class CPUBackend(BaseBackend):
             cpu.passes.ttcpuir.add_convert_dot_generic(pm)
 
             # SPM transformation: convert tiled DRAM loads to DMA+SPM
-            # transfers.  Placement runs first so later milestones can annotate
-            # tensor tiers before ConvertMemoryToSPM consumes the decision.
+            # transfers.  Normal DRAM backing stays cacheable by default.
+            # The older Tier-3 tensor-placement sidecar is retained only as an
+            # opt-in compatibility path for reproducing legacy ablations.
             # Must run after dot lowering (to detect vector.contract consumers)
             # and before type promotion.
             # TRITON_DISABLE_SPM=1 produces a cacheable-only binary suitable
@@ -256,10 +257,14 @@ class CPUBackend(BaseBackend):
                     True)
                 promotion_report = env_bool(
                     "TRITON_SPM_PROMOTION_REPORT", True)
-                cpu.passes.ttcpuir.add_spm_tensor_placement(
-                    pm, enable_reductions
-                    and not enable_row_resident_reductions
-                    and not enable_promotion_profitability)
+                enable_tensor_placement = env_bool(
+                    "TRITON_ENABLE_SPM_TENSOR_PLACEMENT",
+                    False)
+                if enable_tensor_placement:
+                    cpu.passes.ttcpuir.add_spm_tensor_placement(
+                        pm, enable_reductions
+                        and not enable_row_resident_reductions
+                        and not enable_promotion_profitability)
                 cpu.passes.ttcpuir.add_convert_memory_to_spm(
                     pm, spm_base, spm_size, micro_m, window_k,
                     enable_reductions, enable_row_resident_reductions,
