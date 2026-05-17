@@ -60,6 +60,7 @@ public:
     addLegalOp<mlir::UnrealizedConversionCastOp>();
     addIllegalOp<triton::cpu::DmaEnqueue2DOp>();
     addIllegalOp<triton::cpu::DmaWaitOp>();
+    addIllegalOp<triton::cpu::DmaWaitCountOp>();
   }
 };
 
@@ -271,8 +272,44 @@ struct DmaEnqueue2DOpXspmConversion
 };
 
 // ===----------------------------------------------------------------------===
-// DmaWaitOp → polling loop on STATUS register until idle (== 0)
+// DmaWaitOp / DmaWaitCountOp → polling loop on STATUS pending count
 // ===----------------------------------------------------------------------===
+
+static void lowerDmaWaitUntilPendingAtMost(Operation *op, Value maxPending,
+                                           ConversionPatternRewriter &rewriter,
+                                           uint64_t dmaMmioBase) {
+  auto loc = op->getLoc();
+  auto i1Ty = rewriter.getI1Type();
+
+  // Split the block at the wait op.  Everything after the op goes into
+  // continuationBB; currentBlock keeps everything before the op.
+  Block *currentBlock = rewriter.getInsertionBlock();
+  Block *continuationBB =
+      rewriter.splitBlock(currentBlock, Block::iterator(op));
+
+  // Create the poll loop block between current and continuation.
+  Block *pollBB = rewriter.createBlock(continuationBB);
+
+  // currentBlock: fence + branch to pollBB
+  rewriter.setInsertionPointToEnd(currentBlock);
+  emitFence(rewriter, loc);
+  LLVM::BrOp::create(rewriter, loc, pollBB);
+
+  // pollBB: volatile load STATUS, branch back while pending > maxPending.
+  rewriter.setInsertionPointToStart(pollBB);
+  Value status = emitVolatileLoad(rewriter, loc, dmaMmioBase, DMA_REG_STATUS);
+  Value busy = LLVM::ICmpOp::create(rewriter, loc, i1Ty,
+                                    LLVM::ICmpPredicate::ugt, status,
+                                    maxPending);
+  LLVM::CondBrOp::create(rewriter, loc, busy, pollBB, continuationBB);
+
+  // continuationBB: fence at the start, then original ops follow
+  rewriter.setInsertionPointToStart(continuationBB);
+  emitFence(rewriter, loc);
+
+  rewriter.eraseOp(op);
+}
+
 struct DmaWaitOpConversion
     : public OpConversionPattern<triton::cpu::DmaWaitOp> {
   DmaWaitOpConversion(const TypeConverter &typeConverter,
@@ -283,45 +320,60 @@ struct DmaWaitOpConversion
   LogicalResult
   matchAndRewrite(triton::cpu::DmaWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-    auto i64Ty = rewriter.getI64Type();
-    auto i1Ty = rewriter.getI1Type();
-
-    // Split the block at the DmaWaitOp.  Everything after the op goes
-    // into continuationBB; currentBlock keeps everything before the op.
-    Block *currentBlock = rewriter.getInsertionBlock();
-    Block *continuationBB = rewriter.splitBlock(currentBlock,
-                                                 Block::iterator(op));
-
-    // Create the poll loop block between current and continuation.
-    Block *pollBB = rewriter.createBlock(continuationBB);
-
-    // currentBlock: fence + branch to pollBB
-    rewriter.setInsertionPointToEnd(currentBlock);
-    emitFence(rewriter, loc);
-    LLVM::BrOp::create(rewriter, loc, pollBB);
-
-    // pollBB: volatile load STATUS, branch back if busy, else to continuation
-    rewriter.setInsertionPointToStart(pollBB);
-    Value status = emitVolatileLoad(rewriter, loc, dmaMmioBase,
-                                    DMA_REG_STATUS);
-    Value zero = createI64Constant(rewriter, loc, 0);
-    Value busy = LLVM::ICmpOp::create(rewriter, loc, i1Ty,
-                                      LLVM::ICmpPredicate::ne,
-                                      status, zero);
-    LLVM::CondBrOp::create(rewriter, loc, busy, pollBB, continuationBB);
-
-    // continuationBB: fence at the start, then original ops follow
-    rewriter.setInsertionPointToStart(continuationBB);
-    emitFence(rewriter, loc);
-
-    rewriter.eraseOp(op);
+    lowerDmaWaitUntilPendingAtMost(
+        op, createI64Constant(rewriter, op.getLoc(), 0), rewriter,
+        dmaMmioBase);
     return success();
   }
 
 private:
   uint64_t dmaMmioBase;
 };
+
+struct DmaWaitCountOpConversion
+    : public OpConversionPattern<triton::cpu::DmaWaitCountOp> {
+  DmaWaitCountOpConversion(const TypeConverter &typeConverter,
+                           MLIRContext *context, uint64_t dmaMmioBase)
+      : OpConversionPattern(typeConverter, context),
+        dmaMmioBase(dmaMmioBase) {}
+
+  LogicalResult
+  matchAndRewrite(triton::cpu::DmaWaitCountOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    lowerDmaWaitUntilPendingAtMost(op, adaptor.getMaxPending(), rewriter,
+                                   dmaMmioBase);
+    return success();
+  }
+
+private:
+  uint64_t dmaMmioBase;
+};
+
+static void lowerXspmDmaWaitUntilPendingAtMost(
+    Operation *op, Value maxPending, ConversionPatternRewriter &rewriter) {
+  auto loc = op->getLoc();
+  auto i1Ty = rewriter.getI1Type();
+
+  Block *currentBlock = rewriter.getInsertionBlock();
+  Block *continuationBB =
+      rewriter.splitBlock(currentBlock, Block::iterator(op));
+  Block *pollBB = rewriter.createBlock(continuationBB);
+
+  rewriter.setInsertionPointToEnd(currentBlock);
+  LLVM::BrOp::create(rewriter, loc, pollBB);
+
+  rewriter.setInsertionPointToStart(pollBB);
+  Value pending = emitXspmDmaWaitPoll(rewriter, loc);
+  Value busy = LLVM::ICmpOp::create(rewriter, loc, i1Ty,
+                                    LLVM::ICmpPredicate::ugt, pending,
+                                    maxPending);
+  LLVM::CondBrOp::create(rewriter, loc, busy, pollBB, continuationBB);
+
+  rewriter.setInsertionPointToStart(continuationBB);
+  emitFence(rewriter, loc);
+
+  rewriter.eraseOp(op);
+}
 
 struct DmaWaitOpXspmConversion
     : public OpConversionPattern<triton::cpu::DmaWaitOp> {
@@ -330,28 +382,20 @@ struct DmaWaitOpXspmConversion
   LogicalResult
   matchAndRewrite(triton::cpu::DmaWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-    auto i1Ty = rewriter.getI1Type();
+    lowerXspmDmaWaitUntilPendingAtMost(
+        op, createI64Constant(rewriter, op.getLoc(), 0), rewriter);
+    return success();
+  }
+};
 
-    Block *currentBlock = rewriter.getInsertionBlock();
-    Block *continuationBB =
-        rewriter.splitBlock(currentBlock, Block::iterator(op));
-    Block *pollBB = rewriter.createBlock(continuationBB);
+struct DmaWaitCountOpXspmConversion
+    : public OpConversionPattern<triton::cpu::DmaWaitCountOp> {
+  using OpConversionPattern::OpConversionPattern;
 
-    rewriter.setInsertionPointToEnd(currentBlock);
-    LLVM::BrOp::create(rewriter, loc, pollBB);
-
-    rewriter.setInsertionPointToStart(pollBB);
-    Value pending = emitXspmDmaWaitPoll(rewriter, loc);
-    Value zero = createI64Constant(rewriter, loc, 0);
-    Value busy = LLVM::ICmpOp::create(rewriter, loc, i1Ty,
-                                      LLVM::ICmpPredicate::ne, pending, zero);
-    LLVM::CondBrOp::create(rewriter, loc, busy, pollBB, continuationBB);
-
-    rewriter.setInsertionPointToStart(continuationBB);
-    emitFence(rewriter, loc);
-
-    rewriter.eraseOp(op);
+  LogicalResult
+  matchAndRewrite(triton::cpu::DmaWaitCountOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    lowerXspmDmaWaitUntilPendingAtMost(op, adaptor.getMaxPending(), rewriter);
     return success();
   }
 };
@@ -377,10 +421,13 @@ struct DmaOpsToLLVM
     if (useXspmInsn) {
       patterns.add<DmaEnqueue2DOpXspmConversion>(typeConverter, context);
       patterns.add<DmaWaitOpXspmConversion>(typeConverter, context);
+      patterns.add<DmaWaitCountOpXspmConversion>(typeConverter, context);
     } else {
       patterns.add<DmaEnqueue2DOpConversion>(typeConverter, context,
-                                             dmaMmioBase);
+                                              dmaMmioBase);
       patterns.add<DmaWaitOpConversion>(typeConverter, context, dmaMmioBase);
+      patterns.add<DmaWaitCountOpConversion>(typeConverter, context,
+                                             dmaMmioBase);
     }
 
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))

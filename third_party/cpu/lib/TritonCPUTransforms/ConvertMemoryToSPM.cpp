@@ -6318,7 +6318,7 @@ static bool transformFunctionScopePagedKvLoop(
 
   auto alloc = state.alloc(totalStagedBytes, /*alignment=*/64);
   if (!alloc)
-    return reject("paged_kv_below_amortization_threshold",
+    return reject("paged_kv_spm_budget_exhausted",
                   "paged-kv gather staged pages do not fit in the available "
                   "function-scope SPM budget");
   int64_t kSpmAddress = *alloc;

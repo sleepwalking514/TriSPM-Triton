@@ -2,7 +2,8 @@
 Tests for TritonCPU DMA dialect ops and their LLVM lowering.
 
 These tests verify that:
-1. DMA ops (dma_enqueue_2d, dma_wait) are correctly defined in the dialect
+1. DMA ops (dma_enqueue_2d, dma_wait, dma_wait_count) are correctly defined in
+   the dialect
 2. The DmaOpsToLLVM pass lowers them to the expected volatile MMIO stores/loads
 3. The ops integrate with the AOT compilation pipeline
 
@@ -105,6 +106,20 @@ class TestDmaDialectOps:
         """)
         output = run_triton_opt(mlir, [])
         assert "triton_cpu.dma_wait" in output
+
+    def test_dma_wait_count_parses(self):
+        """dma_wait_count should parse with one i64 watermark argument."""
+        mlir = textwrap.dedent("""\
+            module {
+              tt.func public @test_wait_count() {
+                %max = arith.constant 2 : i64
+                triton_cpu.dma_wait_count(%max)
+                tt.return
+              }
+            }
+        """)
+        output = run_triton_opt(mlir, [])
+        assert "triton_cpu.dma_wait_count" in output
 
     def test_dma_enqueue_then_wait_parses(self):
         """Full enqueue + wait sequence should parse."""
@@ -223,6 +238,24 @@ class TestDmaOpsToLLVM:
         # inline asm with has_side_effects to prevent weakening/elimination.
         assert output.count('"fence iorw, iorw"') == 2
         assert output.count("llvm.inline_asm has_side_effects") == 2
+
+    def test_wait_count_produces_watermark_poll(self):
+        """dma_wait_count should poll while pending descriptors exceed a watermark."""
+        mlir = textwrap.dedent("""\
+            module {
+              tt.func public @test_wait_count() {
+                %max = arith.constant 2 : i64
+                triton_cpu.dma_wait_count(%max)
+                tt.return
+              }
+            }
+        """)
+        output = self._lower(mlir)
+        assert "triton_cpu.dma_wait_count" not in output
+        assert "llvm.load volatile" in output
+        assert str(DMA_MMIO_BASE + DMA_REG_STATUS) in output
+        assert 'llvm.icmp "ugt"' in output
+        assert output.count('"fence iorw, iorw"') == 2
 
     def test_enqueue_fence_ordering(self):
         """The trigger (LEN write) must be after the fence, not before config stores."""

@@ -237,6 +237,27 @@ def TTC_DmaWaitOp : TTC_Op<"dma_wait", [
   let assemblyFormat = "attr-dict";
 }
 
+def TTC_DmaWaitCountOp : TTC_Op<"dma_wait_count", [
+  MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>,
+]> {
+  let summary = "Block until the pending DMA transfer count is below a watermark";
+
+  let description = [{
+    Block execution until the DMA engine's pending-transfer count is less than
+    or equal to `max_pending`.  This is a FIFO/watermark synchronization
+    primitive for deeper software pipelines: after enqueueing descriptors in a
+    known order, the compiler can wait until enough older descriptors have
+    completed without draining the whole DMA queue.  `dma_wait` is equivalent to
+    `dma_wait_count(0)`.
+  }];
+
+  let arguments = (ins I64:$max_pending);
+
+  let assemblyFormat = [{
+    `(` $max_pending `)` attr-dict
+  }];
+}
+
 def TTC_BrgemmCreate : TTC_Op<"brgemm_create", [NoMemoryEffect]> {
   let summary = "Crete ukernels handles";
 

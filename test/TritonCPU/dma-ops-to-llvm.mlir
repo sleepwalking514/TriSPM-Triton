@@ -136,3 +136,38 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// ============================================================================
+// Test: DmaWaitCountOp lowers to a pending-count watermark poll
+// ============================================================================
+
+// CHECK-LABEL: @dma_wait_count_watermark
+// CHECK:       %[[MAX:.+]] = arith.constant 2 : i64
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", ""
+// CHECK:       %[[STATUS_ADDR:.+]] = llvm.mlir.constant(4026531864 : i64) : i64
+// CHECK-NEXT:  %[[STATUS_PTR:.+]] = llvm.inttoptr %[[STATUS_ADDR]] : i64 to !llvm.ptr
+// CHECK-NEXT:  %[[STATUS:.+]] = llvm.load volatile %[[STATUS_PTR]] : !llvm.ptr -> i64
+// CHECK-NEXT:  %[[BUSY:.+]] = llvm.icmp "ugt" %[[STATUS]], %[[MAX]] : i64
+// CHECK-NEXT:  llvm.cond_br %[[BUSY]]
+// CHECK:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", ""
+//
+// BASE-LABEL: @dma_wait_count_watermark
+// BASE:       llvm.mlir.constant(3758096408 : i64) : i64
+// BASE:       llvm.icmp "ugt"
+//
+// XSPM-LABEL: @dma_wait_count_watermark
+// XSPM:       llvm.inline_asm has_side_effects asm_dialect = att ".insn i 0x0B, 1, $0, x0, 0", "=r,~{memory}"
+// XSPM-NEXT:  llvm.icmp "ugt"
+// XSPM:       llvm.cond_br
+// XSPM:       llvm.inline_asm has_side_effects {{.*}}"fence iorw, iorw", ""
+// XSPM-NOT:   llvm.load volatile
+
+module {
+  tt.func public @dma_wait_count_watermark() {
+    %max = arith.constant 2 : i64
+    triton_cpu.dma_wait_count(%max)
+    tt.return
+  }
+}
