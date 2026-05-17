@@ -19,6 +19,10 @@
 //      idx loaded from a separate indices buffer.  The loop is preceded by
 //      L_MAX 1D DMAs that stage the rows into SPM, followed by a single
 //      dma_wait; the loop body is rewritten to read from SPM.
+//   5) Paged-KV decode gather: a fixed-trip page-table loop stages contiguous
+//      K/V pages selected by `page_ids[p]`.  The C1 path stages all selected
+//      pages before the consume loop; the default C2 path ping-pongs two K/V
+//      page slots to prefetch page p+1 while computing page p.
 //
 // Loads that don't match these patterns are left unchanged (cache path).
 //
@@ -5581,6 +5585,856 @@ static bool transformFunctionScopeIndirectTile(
   return changed;
 }
 
+//===----------------------------------------------------------------------===//
+// Paged-KV-decode page-gather staging.
+//
+// Recognises the FlashAttention-style paged decode pattern produced by
+// workloads/kernels/paged_kv_decode/kernel.py:
+//
+//   for p in [0, NUM_PAGES):
+//     phys     = tt.load page_ids_ptr[p]
+//     row_off  = phys * PAGE_SIZE
+//     K_page   = make_tensor_ptr K_cache, ..., offsets=[row_off, 0],
+//                                block_shape=<PAGE_SIZE x HEAD_DIM>
+//     V_page   = make_tensor_ptr V_cache, ..., offsets=[row_off, 0],
+//                                block_shape=<PAGE_SIZE x HEAD_DIM>
+//     <consume K_page, V_page via vector.transfer_read>
+//
+// The matcher stages every K/V page that the loop will visit into SPM with
+// one 1D DMA descriptor per page (each descriptor moves a full
+// PAGE_SIZE * HEAD_DIM * elemBytes contiguous block) and rewrites the loop
+// body to read pages from SPM (addrspace 3).
+//
+// C1 is single-buffered full-loop staging.  C2 page-level ping-pong is the
+// default; set TRITON_SPM_PAGED_KV_DECODE_DOUBLE_BUFFER=0 to force C1, or
+// TRITON_SPM_PAGED_KV_DECODE=0 to disable this recognizer.
+//===----------------------------------------------------------------------===//
+
+struct PagedKvGatherInfo {
+  scf::ForOp forOp;
+  int64_t trips = 0;  // NUM_PAGES
+
+  // Two DRAM page reads.  By convention we name them "first" and "second"
+  // in the order they appear in the body; the staging algorithm is
+  // symmetric so the labels are only for diagnostics.
+  vector::TransferReadOp kReadOp;
+  vector::TransferReadOp vReadOp;
+  triton::MakeTensorPtrOp kMakeTensorPtr;
+  triton::MakeTensorPtrOp vMakeTensorPtr;
+  triton::cpu::ExtractMemRefOp kExtractMemRef;
+  triton::cpu::ExtractMemRefOp vExtractMemRef;
+  triton::cpu::ExtractIndicesOp kExtractIndices;
+  triton::cpu::ExtractIndicesOp vExtractIndices;
+  Value kCacheBase;
+  Value vCacheBase;
+  BlockArgument kCacheArg;
+  BlockArgument vCacheArg;
+
+  // Shared per-iter address-compute chain.
+  arith::MulIOp rowOffsetMul;
+  triton::LoadOp physLoad;
+  triton::AddPtrOp physAdvance;
+  Value pageIdsBaseOutsideLoop;
+  BlockArgument pageIdsArg;
+
+  // Static shape parameters (derived from the canonical pattern above).
+  VectorType vecTy;
+  Type elemTy;
+  unsigned elemBytes = 0;
+  int64_t pageSize = 0;
+  int64_t headDim = 0;
+  int64_t pageElems = 0;
+  int64_t pageBytes = 0;
+  int64_t numPhysPages = 0;
+};
+
+static std::optional<PagedKvGatherInfo>
+matchPagedKvGather(scf::ForOp forOp, FunctionOpInterface funcOp,
+                   std::string &reasonCode, std::string &reasonText) {
+  auto setReason = [&](StringRef code, StringRef text) {
+    reasonCode = code.str();
+    reasonText = text.str();
+    return std::optional<PagedKvGatherInfo>{};
+  };
+
+  auto trips = getExactStaticTripCount(forOp);
+  if (!trips || *trips <= 0)
+    return setReason("dynamic_page_loop_bound",
+                     "paged-kv gather requires a statically-known positive "
+                     "NUM_PAGES");
+
+  // The setup loop and consume loop both index SPM using the raw loop
+  // induction variable.  Require lb == 0 and step == 1 so the IV equals
+  // the page ordinal and the SPM offsets stay within [0, trips*pageBytes).
+  auto lbCst = getConstantIntValue(forOp.getLowerBound());
+  auto stepCst = getConstantIntValue(forOp.getStep());
+  if (!lbCst || *lbCst != 0 || !stepCst || *stepCst != 1)
+    return setReason("non_canonical_page_loop",
+                     "paged-kv gather requires the page loop to use "
+                     "lb == 0 and step == 1; non-canonical loops would "
+                     "mis-index the SPM staging buffer");
+
+  // Collect the DRAM 2D vector.transfer_reads in the loop body.
+  SmallVector<vector::TransferReadOp, 4> readsInBody;
+  forOp.getBody()->walk([&](vector::TransferReadOp op) {
+    auto memRefTy = dyn_cast<MemRefType>(op.getBase().getType());
+    if (!memRefTy)
+      return;
+    if (memRefTy.getMemorySpaceAsInt() == SPM_ADDR_SPACE)
+      return;
+    readsInBody.push_back(op);
+  });
+  if (readsInBody.size() != 2)
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires exactly two DRAM "
+                     "vector.transfer_read ops (K page + V page) in the "
+                     "loop body");
+  if (readsInBody[0] == readsInBody[1])
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires two distinct page reads");
+
+  PagedKvGatherInfo info;
+  info.forOp = forOp;
+  info.trips = *trips;
+
+  // Validate one of the two page reads.  Fills the per-read fields of
+  // `info`; on the first call (isV=false) also captures the shared shape
+  // parameters so we can cross-check them against the second read.
+  auto validateRead = [&](vector::TransferReadOp readOp, bool isV) -> bool {
+    auto vecTy = dyn_cast<VectorType>(readOp.getType());
+    if (!vecTy || vecTy.getRank() != 2) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires a rank-2 vector.transfer_read";
+      return false;
+    }
+    if (!vecTy.getElementType().isF32()) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather currently supports fp32 pages only";
+      return false;
+    }
+    // The rewrite emits a fresh full-tile SPM read, so masked, projected,
+    // or partial-in-bounds transfers are unsupported.
+    if (readOp.getMask()) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather rejects masked transfer_reads";
+      return false;
+    }
+    if (!readOp.getPermutationMap().isIdentity()) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires the transfer_read to use "
+                   "the identity permutation map";
+      return false;
+    }
+    if (readOp.getInBoundsValues().size() !=
+        static_cast<size_t>(vecTy.getRank())) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires an explicit in_bounds bit for "
+                   "each transfer_read vector dimension";
+      return false;
+    }
+    for (bool inBoundsLane : readOp.getInBoundsValues()) {
+      if (!inBoundsLane) {
+        reasonCode = "unsupported_pattern";
+        reasonText = "paged-kv gather requires the transfer_read to be "
+                     "fully in_bounds";
+        return false;
+      }
+    }
+    auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+    if (!memRefTy || memRefTy.getRank() != 2) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires a rank-2 memref base";
+      return false;
+    }
+    if (!memRefTy.hasStaticShape()) {
+      reasonCode = "non_static_page_extent";
+      reasonText =
+          "paged-kv gather requires a statically-shaped K/V cache memref";
+      return false;
+    }
+    SmallVector<int64_t> strides;
+    if (!getStaticStrides(memRefTy, strides) || strides.size() != 2 ||
+        strides[1] != 1) {
+      reasonCode = "non_static_row_bytes";
+      reasonText = "paged-kv gather requires a row-major K/V cache memref "
+                   "with contiguous fast axis";
+      return false;
+    }
+    int64_t pageSize = vecTy.getShape()[0];
+    int64_t headDim = vecTy.getShape()[1];
+    if (strides[0] != headDim) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires the K/V cache row stride to "
+                   "match HEAD_DIM";
+      return false;
+    }
+    auto extractMR =
+        readOp.getBase().getDefiningOp<triton::cpu::ExtractMemRefOp>();
+    if (!extractMR) {
+      reasonCode = "unsupported_pattern";
+      reasonText =
+          "paged-kv gather requires extract_memref on a tt.make_tensor_ptr";
+      return false;
+    }
+    auto makePtr =
+        extractMR.getSrc().getDefiningOp<triton::MakeTensorPtrOp>();
+    if (!makePtr) {
+      reasonCode = "unsupported_pattern";
+      reasonText =
+          "paged-kv gather requires a tt.make_tensor_ptr source per page";
+      return false;
+    }
+    // The make_tensor_ptr's block shape must equal the transfer_read's
+    // vector shape; otherwise the DMA would stage a different-sized tile
+    // than the consume loop reads.
+    auto ptrTy = dyn_cast<triton::PointerType>(makePtr.getType());
+    if (!ptrTy) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather expected a triton pointer type on "
+                   "the make_tensor_ptr result";
+      return false;
+    }
+    auto tileTy = dyn_cast<RankedTensorType>(ptrTy.getPointeeType());
+    if (!tileTy || tileTy.getShape() != vecTy.getShape()) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires the make_tensor_ptr block "
+                   "shape to match the transfer_read vector shape";
+      return false;
+    }
+    auto offsets = makePtr.getOffsets();
+    if (offsets.size() != 2) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires two offsets per page tensor";
+      return false;
+    }
+    auto trailingCst = getConstantIntValue(offsets[1]);
+    if (!trailingCst || *trailingCst != 0) {
+      reasonCode = "unsupported_pattern";
+      reasonText =
+          "paged-kv gather requires the inner page-offset to be zero";
+      return false;
+    }
+    Value base = makePtr.getBase();
+    BlockArgument arg = chaseTritonPtrToFuncArg(base, funcOp);
+    if (!arg) {
+      reasonCode = "cache_base_not_function_argument";
+      reasonText = "paged-kv gather requires the K/V cache base to be a "
+                   "function argument";
+      return false;
+    }
+
+    // The rewrite reads the SPM tile at offset 0 within the staged page,
+    // so the transfer_read indices must be exactly the results of an
+    // extract_indices on the same make_tensor_ptr.  Any additional index
+    // arithmetic would silently break the rewrite.
+    if (readOp.getIndices().size() != 2) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires the transfer_read to have "
+                   "two indices coming from extract_indices on the same "
+                   "make_tensor_ptr";
+      return false;
+    }
+    auto extractIdx = readOp.getIndices()[0]
+                          .getDefiningOp<triton::cpu::ExtractIndicesOp>();
+    if (!extractIdx) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires the transfer_read indices "
+                   "to come from triton_cpu.extract_indices";
+      return false;
+    }
+    if (readOp.getIndices()[1].getDefiningOp() != extractIdx) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires both transfer_read indices "
+                   "to come from the same extract_indices op";
+      return false;
+    }
+    if (extractIdx.getSrc() != makePtr.getResult()) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires the transfer_read indices "
+                   "to be extracted from the same make_tensor_ptr that "
+                   "produced the page tile";
+      return false;
+    }
+    if (readOp.getIndices()[0] != extractIdx->getResult(0) ||
+        readOp.getIndices()[1] != extractIdx->getResult(1)) {
+      reasonCode = "unsupported_pattern";
+      reasonText = "paged-kv gather requires the transfer_read to consume "
+                   "the extract_indices results without further index "
+                   "arithmetic";
+      return false;
+    }
+
+    if (isV) {
+      info.vReadOp = readOp;
+      info.vMakeTensorPtr = makePtr;
+      info.vExtractMemRef = extractMR;
+      info.vCacheBase = base;
+      info.vCacheArg = arg;
+      info.vExtractIndices = extractIdx;
+    } else {
+      info.kReadOp = readOp;
+      info.kMakeTensorPtr = makePtr;
+      info.kExtractMemRef = extractMR;
+      info.kCacheBase = base;
+      info.kCacheArg = arg;
+      info.kExtractIndices = extractIdx;
+      info.vecTy = vecTy;
+      info.elemTy = vecTy.getElementType();
+      info.elemBytes = info.elemTy.getIntOrFloatBitWidth() / 8;
+      info.pageSize = pageSize;
+      info.headDim = headDim;
+      info.pageElems = pageSize * headDim;
+      info.pageBytes = info.pageElems * info.elemBytes;
+      if (info.pageSize <= 0 || memRefTy.getShape()[0] % info.pageSize != 0) {
+        reasonCode = "unsupported_pattern";
+        reasonText = "paged-kv gather requires NUM_PHYS_PAGES * PAGE_SIZE "
+                     "to match the K/V cache row count";
+        return false;
+      }
+      info.numPhysPages = memRefTy.getShape()[0] / info.pageSize;
+    }
+    return true;
+  };
+
+  if (!validateRead(readsInBody[0], /*isV=*/false))
+    return std::nullopt;
+  if (!validateRead(readsInBody[1], /*isV=*/true))
+    return std::nullopt;
+
+  // Cross-check: K and V must have identical page tile types and shapes.
+  if (info.kReadOp.getType() != info.vReadOp.getType())
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires K and V pages to share shape");
+
+  // The DMA setup loop reuses one row-offset value to address both K and
+  // V caches, so the backing memrefs must have identical shape, strides,
+  // and address space.
+  if (info.kReadOp.getBase().getType() != info.vReadOp.getBase().getType())
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires K and V caches to share "
+                     "memref shape and strides");
+
+  // K and V must come from distinct function arguments.
+  if (info.kCacheArg == info.vCacheArg)
+    return setReason(
+        "unsupported_pattern",
+        "paged-kv gather requires the K and V caches to be distinct "
+        "function arguments");
+
+  // Both K and V make_tensor_ptrs must share the same row offset SSA value
+  // (canonicalization is expected to CSE `phys * PAGE_SIZE`).
+  Value kRowOff = info.kMakeTensorPtr.getOffsets()[0];
+  Value vRowOff = info.vMakeTensorPtr.getOffsets()[0];
+  if (kRowOff != vRowOff)
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires K and V pages to share the "
+                     "row offset (canonicalization should CSE "
+                     "phys*PAGE_SIZE)");
+
+  auto rowOffsetMul = kRowOff.getDefiningOp<arith::MulIOp>();
+  if (!rowOffsetMul)
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires the page row offset to be "
+                     "arith.muli phys, PAGE_SIZE");
+  auto pageSizeRhs = getConstantIntValue(rowOffsetMul.getRhs());
+  Value physValue = rowOffsetMul.getLhs();
+  if (!pageSizeRhs) {
+    pageSizeRhs = getConstantIntValue(rowOffsetMul.getLhs());
+    physValue = rowOffsetMul.getRhs();
+  }
+  if (!pageSizeRhs || *pageSizeRhs != info.pageSize)
+    return setReason(
+        "unsupported_pattern",
+        "paged-kv gather requires the row-offset multiplier to be a "
+        "compile-time PAGE_SIZE constant matching the page tile height");
+  info.rowOffsetMul = rowOffsetMul;
+
+  // %phys = tt.load on a tt.addptr chain (loop-invariant base + IV).
+  auto physLoad = physValue.getDefiningOp<triton::LoadOp>();
+  if (!physLoad)
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires the phys index to come from "
+                     "a tt.load");
+  Type physTy = physLoad.getResult().getType();
+  if (!physTy.isInteger(32) && !physTy.isInteger(64) && !physTy.isIndex())
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires a scalar integer page_ids "
+                     "load");
+  if (physLoad.getMask() || physLoad.getOther() ||
+      !physLoad.getBoundaryCheck().empty() || physLoad.getPadding() ||
+      physLoad.getIsVolatile())
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires an unmasked non-volatile "
+                     "page_ids load with no boundary check or padding");
+  auto physAdvance = physLoad.getPtr().getDefiningOp<triton::AddPtrOp>();
+  if (!physAdvance)
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires the page_ids pointer to be "
+                     "advanced by tt.addptr");
+  if (physAdvance->getParentRegion() != &forOp.getRegion())
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires the per-iteration tt.addptr "
+                     "to live inside the page loop");
+  if (physAdvance.getOffset() != forOp.getInductionVar())
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires the per-iteration tt.addptr "
+                     "offset to be the loop induction variable");
+
+  Value pageIdsBaseOutside = physAdvance.getPtr();
+  if (auto *baseDef = pageIdsBaseOutside.getDefiningOp())
+    if (baseDef->getParentRegion() == &forOp.getRegion())
+      return setReason("unsupported_pattern",
+                       "paged-kv gather requires the page_ids base to be "
+                       "defined outside the page loop");
+  BlockArgument pageIdsArg =
+      chaseTritonPtrToFuncArg(pageIdsBaseOutside, funcOp);
+  if (!pageIdsArg)
+    return setReason("page_ids_not_function_argument",
+                     "paged-kv gather requires the page_ids base to chase "
+                     "to a function argument");
+  if (pageIdsArg == info.kCacheArg || pageIdsArg == info.vCacheArg)
+    return setReason("unsupported_pattern",
+                     "paged-kv gather requires the page_ids pointer to be "
+                     "distinct from the K/V cache function arguments");
+
+  // No DRAM store may target the K/V caches inside the loop (read-only).
+  bool sawAliasingStore = false;
+  forOp.getBody()->walk([&](vector::TransferWriteOp writeOp) {
+    auto writeMemRefTy = dyn_cast<MemRefType>(writeOp.getBase().getType());
+    if (writeMemRefTy &&
+        writeMemRefTy.getMemorySpaceAsInt() != SPM_ADDR_SPACE)
+      sawAliasingStore = true;
+  });
+  if (sawAliasingStore)
+    return setReason("kv_cache_aliased_with_store",
+                     "paged-kv gather requires the K/V caches to be "
+                     "read-only within the page loop");
+
+  info.physLoad = physLoad;
+  info.physAdvance = physAdvance;
+  info.pageIdsBaseOutsideLoop = pageIdsBaseOutside;
+  info.pageIdsArg = pageIdsArg;
+  return info;
+}
+
+static SPMPromotionRecord
+makePagedKvGatherRecord(const PagedKvGatherInfo &info, int64_t spmAddress) {
+  SPMPromotionRecord record;
+  record.source = "paged KV-cache page tiles";
+  record.scope = "function-scope paged_kv_decode page-gather stage";
+  record.shape.push_back(info.trips);
+  record.shape.push_back(info.pageSize);
+  record.shape.push_back(info.headDim);
+  record.uses = info.trips * 2;
+  record.copyIn = "DMA descriptor list (2 x NUM_PAGES)";
+  record.copyOut = "none";
+  record.bytes = 2 * info.trips * info.pageBytes;
+  record.spmAddress = spmAddress;
+  record.overhead = "2*NUM_PAGES 1D DMA descriptors plus one dma_wait "
+                    "before the consume loop";
+  record.benefit = "stages selected K/V pages contiguously into SPM so the "
+                   "consume loop reads dense pages from addrspace(3) "
+                   "instead of an irregular page-table gather";
+  record.reasonCode = "accepted_paged_kv_gather_staging";
+  record.reason =
+      "accepted by the paged-kv-decode gather staging path";
+  return record;
+}
+
+static Value hoistPagedKvCacheBase(OpBuilder &b, Location loc,
+                                   triton::MakeTensorPtrOp origMakePtr,
+                                   triton::cpu::ExtractMemRefOp origExtract,
+                                   Value cacheBase) {
+  Value zeroI32 = i32Cst(b, loc, 0);
+  SmallVector<Value> zeroOffsets(origMakePtr.getOffsets().size(), zeroI32);
+  Value basePtr = triton::MakeTensorPtrOp::create(
+      b, loc, origMakePtr.getType(), cacheBase, origMakePtr.getShape(),
+      origMakePtr.getStrides(), zeroOffsets, origMakePtr.getOrderAttr());
+  Value baseMemRef = triton::cpu::ExtractMemRefOp::create(
+      b, loc, origExtract.getType(), basePtr);
+  Value baseIdx =
+      memref::ExtractAlignedPointerAsIndexOp::create(b, loc, baseMemRef);
+  return arith::IndexCastOp::create(b, loc, b.getI64Type(), baseIdx);
+}
+
+static void emitPagedKvPagePrefetch(OpBuilder &b, Location loc,
+                                    PagedKvGatherInfo &info,
+                                    Value pageOrdinal, Value dstKAddr,
+                                    Value dstVAddr, Value kBaseI64,
+                                    Value vBaseI64, Value pageBytesI64) {
+  Value idxPtr = triton::AddPtrOp::create(
+      b, loc, info.pageIdsBaseOutsideLoop.getType(),
+      info.pageIdsBaseOutsideLoop, pageOrdinal);
+  Value physVal = triton::LoadOp::create(
+      b, loc, idxPtr, /*mask=*/Value{}, /*other=*/Value{},
+      /*boundaryCheck=*/ArrayRef<int32_t>{},
+      /*padding=*/std::optional<triton::PaddingOption>{},
+      info.physLoad.getCache(), info.physLoad.getEvict(),
+      info.physLoad.getIsVolatile());
+  Value physI64 = toI64(b, loc, physVal);
+  Value srcOff = arith::MulIOp::create(b, loc, physI64, pageBytesI64);
+  Value srcKAddr = arith::AddIOp::create(b, loc, kBaseI64, srcOff);
+  Value srcVAddr = arith::AddIOp::create(b, loc, vBaseI64, srcOff);
+
+  triton::cpu::DmaEnqueue2DOp::create(b, loc, dstKAddr, srcKAddr,
+                                      /*width=*/pageBytesI64,
+                                      /*height=*/i64Cst(b, loc, 1),
+                                      /*src_stride=*/pageBytesI64,
+                                      /*dst_stride=*/pageBytesI64);
+  triton::cpu::DmaEnqueue2DOp::create(b, loc, dstVAddr, srcVAddr,
+                                      /*width=*/pageBytesI64,
+                                      /*height=*/i64Cst(b, loc, 1),
+                                      /*src_stride=*/pageBytesI64,
+                                      /*dst_stride=*/pageBytesI64);
+}
+
+static bool tryTransformDoubleBufferedPagedKv(
+    PagedKvGatherInfo &info, FunctionScopeAttentionSpmState &state,
+    SPMPromotionReport *report) {
+  if (!getEnvBool("TRITON_SPM_PAGED_KV_DECODE_DOUBLE_BUFFER", true))
+    return false;
+  if (info.trips <= 1)
+    return false;
+  if (!info.forOp.getInductionVar().getType().isInteger(32))
+    return false;
+
+  scf::ForOp oldLoop = info.forOp;
+  int64_t checkpoint = state.checkpoint();
+  int64_t pageBytes = info.pageBytes;
+  int64_t twoPagesBytes = 2 * pageBytes;
+  int64_t totalSpmBytes = 4 * pageBytes; // K ping-pong + V ping-pong.
+  auto alloc = state.alloc(totalSpmBytes, /*alignment=*/64);
+  if (!alloc) {
+    state.restore(checkpoint);
+    return false;
+  }
+  int64_t kSpmAddress = *alloc;
+  int64_t vSpmAddress = kSpmAddress + twoPagesBytes;
+
+  InsertedBeforeGuard guard(oldLoop.getOperation());
+  Location loc = oldLoop.getLoc();
+  OpBuilder b(oldLoop);
+  Value kSpmBaseI64 = i64Cst(b, loc, kSpmAddress);
+  Value vSpmBaseI64 = i64Cst(b, loc, vSpmAddress);
+  Value pageBytesI64 = i64Cst(b, loc, pageBytes);
+  Value kBaseI64 = hoistPagedKvCacheBase(b, loc, info.kMakeTensorPtr,
+                                         info.kExtractMemRef, info.kCacheBase);
+  Value vBaseI64 = hoistPagedKvCacheBase(b, loc, info.vMakeTensorPtr,
+                                         info.vExtractMemRef, info.vCacheBase);
+
+  // Prologue: prefetch page 0 into ping-pong buffer 0 before entering the
+  // consume loop.  The first in-loop dma_wait drains this prologue prefetch.
+  emitPagedKvPagePrefetch(b, loc, info, oldLoop.getLowerBound(), kSpmBaseI64,
+                          vSpmBaseI64, kBaseI64, vBaseI64, pageBytesI64);
+
+  SmallVector<Value> initArgs(oldLoop.getInitArgs().begin(),
+                              oldLoop.getInitArgs().end());
+  auto newLoop = scf::ForOp::create(
+      b, loc, oldLoop.getLowerBound(), oldLoop.getUpperBound(),
+      oldLoop.getStep(), initArgs,
+      [](OpBuilder &bb, Location bbLoc, Value /*iv*/, ValueRange iters) {
+        scf::YieldOp::create(bb, bbLoc, iters);
+      });
+
+  Block *oldBody = oldLoop.getBody();
+  Block *newBody = newLoop.getBody();
+  Value newIv = newLoop.getInductionVar();
+
+  OpBuilder nb(newBody, newBody->begin());
+  triton::cpu::DmaWaitOp::create(nb, loc);
+
+  Value oneI32 = i32Cst(nb, loc, 1);
+  Value curBuf = arith::AndIOp::create(nb, loc, newIv, oneI32);
+  Value curBufI64 = arith::ExtSIOp::create(nb, loc, nb.getI64Type(), curBuf);
+  Value curBufOff = arith::MulIOp::create(nb, loc, curBufI64, pageBytesI64);
+  Value nextIv = arith::AddIOp::create(nb, loc, newIv, oneI32);
+  Value hasNext = arith::CmpIOp::create(nb, loc, arith::CmpIPredicate::slt,
+                                       nextIv, newLoop.getUpperBound());
+  auto ifOp = scf::IfOp::create(nb, loc, /*resultTypes=*/TypeRange{}, hasNext,
+                                /*withElseRegion=*/false);
+  {
+    OpBuilder ib(ifOp.thenBlock(), ifOp.thenBlock()->begin());
+    Value nextBufOff = arith::SubIOp::create(ib, loc, pageBytesI64, curBufOff);
+    Value nextKAddr = arith::AddIOp::create(ib, loc, kSpmBaseI64, nextBufOff);
+    Value nextVAddr = arith::AddIOp::create(ib, loc, vSpmBaseI64, nextBufOff);
+    emitPagedKvPagePrefetch(ib, loc, info, nextIv, nextKAddr, nextVAddr,
+                            kBaseI64, vBaseI64, pageBytesI64);
+  }
+
+  Value curKAddr = arith::AddIOp::create(nb, loc, kSpmBaseI64, curBufOff);
+  Value curVAddr = arith::AddIOp::create(nb, loc, vSpmBaseI64, curBufOff);
+
+  IRMapping migrate;
+  migrate.map(oldLoop.getInductionVar(), newIv);
+  for (auto [oldArg, newArg] :
+       llvm::zip_equal(oldBody->getArguments().drop_front(),
+                       newLoop.getRegionIterArgs()))
+    migrate.map(oldArg, newArg);
+
+  for (Operation &op : *oldBody) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+    nb.clone(op, migrate);
+  }
+
+  auto getClonedRead = [&](vector::TransferReadOp oldRead)
+      -> vector::TransferReadOp {
+    Value clonedValue = migrate.lookupOrNull(oldRead.getResult());
+    if (!clonedValue)
+      return {};
+    return clonedValue.getDefiningOp<vector::TransferReadOp>();
+  };
+  vector::TransferReadOp clonedKRead = getClonedRead(info.kReadOp);
+  vector::TransferReadOp clonedVRead = getClonedRead(info.vReadOp);
+  if (!clonedKRead || !clonedVRead) {
+    state.restore(checkpoint);
+    return false;
+  }
+
+  auto rewriteClonedRead = [&](vector::TransferReadOp readOp, Value spmAddr) {
+    OpBuilder rb(readOp);
+    Value spmRead = emitSpmReadWithStrides(
+        rb, loc, spmAddr, info.vecTy, getDefaultSpmMemStrides(info.vecTy));
+    readOp.getResult().replaceAllUsesWith(spmRead);
+    readOp.erase();
+  };
+  rewriteClonedRead(clonedKRead, curKAddr);
+  rewriteClonedRead(clonedVRead, curVAddr);
+
+  auto eraseIfDead = [](Operation *op) {
+    if (op && op->use_empty())
+      op->erase();
+  };
+  auto lookupClonedOp = [&](Operation *orig) -> Operation * {
+    if (!orig || orig->getNumResults() == 0)
+      return nullptr;
+    Value v = migrate.lookupOrNull(orig->getResult(0));
+    return v ? v.getDefiningOp() : nullptr;
+  };
+  eraseIfDead(lookupClonedOp(info.kExtractMemRef));
+  eraseIfDead(lookupClonedOp(info.kExtractIndices));
+  eraseIfDead(lookupClonedOp(info.kMakeTensorPtr));
+  eraseIfDead(lookupClonedOp(info.vExtractMemRef));
+  eraseIfDead(lookupClonedOp(info.vExtractIndices));
+  eraseIfDead(lookupClonedOp(info.vMakeTensorPtr));
+  eraseIfDead(lookupClonedOp(info.rowOffsetMul));
+  eraseIfDead(lookupClonedOp(info.physLoad));
+  eraseIfDead(lookupClonedOp(info.physAdvance));
+
+  scf::YieldOp oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
+  scf::YieldOp placeholderYield = cast<scf::YieldOp>(newBody->getTerminator());
+  OpBuilder yb(placeholderYield);
+  SmallVector<Value> yieldValues;
+  yieldValues.reserve(oldYield.getNumOperands());
+  for (Value operand : oldYield.getOperands())
+    yieldValues.push_back(migrate.lookupOrDefault(operand));
+  scf::YieldOp::create(yb, loc, yieldValues);
+  placeholderYield.erase();
+
+  for (auto [oldResult, newResult] : llvm::zip_equal(
+           oldLoop.getResults(), newLoop.getResults().take_front(
+                                     oldLoop.getNumResults())))
+    oldResult.replaceAllUsesWith(newResult);
+  oldLoop.erase();
+  guard.commit();
+
+  if (report) {
+    SPMPromotionRecord record;
+    record.source = "paged KV-cache page tiles (double-buffered)";
+    record.scope = "function-scope paged_kv_decode page-gather ping-pong";
+    record.shape.push_back(info.trips);
+    record.shape.push_back(info.pageSize);
+    record.shape.push_back(info.headDim);
+    record.uses = info.trips * 2;
+    record.copyIn = "page-level ping-pong DMA (K + V)";
+    record.copyOut = "none";
+    record.bytes = 2 * info.trips * info.pageBytes;
+    record.spmAddress = kSpmAddress;
+    record.overhead =
+        "4 SPM page buffers; per-page dma_wait plus conditional next-page "
+        "prefetch into the inactive K/V buffers selected from page parity";
+    record.benefit =
+        "overlaps page-table selected K/V DMA for page p+1 with compute on "
+        "page p by ping-ponging two K/V page slots";
+    record.reasonCode = "accepted_paged_kv_gather_double_buffered";
+    record.reason =
+        "accepted by the paged-kv-decode page ping-pong path";
+    report->records.push_back(record);
+  }
+  return true;
+}
+
+static bool transformFunctionScopePagedKvLoop(
+    scf::ForOp forOp, FunctionOpInterface funcOp,
+    FunctionScopeAttentionSpmState &state, SPMPromotionReport *report) {
+  auto reject = [&](StringRef reasonCode, StringRef reason) {
+    if (report)
+      report->rejections.push_back(
+          makePromotionRejection("paged_kv_gather", reasonCode, reason));
+    return false;
+  };
+
+  std::string reasonCode;
+  std::string reasonText;
+  auto match = matchPagedKvGather(forOp, funcOp, reasonCode, reasonText);
+  if (!match) {
+    if (!reasonCode.empty())
+      return reject(reasonCode, reasonText);
+    return false;
+  }
+  PagedKvGatherInfo info = *match;
+
+  if (tryTransformDoubleBufferedPagedKv(info, state, report))
+    return true;
+
+  int64_t kTileBytes = info.trips * info.pageBytes;
+  int64_t totalStagedBytes = 2 * kTileBytes;
+
+  // Profitability gate (opt-in via TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY).
+  // Default threshold of one 4 KiB page admits the smoke preset; raise via
+  // TRITON_SPM_PAGED_KV_DECODE_MIN_BYTES to push C1 toward the larger shapes.
+  bool enableProfit =
+      getEnvBool("TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY", false);
+  if (enableProfit) {
+    int64_t minBytes = getEnvInt64("TRITON_SPM_PAGED_KV_DECODE_MIN_BYTES",
+                                   /*default=*/4096);
+    if (totalStagedBytes < minBytes)
+      return reject(
+          "paged_kv_below_amortization_threshold",
+          "paged-kv gather staged bytes are below the profitability "
+          "threshold; leave on the cache path");
+  }
+
+  // DMA queue depth guard: each iteration enqueues 2 descriptors (K + V)
+  // before one dma_wait, so 2*NUM_PAGES must fit in the simulator's
+  // finite descriptor queue.  Default to 32 (current gem5 SPM model);
+  // override via TRITON_SPM_PAGED_KV_DECODE_MAX_DESCRIPTORS.
+  int64_t maxDescriptors =
+      getEnvInt64("TRITON_SPM_PAGED_KV_DECODE_MAX_DESCRIPTORS", 32);
+  if (2 * info.trips > maxDescriptors)
+    return reject("paged_kv_descriptor_count_exceeds_queue",
+                  "paged-kv gather would enqueue more descriptors than the "
+                  "DMA queue depth allows; tile NUM_PAGES or add chunking");
+
+  auto alloc = state.alloc(totalStagedBytes, /*alignment=*/64);
+  if (!alloc)
+    return reject("paged_kv_below_amortization_threshold",
+                  "paged-kv gather staged pages do not fit in the available "
+                  "function-scope SPM budget");
+  int64_t kSpmAddress = *alloc;
+  int64_t vSpmAddress = kSpmAddress + kTileBytes;
+
+  OpBuilder b(forOp);
+  Location loc = forOp.getLoc();
+  Value kSpmBaseI64 = i64Cst(b, loc, kSpmAddress);
+  Value vSpmBaseI64 = i64Cst(b, loc, vSpmAddress);
+  Value pageBytesI64 = i64Cst(b, loc, info.pageBytes);
+
+  // Hoist K- and V-cache base addresses as i64 (loop-invariant).
+  Value kBaseI64 = hoistPagedKvCacheBase(b, loc, info.kMakeTensorPtr,
+                                         info.kExtractMemRef, info.kCacheBase);
+  Value vBaseI64 = hoistPagedKvCacheBase(b, loc, info.vMakeTensorPtr,
+                                         info.vExtractMemRef, info.vCacheBase);
+
+  // Setup loop: one 1D DMA per page, for both K and V.  Each descriptor
+  // moves PAGE_SIZE * HEAD_DIM * elemBytes contiguous bytes (the page is
+  // contiguous because strides[0] == HEAD_DIM and strides[1] == 1).
+  Value lb = forOp.getLowerBound();
+  Value ub = forOp.getUpperBound();
+  Value step = forOp.getStep();
+  auto setupLoop = scf::ForOp::create(b, loc, lb, ub, step, ValueRange{});
+  {
+    OpBuilder sb(setupLoop.getBody()->getTerminator());
+    Value k = setupLoop.getInductionVar();
+    Value idxKPtr = triton::AddPtrOp::create(
+        sb, loc, info.pageIdsBaseOutsideLoop.getType(),
+        info.pageIdsBaseOutsideLoop, k);
+    Value physVal = triton::LoadOp::create(
+        sb, loc, idxKPtr, /*mask=*/Value{}, /*other=*/Value{},
+        /*boundaryCheck=*/ArrayRef<int32_t>{},
+        /*padding=*/std::optional<triton::PaddingOption>{},
+        info.physLoad.getCache(), info.physLoad.getEvict(),
+        info.physLoad.getIsVolatile());
+    Value physI64 = toI64(sb, loc, physVal);
+    Value srcOff = arith::MulIOp::create(sb, loc, physI64, pageBytesI64);
+    Value srcKAddr = arith::AddIOp::create(sb, loc, kBaseI64, srcOff);
+    Value srcVAddr = arith::AddIOp::create(sb, loc, vBaseI64, srcOff);
+
+    Value kI64 = toI64(sb, loc, k);
+    Value dstOff = arith::MulIOp::create(sb, loc, kI64, pageBytesI64);
+    Value dstKAddr = arith::AddIOp::create(sb, loc, kSpmBaseI64, dstOff);
+    Value dstVAddr = arith::AddIOp::create(sb, loc, vSpmBaseI64, dstOff);
+
+    triton::cpu::DmaEnqueue2DOp::create(sb, loc, dstKAddr, srcKAddr,
+                                        /*width=*/pageBytesI64,
+                                        /*height=*/i64Cst(sb, loc, 1),
+                                        /*src_stride=*/pageBytesI64,
+                                        /*dst_stride=*/pageBytesI64);
+    triton::cpu::DmaEnqueue2DOp::create(sb, loc, dstVAddr, srcVAddr,
+                                        /*width=*/pageBytesI64,
+                                        /*height=*/i64Cst(sb, loc, 1),
+                                        /*src_stride=*/pageBytesI64,
+                                        /*dst_stride=*/pageBytesI64);
+  }
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  // Rewrite both DRAM reads to come from SPM at spmBase + k * pageBytes.
+  auto rewriteRead = [&](vector::TransferReadOp readOp, Value spmBase) {
+    OpBuilder rb(readOp);
+    Value kBody = forOp.getInductionVar();
+    Value kBodyI64 = toI64(rb, loc, kBody);
+    Value bodyOff = arith::MulIOp::create(rb, loc, kBodyI64, pageBytesI64);
+    Value pageSpmAddr = arith::AddIOp::create(rb, loc, spmBase, bodyOff);
+    Value spmRead = emitSpmReadWithStrides(rb, loc, pageSpmAddr, info.vecTy,
+                                           getDefaultSpmMemStrides(info.vecTy));
+    readOp.getResult().replaceAllUsesWith(spmRead);
+    readOp.erase();
+  };
+  rewriteRead(info.kReadOp, kSpmBaseI64);
+  rewriteRead(info.vReadOp, vSpmBaseI64);
+
+  auto eraseIfDead = [](Operation *op) {
+    if (op && op->use_empty())
+      op->erase();
+  };
+  eraseIfDead(info.kExtractMemRef);
+  if (info.kExtractIndices)
+    eraseIfDead(info.kExtractIndices);
+  eraseIfDead(info.kMakeTensorPtr);
+  eraseIfDead(info.vExtractMemRef);
+  if (info.vExtractIndices)
+    eraseIfDead(info.vExtractIndices);
+  eraseIfDead(info.vMakeTensorPtr);
+  eraseIfDead(info.rowOffsetMul);
+  eraseIfDead(info.physLoad);
+  eraseIfDead(info.physAdvance);
+
+  if (report)
+    report->records.push_back(makePagedKvGatherRecord(info, kSpmAddress));
+  return true;
+}
+
+static bool transformFunctionScopePagedKv(
+    FunctionOpInterface funcOp, FunctionScopeAttentionSpmState &state,
+    SPMPromotionReport *report) {
+  bool changed = false;
+  while (true) {
+    SmallVector<scf::ForOp, 4> loops;
+    funcOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
+    bool advanced = false;
+    for (scf::ForOp forOp : loops) {
+      if (transformFunctionScopePagedKvLoop(forOp, funcOp, state, report)) {
+        advanced = true;
+        changed = true;
+        break;
+      }
+    }
+    if (!advanced)
+      break;
+  }
+  return changed;
+}
+
 static bool transformReductionResidencyPlan(
     ReductionResidencyPlan &plan, int64_t spmBase, int64_t spmSize,
     int64_t rowResidentMaxBytes, bool enablePromotionProfitability,
@@ -7333,8 +8187,10 @@ struct ConvertMemoryToSPM
         getEnvBool("TRITON_SPM_ATTENTION_PV_GENERATED_TILE", false);
     bool enableFunctionScopeIndirectTile =
         getEnvBool("TRITON_SPM_INDIRECT_TILE", false);
+    bool enableFunctionScopePagedKv =
+        getEnvBool("TRITON_SPM_PAGED_KV_DECODE", true);
     if (enableFunctionScopeQK || enableFunctionScopePVGenerated ||
-        enableFunctionScopeIndirectTile) {
+        enableFunctionScopeIndirectTile || enableFunctionScopePagedKv) {
       mod.walk([&](FunctionOpInterface funcOp) {
         if (funcOp.getFunctionBody().empty())
           return;
@@ -7348,6 +8204,8 @@ struct ConvertMemoryToSPM
           transformFunctionScopeAttentionPVGenerated(funcOp, state, report);
         if (enableFunctionScopeIndirectTile)
           transformFunctionScopeIndirectTile(funcOp, state, report);
+        if (enableFunctionScopePagedKv)
+          transformFunctionScopePagedKv(funcOp, state, report);
       });
     }
 
