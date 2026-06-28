@@ -186,6 +186,94 @@ static Value emitXspmDmaWaitPoll(ConversionPatternRewriter &rewriter,
                        ".insn i 0x0B, 1, $0, x0, 0", "=r,~{memory}");
 }
 
+static LLVM::LLVMFuncOp getOrAddFuncDecl(ConversionPatternRewriter &rewriter,
+                                         ModuleOp moduleOp,
+                                         StringRef funcName,
+                                         Type resultType,
+                                         ArrayRef<Type> argTypes) {
+  if (Operation *funcOp = moduleOp.lookupSymbol(funcName))
+    return cast<LLVM::LLVMFuncOp>(*funcOp);
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(moduleOp.getBody());
+  auto funcType = LLVM::LLVMFunctionType::get(resultType, argTypes);
+  return LLVM::LLVMFuncOp::create(rewriter, UnknownLoc::get(moduleOp.getContext()),
+                                  funcName, funcType);
+}
+
+static LLVM::LLVMFuncOp getRealHwDmaEnqueue2DDecl(
+    ConversionPatternRewriter &rewriter, ModuleOp moduleOp) {
+  auto *ctx = moduleOp.getContext();
+  auto i64Ty = IntegerType::get(ctx, 64);
+  return getOrAddFuncDecl(
+      rewriter, moduleOp, "trispm_real_hw_runtime_dma_enqueue_2d",
+      LLVM::LLVMVoidType::get(ctx),
+      {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty, i64Ty});
+}
+
+static LLVM::LLVMFuncOp getRealHwDmaWaitCountDecl(
+    ConversionPatternRewriter &rewriter, ModuleOp moduleOp) {
+  auto *ctx = moduleOp.getContext();
+  auto i64Ty = IntegerType::get(ctx, 64);
+  auto i32Ty = IntegerType::get(ctx, 32);
+  return getOrAddFuncDecl(rewriter, moduleOp,
+                          "trispm_real_hw_runtime_dma_wait_count", i32Ty,
+                          {i64Ty});
+}
+
+struct DmaEnqueue2DOpRealHwConversion
+    : public OpConversionPattern<triton::cpu::DmaEnqueue2DOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::cpu::DmaEnqueue2DOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto moduleOp = op->getParentOfType<ModuleOp>();
+    auto fn = getRealHwDmaEnqueue2DDecl(rewriter, moduleOp);
+    LLVM::CallOp::create(
+        rewriter, op.getLoc(), TypeRange(), SymbolRefAttr::get(fn),
+        ValueRange{adaptor.getDst(), adaptor.getSrc(), adaptor.getWidth(),
+                   adaptor.getHeight(), adaptor.getSrcStride(),
+                   adaptor.getDstStride()});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+static void lowerRealHwDmaWait(Operation *op, Value maxPending,
+                               ConversionPatternRewriter &rewriter) {
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+  auto fn = getRealHwDmaWaitCountDecl(rewriter, moduleOp);
+  LLVM::CallOp::create(rewriter, op->getLoc(), TypeRange{rewriter.getI32Type()},
+                       SymbolRefAttr::get(fn), ValueRange{maxPending});
+  rewriter.eraseOp(op);
+}
+
+struct DmaWaitOpRealHwConversion
+    : public OpConversionPattern<triton::cpu::DmaWaitOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::cpu::DmaWaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    lowerRealHwDmaWait(op, createI64Constant(rewriter, op.getLoc(), 0),
+                       rewriter);
+    return success();
+  }
+};
+
+struct DmaWaitCountOpRealHwConversion
+    : public OpConversionPattern<triton::cpu::DmaWaitCountOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::cpu::DmaWaitCountOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    lowerRealHwDmaWait(op, adaptor.getMaxPending(), rewriter);
+    return success();
+  }
+};
+
 // ===----------------------------------------------------------------------===
 // DmaEnqueue2DOp → volatile MMIO stores
 // ===----------------------------------------------------------------------===
@@ -418,7 +506,11 @@ struct DmaOpsToLLVM
     TritonLLVMConversionTarget convTarget(*context);
 
     RewritePatternSet patterns(context);
-    if (useXspmInsn) {
+    if (realHwRuntime) {
+      patterns.add<DmaEnqueue2DOpRealHwConversion>(typeConverter, context);
+      patterns.add<DmaWaitOpRealHwConversion>(typeConverter, context);
+      patterns.add<DmaWaitCountOpRealHwConversion>(typeConverter, context);
+    } else if (useXspmInsn) {
       patterns.add<DmaEnqueue2DOpXspmConversion>(typeConverter, context);
       patterns.add<DmaWaitOpXspmConversion>(typeConverter, context);
       patterns.add<DmaWaitCountOpXspmConversion>(typeConverter, context);
@@ -446,10 +538,12 @@ std::unique_ptr<OperationPass<ModuleOp>> createDmaOpsToLLVMPass() {
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>
-createDmaOpsToLLVMPass(uint64_t dmaMmioBase, bool useXspmInsn) {
+createDmaOpsToLLVMPass(uint64_t dmaMmioBase, bool useXspmInsn,
+                       bool realHwRuntime) {
   ::mlir::triton::DmaOpsToLLVMOptions options;
   options.dmaMmioBase = dmaMmioBase;
   options.useXspmInsn = useXspmInsn;
+  options.realHwRuntime = realHwRuntime;
   return std::make_unique<DmaOpsToLLVM>(options);
 }
 

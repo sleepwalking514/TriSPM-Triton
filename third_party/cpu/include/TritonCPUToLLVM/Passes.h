@@ -33,7 +33,8 @@ std::unique_ptr<OperationPass<ModuleOp>> createAtomicOpsToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDebugOpsToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDmaOpsToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>>
-createDmaOpsToLLVMPass(uint64_t dmaMmioBase, bool useXspmInsn);
+createDmaOpsToLLVMPass(uint64_t dmaMmioBase, bool useXspmInsn,
+                       bool realHwRuntime = false);
 std::unique_ptr<OperationPass<ModuleOp>> createUkernelOpsToOneDNNLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createUkernelOpsToXSMMLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>>

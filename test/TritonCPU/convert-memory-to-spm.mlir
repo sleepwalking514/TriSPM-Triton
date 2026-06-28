@@ -1,9 +1,8 @@
 // RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s
-// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=NOREDUCE
-// RUN: env TRITON_SPM_ATTENTION_Q_RESIDENT=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=MULTI
-// RUN: env TRITON_SPM_ATTENTION_Q_RESIDENT=1 TRITON_SPM_ATTENTION_KV_STREAM=1 TRITON_SPM_ATTENTION_KV_STREAM_STAGE_Q=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=KV-STREAM
-// RUN: env TRITON_SPM_ATTENTION_QK_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=QK-TILE
-// RUN: env TRITON_SPM_ATTENTION_PV_GENERATED_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32 enable-reductions=0" | FileCheck %s --check-prefix=PV-GEN
+// RUN: env TRITON_SPM_ATTENTION_Q_RESIDENT=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s --check-prefix=MULTI
+// RUN: env TRITON_SPM_ATTENTION_Q_RESIDENT=1 TRITON_SPM_ATTENTION_KV_STREAM=1 TRITON_SPM_ATTENTION_KV_STREAM_STAGE_Q=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s --check-prefix=KV-STREAM
+// RUN: env TRITON_SPM_ATTENTION_QK_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s --check-prefix=QK-TILE
+// RUN: env TRITON_SPM_ATTENTION_PV_GENERATED_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=32" | FileCheck %s --check-prefix=PV-GEN
 
 // ============================================================================
 // Test: GEMM K-loop with two tiled loads feeding vector.contract
@@ -209,12 +208,6 @@ module {
 // CHECK:         vector.transfer_read {{.*}} memref<16xf32, strided<[1]>, 3>
 // CHECK:         arith.addf
 // CHECK:         scf.yield
-//
-// NOREDUCE-LABEL: @reduction_prefetch
-// NOREDUCE-NOT:   triton_cpu.dma_enqueue_2d
-// NOREDUCE-NOT:   memref.reinterpret_cast
-// NOREDUCE:       vector.transfer_read
-// NOREDUCE-SAME:  memref<64xf32, strided<[1]>>
 
 module {
   tt.func public @reduction_prefetch(
@@ -518,7 +511,7 @@ module {
 // ============================================================================
 // Test: attention-v2 Q-resident lowering.
 //       Q is materialized once into SPM before the loop. K/V remain normal
-//       cacheable transfer_read operations to avoid SPM scalarization blow-up.
+//       ordinary DRAM transfer_read operations to avoid SPM scalarization blow-up.
 // ============================================================================
 
 // MULTI-LABEL: @attention_v2_window_qkv

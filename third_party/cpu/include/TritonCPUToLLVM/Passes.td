@@ -79,6 +79,9 @@ def DmaOpsToLLVM : Pass<"triton-cpu-dma-ops-to-llvm", "mlir::ModuleOp"> {
         Option<"useXspmInsn", "use-xspm-insn",
                "bool", /*default*/"false",
                "Reserve the Phase 4 Xspm-instruction lowering path; currently unsupported.">,
+        Option<"realHwRuntime", "real-hw-runtime",
+               "bool", /*default*/"false",
+               "Lower DMA ops to TriSPM real-hardware runtime calls instead of gem5 MMIO.">,
     ];
     let constructor = "mlir::triton::cpu::createDmaOpsToLLVMPass()";
 

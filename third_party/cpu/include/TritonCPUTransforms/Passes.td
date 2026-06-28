@@ -187,58 +187,6 @@ def Canonicalize : Pass<"triton-cpu-canonicalize", "mlir::ModuleOp"> {
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 
-def SPMTensorPlacement : Pass<"triton-cpu-spm-tensor-placement", "mlir::ModuleOp"> {
-    let summary = "Analyze tensor placement tiers for SPM-aware lowering.";
-    let description = [{
-        This pass is the analysis hook for the three-tier data placement pipeline.
-        It runs before ConvertMemoryToSPM and will annotate eligible kernel
-        arguments with the selected SPM placement tier.
-
-        M3 intentionally leaves the pass as a no-op skeleton; later milestones add
-        scalar-reuse analysis, tier attributes, and sidecar export.
-    }];
-
-    let options = [
-        Option<"enableReductions", "enable-reductions",
-               "bool", /*default*/"true",
-               "Emit tier sidecar entries for reduction/streaming-only tensors.">,
-    ];
-
-    let constructor = "mlir::triton::cpu::createSPMTensorPlacement()";
-
-    let dependentDialects = ["mlir::func::FuncDialect",
-                             "mlir::memref::MemRefDialect",
-                             "mlir::scf::SCFDialect",
-                             "mlir::vector::VectorDialect",
-                             "mlir::triton::TritonDialect",
-                             "mlir::triton::cpu::TritonCPUDialect"];
-}
-
-def SplitLargeContract : Pass<"triton-cpu-split-large-contract", "mlir::ModuleOp"> {
-    let summary = "Split large vector.contract ops into register-friendly micro-tiles.";
-    let description = [{
-        Splits vector.contract operations whose accumulator M dimension exceeds
-        `microM` into ceil(M / microM) smaller contracts.  This reduces vector
-        register pressure on targets with limited physical registers (e.g.
-        RISC-V RVV VLEN=256 with 32 vregs).
-
-        Must run AFTER ConvertMemoryToSPM (so DMA granularity is unaffected)
-        and BEFORE LLVM lowering.
-    }];
-
-    let options = [
-        Option<"microM", "micro-m",
-               "int64_t", /*default*/"8",
-               "Maximum number of accumulator rows per micro-tile.">,
-    ];
-
-    let constructor = "mlir::triton::cpu::createSplitLargeContract()";
-
-    let dependentDialects = ["mlir::arith::ArithDialect",
-                             "mlir::scf::SCFDialect",
-                             "mlir::vector::VectorDialect"];
-}
-
 def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleOp"> {
     let summary = "Convert tiled DRAM loads to DMA-based SPM transfers.";
     let description = [{
@@ -246,11 +194,8 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
         eligible DRAM loads into DMA transfers to scratchpad memory (SPM).
 
         For GEMM-like patterns (K-loop with two tiled loads feeding a dot product),
-        the pass inserts double-buffered DMA transfers: while the current tiles are
-        being computed, the next tiles are prefetched asynchronously.
-
-        For reduction patterns (single loop accumulating over a dimension), the pass
-        inserts double-buffered DMA prefetch for the next chunk.
+        the pass first tries the fused micro-M schedule.  Remaining affine-tile
+        loops fall through to the generic streaming fallback.
 
         Loads that don't match SPM-eligible patterns (scalar loads, irregular access,
         low-reuse elementwise ops) are left unchanged to use the cache hierarchy.
@@ -269,9 +214,6 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
         Option<"windowK", "window-k",
                "int64_t", /*default*/"8",
                "Maximum K-iteration window for resident B tiles.">,
-        Option<"enableReductions", "enable-reductions",
-               "bool", /*default*/"true",
-               "Enable reduction/streaming loop lowering through SPM.">,
         Option<"enableRowResidentReductions", "enable-row-resident-reductions",
                "bool", /*default*/"false",
                "Enable matcher-driven row-resident reduction lowering.">,
@@ -287,6 +229,9 @@ def ConvertMemoryToSPM : Pass<"triton-cpu-convert-memory-to-spm", "mlir::ModuleO
         Option<"promotionReport", "promotion-report",
                "bool", /*default*/"true",
                "Write SPM promotion records and rejection reasons to the AOT auxiliary directory.">,
+        Option<"genericAffineTileMinBytes", "generic-affine-tile-min-bytes",
+               "int64_t", /*default*/"64",
+               "Minimum tile byte size for generic affine-tile streaming fallback.">,
     ];
 
     let constructor = "mlir::triton::cpu::createConvertMemoryToSPM()";

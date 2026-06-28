@@ -8,8 +8,8 @@
 // loads/stores as independent of DRAM loads/stores.
 //
 // Address space layout (LLVM):
-//   0  -> default DRAM (cacheable + uncacheable DMA buffer regions)
-//   3  -> SPM scratchpad (uncacheable, accessed via spm_port at L1 latency)
+//   0  -> ordinary DRAM
+//   3  -> SPM scratchpad (routed via spm_port at L1 latency)
 //
 //===----------------------------------------------------------------------===//
 

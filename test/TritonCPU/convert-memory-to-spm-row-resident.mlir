@@ -1,19 +1,19 @@
-// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=4096" | FileCheck %s --check-prefix=ROW
-// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=DEFAULT
+// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=1 row-resident-max-bytes=4096 row-resident-producer-pass=fill_on_first_pass enable-promotion-profitability=0" | FileCheck %s --check-prefix=ROW
+// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=DEFAULT
 // RUN: rm -rf %t.row && mkdir -p %t.row
-// RUN: env KERNEL_AUX_FILE_DIR=%t.row triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=4096 promotion-report=1" >/dev/null
+// RUN: env KERNEL_AUX_FILE_DIR=%t.row triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=1 row-resident-max-bytes=4096 row-resident-producer-pass=fill_on_first_pass enable-promotion-profitability=0 promotion-report=1" >/dev/null
 // RUN: cat %t.row/layer_norm_row_resident_promotions.json | FileCheck %s --check-prefix=REPORT
 // RUN: rm -rf %t.reject && mkdir -p %t.reject
-// RUN: env KERNEL_AUX_FILE_DIR=%t.reject triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=128 promotion-report=1" >/dev/null
+// RUN: env KERNEL_AUX_FILE_DIR=%t.reject triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=1 row-resident-max-bytes=128 promotion-report=1" >/dev/null
 // RUN: cat %t.reject/layer_norm_row_resident_promotions.json | FileCheck %s --check-prefix=REJECT
-// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=4096 enable-promotion-profitability=1" | FileCheck %s --check-prefix=D3IR
+// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=1 row-resident-max-bytes=4096 enable-promotion-profitability=1" | FileCheck %s --check-prefix=D3IR
 // RUN: rm -rf %t.d3 && mkdir -p %t.d3
-// RUN: env KERNEL_AUX_FILE_DIR=%t.d3 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=4096 enable-promotion-profitability=1 promotion-report=1" >/dev/null
+// RUN: env KERNEL_AUX_FILE_DIR=%t.d3 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=1 row-resident-max-bytes=4096 enable-promotion-profitability=1 promotion-report=1" >/dev/null
 // RUN: cat %t.d3/layer_norm_row_resident_promotions.json | FileCheck %s --check-prefix=D3REPORT
 // RUN: rm -rf %t.softmax && mkdir -p %t.softmax
-// RUN: env KERNEL_AUX_FILE_DIR=%t.softmax triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=8192 promotion-report=1" | FileCheck %s --check-prefix=SOFTMAXIR
+// RUN: env KERNEL_AUX_FILE_DIR=%t.softmax triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=1 row-resident-max-bytes=8192 promotion-report=1" | FileCheck %s --check-prefix=SOFTMAXIR
 // RUN: cat %t.softmax/softmax_row_resident_plan_promotions.json | FileCheck %s --check-prefix=SOFTMAXREPORT
-// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=1 row-resident-max-bytes=4096 row-resident-producer-pass=producer_store" | FileCheck %s --check-prefix=PRODUCER
+// RUN: triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=1 row-resident-max-bytes=4096 row-resident-producer-pass=producer_store enable-promotion-profitability=0" | FileCheck %s --check-prefix=PRODUCER
 
 // ROW-LABEL: @layer_norm_row_resident
 // ROW:      scf.for

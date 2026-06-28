@@ -1,23 +1,23 @@
 // RUN: rm -rf %t && mkdir -p %t
-// RUN: env KERNEL_AUX_FILE_DIR=%t triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=0 promotion-report=1" >/dev/null
+// RUN: env KERNEL_AUX_FILE_DIR=%t triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 promotion-report=1" >/dev/null
 // RUN: cat %t/gemm_fused_report_promotions.json | FileCheck %s --check-prefix=REPORT
-// RUN: cat %t/reduction_report_promotions.json | FileCheck %s --check-prefix=REJECT
+// RUN: cat %t/reduction_report_promotions.json | FileCheck %s --check-prefix=GENERIC
 // RUN: rm -rf %t.off && mkdir -p %t.off
-// RUN: env KERNEL_AUX_FILE_DIR=%t.off triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=0 promotion-report=0" >/dev/null
+// RUN: env KERNEL_AUX_FILE_DIR=%t.off triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 promotion-report=0" >/dev/null
 // RUN: not test -e %t.off/gemm_fused_report_promotions.json
 // RUN: not test -e %t.off/reduction_report_promotions.json
 // RUN: rm -rf %t.d3 && mkdir -p %t.d3
-// RUN: env KERNEL_AUX_FILE_DIR=%t.d3 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=1 enable-promotion-profitability=1 promotion-report=1" >/dev/null
+// RUN: env KERNEL_AUX_FILE_DIR=%t.d3 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-promotion-profitability=1 promotion-report=1" >/dev/null
 // RUN: cat %t.d3/gemm_fused_report_promotions.json | FileCheck %s --check-prefix=D3GEMM
-// RUN: cat %t.d3/reduction_report_promotions.json | FileCheck %s --check-prefix=D3REDUCE
+// RUN: cat %t.d3/reduction_report_promotions.json | FileCheck %s --check-prefix=D3GENERIC
 // RUN: rm -rf %t.multi && mkdir -p %t.multi
-// RUN: env KERNEL_AUX_FILE_DIR=%t.multi TRITON_SPM_ATTENTION_Q_RESIDENT=1 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=0 promotion-report=1" >/dev/null
+// RUN: env KERNEL_AUX_FILE_DIR=%t.multi TRITON_SPM_ATTENTION_Q_RESIDENT=1 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 promotion-report=1" >/dev/null
 // RUN: cat %t.multi/attention_v2_window_report_promotions.json | FileCheck %s --check-prefix=MULTI
 // RUN: rm -rf %t.qk && mkdir -p %t.qk
-// RUN: env KERNEL_AUX_FILE_DIR=%t.qk TRITON_SPM_ATTENTION_QK_TILE=1 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=0 promotion-report=1" >/dev/null
+// RUN: env KERNEL_AUX_FILE_DIR=%t.qk TRITON_SPM_ATTENTION_QK_TILE=1 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 promotion-report=1" >/dev/null
 // RUN: cat %t.qk/fused_attention_qk_report_promotions.json | FileCheck %s --check-prefix=QKREPORT
 // RUN: rm -rf %t.pv && mkdir -p %t.pv
-// RUN: env KERNEL_AUX_FILE_DIR=%t.pv TRITON_SPM_ATTENTION_PV_GENERATED_TILE=1 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 enable-reductions=0 promotion-report=1" >/dev/null
+// RUN: env KERNEL_AUX_FILE_DIR=%t.pv TRITON_SPM_ATTENTION_PV_GENERATED_TILE=1 triton-opt %s -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 micro-m=8 window-k=4 promotion-report=1" >/dev/null
 // RUN: cat %t.pv/fused_attention_pv_generated_report_promotions.json | FileCheck %s --check-prefix=PVREPORT
 
 // REPORT:      "schema_version": 1
@@ -27,6 +27,7 @@
 // REPORT:      "status": "accepted"
 // REPORT:      "source": "B tile window"
 // REPORT:      "scope": "loop-window"
+// REPORT:      "footprint_class": "contraction_reuse_window"
 // REPORT:      "shape": [16, 16, 4]
 // REPORT:      "uses": 16
 // REPORT:      "bytes": 4096
@@ -56,22 +57,27 @@
 // REPORT:      "source": "memory_backed"
 // REPORT:      "output_relation": "loop_carried_accumulator_to_memory_store"
 // REPORT:      "schedule_status": "existing_gemm_schedule_candidate"
+// REPORT:      "affine_tile_candidates": [
+// REPORT:      "candidate_id": "affine_tile_0"
+// REPORT:      "loop_ordinal": 0
+// REPORT:      "op_ordinal": 0
+// REPORT:      "op": "vector.transfer_read"
+// REPORT:      "schedule_class": "streaming_ping_pong"
+// REPORT:      "reason_code": "candidate_streaming_ping_pong_contraction_fallback"
 
-// REJECT:      "schema_version": 1
-// REJECT:      "kernel": "reduction_report"
-// REJECT:      "promotions": [
-// REJECT-NEXT:   ],
-// REJECT:      "rejections": [
-// REJECT:      "status": "rejected"
-// REJECT:      "pattern": "reduction_streaming"
-// REJECT:      "scope": "candidate"
-// REJECT:      "uses": 0
-// REJECT:      "copy_in": "none"
-// REJECT:      "copy_out": "none"
-// REJECT:      "bytes": 0
-// REJECT:      "reason_code": "policy_disabled"
-// REJECT:      "reason": "reduction/streaming SPM promotion is disabled by default; leave the candidate on the cache path"
-// REJECT:      "shape": "exact-if-known"
+// GENERIC:      "schema_version": 1
+// GENERIC:      "kernel": "reduction_report"
+// GENERIC:      "promotions": [
+// GENERIC:      "status": "accepted"
+// GENERIC:      "source": "generic affine tile"
+// GENERIC:      "scope": "loop-local streaming tile"
+// GENERIC:      "footprint_class": "streaming_ping_pong"
+// GENERIC:      "shape": [16]
+// GENERIC:      "uses": 1
+// GENERIC:      "copy_in": "DMA"
+// GENERIC:      "copy_out": "none"
+// GENERIC:      "bytes": 128
+// GENERIC:      "reason_code": "accepted_generic_affine_tile_streaming"
 
 // D3GEMM:      "kernel": "gemm_fused_report"
 // D3GEMM:      "source": "B tile window"
@@ -94,28 +100,13 @@
 // D3GEMM:      "source": "accumulator tile"
 // D3GEMM:      "reason_code": "accepted_bounded_temporary"
 
-// D3REDUCE:      "kernel": "reduction_report"
-// D3REDUCE:      "promotions": [
-// D3REDUCE-NEXT:   ],
-// D3REDUCE:      "status": "rejected"
-// D3REDUCE:      "pattern": "reduction_streaming"
-// D3REDUCE:      "copy_in": "DMA"
-// D3REDUCE:      "bytes": 256
-// D3REDUCE:      "reason_code": "streaming_reduction_no_residency"
-// D3REDUCE:      "profitability": {
-// D3REDUCE:      "model": "phase35_p3_static_best_baseline_v1"
-// D3REDUCE:      "baseline": "best_legal_cache_schedule"
-// D3REDUCE:      "decision": "reject"
-// D3REDUCE:      "dma_descriptors": 4
-// D3REDUCE:      "mmio_stores": 16
-// D3REDUCE:      "waits": 4
-// D3REDUCE:      "copy_bytes": 256
-// D3REDUCE:      "spm_write_bytes": 256
-// D3REDUCE:      "spm_read_bytes": 256
-// D3REDUCE:      "avoided_repeated_read_bytes": 0
-// D3REDUCE:      "estimated_extra_ops": 4
-// D3REDUCE:      "measured_bank_conflicts": 0
-// D3REDUCE:      "uses": 1
+// D3GENERIC:      "kernel": "reduction_report"
+// D3GENERIC:      "status": "accepted"
+// D3GENERIC:      "source": "generic affine tile"
+// D3GENERIC:      "footprint_class": "streaming_ping_pong"
+// D3GENERIC:      "copy_in": "DMA"
+// D3GENERIC:      "bytes": 128
+// D3GENERIC:      "reason_code": "accepted_generic_affine_tile_streaming"
 
 // MULTI:      "kernel": "attention_v2_window_report"
 // MULTI:      "source": "attention Q resident tile"

@@ -45,9 +45,6 @@ std::unique_ptr<OperationPass<ModuleOp>> createConvertDotToFMA();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotGeneric();
 std::unique_ptr<OperationPass<ModuleOp>> createCanonicalize();
 
-std::unique_ptr<OperationPass<ModuleOp>> createSPMTensorPlacement();
-std::unique_ptr<OperationPass<ModuleOp>>
-createSPMTensorPlacement(bool enableReductions);
 std::unique_ptr<OperationPass<ModuleOp>> createConvertMemoryToSPM();
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize);
@@ -57,24 +54,20 @@ createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
                          int64_t microM, int64_t windowK,
-                         bool enableReductions);
-std::unique_ptr<OperationPass<ModuleOp>>
-createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
-                         int64_t microM, int64_t windowK,
-                         bool enableReductions, bool promotionReport);
-std::unique_ptr<OperationPass<ModuleOp>>
-createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
-                         int64_t microM, int64_t windowK,
-                         bool enableReductions,
                          bool enableRowResidentReductions,
                          int64_t rowResidentMaxBytes,
                          StringRef rowResidentProducerPass,
                          bool enablePromotionProfitability,
                          bool promotionReport);
-
-std::unique_ptr<OperationPass<ModuleOp>> createSplitLargeContract();
 std::unique_ptr<OperationPass<ModuleOp>>
-createSplitLargeContract(int64_t microM);
+createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize,
+                         int64_t microM, int64_t windowK,
+                         bool enableRowResidentReductions,
+                         int64_t rowResidentMaxBytes,
+                         StringRef rowResidentProducerPass,
+                         bool enablePromotionProfitability,
+                         bool promotionReport,
+                         int64_t genericAffineTileMinBytes);
 
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotOpToUkernelOps(
     Ukernels ukernels = mlir::triton::cpu::Ukernels::OneDNN);

@@ -1,7 +1,7 @@
-// RUN: env TRITON_SPM_PAGED_KV_DECODE=0 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=BASELINE
-// RUN: env TRITON_SPM_PAGED_KV_DECODE_DOUBLE_BUFFER=0 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=PAGED-KV-ACCEPT
-// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=PAGED-KV-REJECT
-// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=PAGED-KV-DOUBLE
+// RUN: env TRITON_SPM_PAGED_KV_DECODE=0 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=BASELINE
+// RUN: env TRITON_SPM_PAGED_KV_DECODE_DOUBLE_BUFFER=0 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=PAGED-KV-ACCEPT
+// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=PAGED-KV-REJECT
+// RUN: triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=PAGED-KV-DOUBLE
 
 // ============================================================================
 // Lit fixture for the paged_kv_decode SPM matcher.  The matcher is default-on
@@ -65,14 +65,14 @@
 // PAGED-KV-DOUBLE:       triton_cpu.dma_enqueue_2d
 // Replacement page loop derives the ping-pong slot from page-IV parity:
 // PAGED-KV-DOUBLE:       scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (vector<64xf32>)
-// PAGED-KV-DOUBLE:         triton_cpu.dma_wait
+// PAGED-KV-DOUBLE:         triton_cpu.dma_wait_count
 // PAGED-KV-DOUBLE:         arith.andi
+// PAGED-KV-DOUBLE:         vector.transfer_read {{.*}} memref<16x64xf32, strided<[64, 1]>, 3>, vector<16x64xf32>
+// PAGED-KV-DOUBLE:         vector.transfer_read {{.*}} memref<16x64xf32, strided<[64, 1]>, 3>, vector<16x64xf32>
 // PAGED-KV-DOUBLE:         scf.if
-// PAGED-KV-DOUBLE:           arith.subi
+// PAGED-KV-DOUBLE:           tt.load
 // PAGED-KV-DOUBLE:           triton_cpu.dma_enqueue_2d
 // PAGED-KV-DOUBLE:           triton_cpu.dma_enqueue_2d
-// PAGED-KV-DOUBLE:         vector.transfer_read {{.*}} memref<16x64xf32, strided<[64, 1]>, 3>, vector<16x64xf32>
-// PAGED-KV-DOUBLE:         vector.transfer_read {{.*}} memref<16x64xf32, strided<[64, 1]>, 3>, vector<16x64xf32>
 
 module {
   tt.func public @paged_kv_decode_w1(

@@ -2,7 +2,6 @@ import os
 import hashlib
 import importlib
 import importlib.resources
-import json
 import tempfile
 import time
 
@@ -391,33 +390,6 @@ PyMODINIT_FUNC PyInit___triton_cpu_launcher(void) {{
     return src
 
 
-def _read_tier_sidecar(kernel_name):
-    tiers: dict[int, int] = {}
-    if _env_bool("TRITON_ENABLE_SPM_TENSOR_PLACEMENT", False):
-        launcher_dir = os.getenv("KERNEL_AUX_FILE_DIR",
-                                 os.getenv("KERNEL_LAUNCHER_DIR", "."))
-        path = os.path.join(launcher_dir, f"{kernel_name}_tiers.json")
-        if os.path.exists(path):
-            with open(path) as f:
-                data = json.load(f)
-            tiers = {int(index): int(tier) for index, tier in data.items()}
-
-    # Experiment-time override layered on top of the analysis pass result.
-    # Format: "idx=tier,idx=tier" e.g. "0=2,1=2" forces args 0 and 1 to Tier 2.
-    override = os.getenv("KERNEL_TIER_OVERRIDE", "").strip()
-    if override:
-        for entry in override.split(","):
-            entry = entry.strip()
-            if not entry:
-                continue
-            if "=" not in entry:
-                raise ValueError(
-                    f"KERNEL_TIER_OVERRIDE entry {entry!r} must be 'idx=tier'")
-            idx_str, tier_str = entry.split("=", 1)
-            tiers[int(idx_str)] = int(tier_str)
-    return tiers
-
-
 def make_aot_launcher(constants, signature, ids, kernel_name):
     """Generate a standalone C launcher (header + source) for AOT cross-compilation.
 
@@ -442,7 +414,6 @@ def make_aot_launcher(constants, signature, ids, kernel_name):
     kernel_fn_args = [i for i, ty in signature_flat.items() if i not in constants and ty != "constexpr"]
     arg_decls = ', '.join(f"{ty_to_cpp(signature_flat[i])} arg{i}" for i in kernel_fn_args)
     kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_fn_args)
-    tiers = _read_tier_sidecar(kernel_name)
     flash_head_resident = (
         kernel_name == "flash_attention"
         and os.getenv("TRITON_DISABLE_SPM", "0") != "1"
@@ -464,27 +435,7 @@ def make_aot_launcher(constants, signature, ids, kernel_name):
     if flash_head_resident_chunk_rows <= 0:
         flash_head_resident_chunk_rows = 1
 
-    def _alloc_case(arg_index, tier):
-        if tier == 1:
-            expr = "spm_malloc(nbytes)"
-        elif tier == 3:
-            expr = "dma_buf_malloc(nbytes)"
-        else:
-            expr = f"{kernel_name}_record_malloc(malloc(nbytes))"
-        return f"    case {arg_index}: return {expr};"
-
-    alloc_cases = "\n".join(
-        _alloc_case(i, tiers.get(i, 2))
-        for i in kernel_fn_args
-        if ty_to_cpp(signature_flat[i]) == "void*"
-    )
-    if not alloc_cases:
-        alloc_cases = f"    default: return {kernel_name}_record_malloc(malloc(nbytes));"
-    else:
-        alloc_cases = (
-            alloc_cases
-            + f"\n    default: return {kernel_name}_record_malloc(malloc(nbytes));"
-        )
+    alloc_cases = f"    default: return {kernel_name}_arg_malloc(arg_index, nbytes);"
 
     # Extern declaration for the Triton-generated kernel symbol.
     # Triton's LLVM lowering appends 6 i32 args: pid_x/y/z, gridX/Y/Z.
@@ -633,6 +584,18 @@ void {kernel_name}_free_all(void);
 """
 
     # --- Source (C-compatible) ---
+    real_hw_launch_init = ""
+    if (
+        os.getenv("TRISPM_REAL_HW", "0") == "1"
+        and os.getenv("TRITON_DISABLE_SPM", "0") != "1"
+    ):
+        real_hw_launch_init = """\
+#ifdef TRISPM_REAL_HW
+    if (trispm_real_hw_init_spm() != 0)
+        return;
+#endif
+"""
+
     source = f"""\
 #include "{kernel_name}_launcher.h"
 
@@ -652,6 +615,39 @@ static void *{kernel_name}_record_malloc(void *ptr)
     if (ptr && {kernel_name}_malloc_count < 64)
         {kernel_name}_malloc_ptrs[{kernel_name}_malloc_count++] = ptr;
     return ptr;
+}}
+
+static int {kernel_name}_arg_uses_dma_buf(int arg_index)
+{{
+#ifdef TRISPM_REAL_HW
+    const char *env = getenv("TRISPM_REAL_HW_UDMA_ALLOC_ARGS");
+    if (!env || !env[0])
+        return 0;
+
+    const char *p = env;
+    while (*p) {{
+        char *end = NULL;
+        long value = strtol(p, &end, 10);
+        if (end != p && value == arg_index)
+            return 1;
+        if (end == p)
+            ++p;
+        else
+            p = end;
+        while (*p == ',' || *p == ' ' || *p == '\\t')
+            ++p;
+    }}
+#else
+    (void)arg_index;
+#endif
+    return 0;
+}}
+
+static void *{kernel_name}_arg_malloc(int arg_index, size_t nbytes)
+{{
+    if ({kernel_name}_arg_uses_dma_buf(arg_index))
+        return dma_buf_malloc(nbytes);
+    return {kernel_name}_record_malloc(malloc(nbytes));
 }}
 
 {extra_helpers}
@@ -678,6 +674,7 @@ void {kernel_name}_launch(
     int32_t gridX, int32_t gridY, int32_t gridZ
     {(', ' + arg_decls) if arg_decls else ''})
 {{
+{real_hw_launch_init}
 {launch_body}
 }}
 """

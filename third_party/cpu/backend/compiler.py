@@ -228,21 +228,16 @@ class CPUBackend(BaseBackend):
             cpu.passes.ttcpuir.add_convert_dot_generic(pm)
 
             # SPM transformation: convert tiled DRAM loads to DMA+SPM
-            # transfers.  Normal DRAM backing stays cacheable by default.
-            # The older Tier-3 tensor-placement sidecar is retained only as an
-            # opt-in compatibility path for reproducing legacy ablations.
+            # transfers.  Ordinary DRAM backing uses the normal allocation path.
             # Must run after dot lowering (to detect vector.contract consumers)
             # and before type promotion.
-            # TRITON_DISABLE_SPM=1 produces a cacheable-only binary suitable
+            # TRITON_DISABLE_SPM=1 produces an ordinary-DRAM-only binary suitable
             # for the cache_baseline gem5 run (no DMA MMIO accesses).
             if os.getenv("TRITON_DISABLE_SPM", "0") != "1":
                 spm_base = int(os.getenv("TRITON_SPM_BASE", "0x40000000"), 0)
                 spm_size = int(os.getenv("TRITON_SPM_SIZE", "262144"), 0)
                 micro_m = int(os.getenv("TRITON_MICRO_M", "8"), 0)
                 window_k = int(os.getenv("TRITON_SPM_WINDOW_K", "8"), 0)
-                enable_reductions = (
-                    os.getenv("TRITON_ENABLE_SPM_REDUCTIONS", "0") == "1"
-                )
                 enable_row_resident_reductions = env_bool(
                     "TRITON_ENABLE_SPM_ROW_RESIDENT_REDUCTIONS",
                     True)
@@ -257,26 +252,15 @@ class CPUBackend(BaseBackend):
                     True)
                 promotion_report = env_bool(
                     "TRITON_SPM_PROMOTION_REPORT", True)
-                enable_tensor_placement = env_bool(
-                    "TRITON_ENABLE_SPM_TENSOR_PLACEMENT",
-                    False)
-                if enable_tensor_placement:
-                    cpu.passes.ttcpuir.add_spm_tensor_placement(
-                        pm, enable_reductions
-                        and not enable_row_resident_reductions
-                        and not enable_promotion_profitability)
+                generic_affine_tile_min_bytes = env_int(
+                    "TRITON_SPM_GENERIC_AFFINE_TILE_MIN_BYTES",
+                    64)
                 cpu.passes.ttcpuir.add_convert_memory_to_spm(
                     pm, spm_base, spm_size, micro_m, window_k,
-                    enable_reductions, enable_row_resident_reductions,
+                    enable_row_resident_reductions,
                     row_resident_max_bytes, row_resident_producer_pass,
                     enable_promotion_profitability,
-                    promotion_report)
-
-                enable_split_large_contract = env_bool(
-                    "TRITON_ENABLE_SPM_SPLIT_LARGE_CONTRACT",
-                    True)
-                if enable_split_large_contract:
-                    cpu.passes.ttcpuir.add_split_large_contract(pm, micro_m)
+                    promotion_report, generic_affine_tile_min_bytes)
 
             # bf16 hardware support requires Zfbfmin (not in gem5 yet)
             promote_bf16_to_fp32 = True
@@ -360,8 +344,9 @@ class CPUBackend(BaseBackend):
         if _AOT_MODE:
             dma_mmio_base = int(os.getenv("TRITON_DMA_MMIO_BASE", "0xF0000000"), 0)
             use_xspm_insn = env_bool("TRITON_USE_XSPM_INSN", False)
+            real_hw_runtime = env_bool("TRISPM_REAL_HW", False)
             cpu.passes.ttcpuir.add_dma_ops_to_llvmir(
-                pm, dma_mmio_base, use_xspm_insn)
+                pm, dma_mmio_base, use_xspm_insn, real_hw_runtime)
 
         if not _AOT_MODE:
             vec_lib_requirements = {

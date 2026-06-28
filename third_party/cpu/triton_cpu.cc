@@ -106,14 +106,6 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_optimize_masks", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createOptimizeMasks());
   });
-  m.def("add_spm_tensor_placement", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::cpu::createSPMTensorPlacement());
-  });
-  m.def("add_spm_tensor_placement",
-        [](mlir::PassManager &pm, bool enableReductions) {
-          pm.addPass(
-              mlir::triton::cpu::createSPMTensorPlacement(enableReductions));
-        });
   m.def("add_convert_memory_to_spm",
         [](mlir::PassManager &pm, int64_t spmBase, int64_t spmSize) {
           pm.addPass(
@@ -127,33 +119,27 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
         });
   m.def("add_convert_memory_to_spm",
         [](mlir::PassManager &pm, int64_t spmBase, int64_t spmSize,
-           int64_t microM, int64_t windowK, bool enableReductions) {
-          pm.addPass(mlir::triton::cpu::createConvertMemoryToSPM(
-              spmBase, spmSize, microM, windowK, enableReductions));
-        });
-  m.def("add_convert_memory_to_spm",
-        [](mlir::PassManager &pm, int64_t spmBase, int64_t spmSize,
-           int64_t microM, int64_t windowK, bool enableReductions,
-           bool promotionReport) {
-          pm.addPass(mlir::triton::cpu::createConvertMemoryToSPM(
-              spmBase, spmSize, microM, windowK, enableReductions,
-              promotionReport));
-        });
-  m.def("add_convert_memory_to_spm",
-        [](mlir::PassManager &pm, int64_t spmBase, int64_t spmSize,
-           int64_t microM, int64_t windowK, bool enableReductions,
+           int64_t microM, int64_t windowK,
            bool enableRowResidentReductions, int64_t rowResidentMaxBytes,
            std::string rowResidentProducerPass,
            bool enablePromotionProfitability, bool promotionReport) {
           pm.addPass(mlir::triton::cpu::createConvertMemoryToSPM(
-              spmBase, spmSize, microM, windowK, enableReductions,
-              enableRowResidentReductions, rowResidentMaxBytes,
-              rowResidentProducerPass,
+              spmBase, spmSize, microM, windowK, enableRowResidentReductions,
+              rowResidentMaxBytes, rowResidentProducerPass,
               enablePromotionProfitability, promotionReport));
         });
-  m.def("add_split_large_contract",
-        [](mlir::PassManager &pm, int64_t microM) {
-          pm.addPass(mlir::triton::cpu::createSplitLargeContract(microM));
+  m.def("add_convert_memory_to_spm",
+        [](mlir::PassManager &pm, int64_t spmBase, int64_t spmSize,
+           int64_t microM, int64_t windowK,
+           bool enableRowResidentReductions,
+           int64_t rowResidentMaxBytes, std::string rowResidentProducerPass,
+           bool enablePromotionProfitability, bool promotionReport,
+           int64_t genericAffineTileMinBytes) {
+          pm.addPass(mlir::triton::cpu::createConvertMemoryToSPM(
+              spmBase, spmSize, microM, windowK, enableRowResidentReductions,
+              rowResidentMaxBytes, rowResidentProducerPass,
+              enablePromotionProfitability, promotionReport,
+              genericAffineTileMinBytes));
         });
   m.def("add_convert_dot_product", [](mlir::PassManager &pm,
                                       bool useHorizontalSum) {
@@ -219,9 +205,9 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   });
   m.def("add_dma_ops_to_llvmir",
         [](mlir::PassManager &pm, uint64_t dma_mmio_base,
-           bool use_xspm_insn) {
+           bool use_xspm_insn, bool real_hw_runtime) {
           pm.addPass(mlir::triton::cpu::createDmaOpsToLLVMPass(
-              dma_mmio_base, use_xspm_insn));
+              dma_mmio_base, use_xspm_insn, real_hw_runtime));
         });
   m.def("add_ukernels_to_onednn_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createUkernelOpsToOneDNNLLVMPass());

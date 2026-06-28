@@ -1,5 +1,5 @@
-// RUN: env TRITON_SPM_INDIRECT_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=ACCEPTED
-// RUN: env TRITON_SPM_INDIRECT_TILE=1 TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY=1 TRITON_SPM_INDIRECT_TILE_MIN_BYTES=4096 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=REJECTED
+// RUN: env TRITON_SPM_INDIRECT_TILE=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=ACCEPTED
+// RUN: env TRITON_SPM_INDIRECT_TILE=1 TRITON_ENABLE_SPM_PROMOTION_PROFITABILITY=1 TRITON_SPM_INDIRECT_TILE_MIN_BYTES=4096 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=0" | FileCheck %s --check-prefix=REJECTED
 
 // ============================================================================
 // Accepted case: a fixed-trip gather loop with table[idx, :] body.
@@ -73,7 +73,7 @@ module {
 //   - inside, emit dma_wait, conditional next-bag prefetch via scf.if, and
 //     read the consume side from SPM (addrspace 3) at curBuf*tileBytes+...
 // ============================================================================
-// RUN: env TRITON_SPM_INDIRECT_TILE=1 TRITON_SPM_INDIRECT_TILE_DOUBLE_BUFFER=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-reductions=0 enable-row-resident-reductions=0" 2>&1 | FileCheck %s --check-prefix=DOUBLE_BUFFER
+// RUN: env TRITON_SPM_INDIRECT_TILE=1 TRITON_SPM_INDIRECT_TILE_DOUBLE_BUFFER=1 triton-opt %s -split-input-file -triton-cpu-convert-memory-to-spm="spm-base=0x40000000 spm-size=65536 enable-row-resident-reductions=0" 2>&1 | FileCheck %s --check-prefix=DOUBLE_BUFFER
 
 // DOUBLE_BUFFER-LABEL: @embedding_bag_grouped
 // Pre-loop prefetch: one dma_enqueue_2d setup loop before the outer scf.for.

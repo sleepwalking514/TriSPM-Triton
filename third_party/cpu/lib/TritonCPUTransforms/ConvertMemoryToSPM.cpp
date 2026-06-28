@@ -4,9 +4,9 @@
 // DMA-based scratchpad memory (SPM) transfers.
 //
 // Supported patterns:
-//   1) GEMM double-buffering: K-loop with two tiled loads feeding a dot
-//      product.  Each load gets two SPM buffers; while the current tiles
-//      are computed, the next tiles are prefetched asynchronously.
+//   1) Fused micro GEMM: K-loop with two tiled loads feeding a dot product.
+//      B tiles are staged in a loop-local K window, A is streamed as micro-M
+//      rows, and the full accumulator tile is kept in SPM between slices.
 //   2) Attention v2 residency: attention-style QK/PV loops stage the
 //      loop-invariant Q tile once in SPM.  An experimental K/V streaming
 //      schedule can also double-buffer loop-local K/V tiles without unrolling
@@ -49,6 +49,7 @@
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -256,6 +257,11 @@ static std::optional<int64_t> getExactStaticTripCount(scf::ForOp forOp) {
     return std::nullopt;
 
   return distance / *stepCst;
+}
+
+static bool hasPositiveConstantStep(scf::ForOp forOp) {
+  auto stepCst = getConstantIntValue(forOp.getStep());
+  return stepCst && *stepCst > 0;
 }
 
 /// Cast a value to i64.  Handles index, i64 (no-op), and narrower integers.
@@ -477,6 +483,61 @@ static bool canComputePrologueDramAddr(vector::TransferReadOp readOp,
   return true;
 }
 
+static std::optional<int64_t>
+getLoopBlockPtrStepBytes(vector::TransferReadOp readOp, scf::ForOp forOp) {
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!memRefTy)
+    return std::nullopt;
+
+  auto *baseDefOp = readOp.getBase().getDefiningOp();
+  if (!baseDefOp || baseDefOp->getParentRegion() != &forOp.getRegion())
+    return std::nullopt;
+
+  auto extractMR = dyn_cast<triton::cpu::ExtractMemRefOp>(baseDefOp);
+  if (!extractMR)
+    return std::nullopt;
+
+  auto blockPtrArg = dyn_cast<BlockArgument>(extractMR.getSrc());
+  if (!blockPtrArg || blockPtrArg.getOwner() != forOp.getBody() ||
+      blockPtrArg.getArgNumber() == 0)
+    return std::nullopt;
+
+  OpOperand *yielded = forOp.getTiedLoopYieldedValue(blockPtrArg);
+  if (!yielded)
+    return std::nullopt;
+
+  auto advance = yielded->get().getDefiningOp<triton::AdvanceOp>();
+  if (!advance || advance.getPtr() != blockPtrArg)
+    return std::nullopt;
+
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides))
+    return std::nullopt;
+  auto offsets = advance.getOffsets();
+  if (offsets.size() != strides.size())
+    return std::nullopt;
+
+  int64_t stepElems = 0;
+  bool sawNonZero = false;
+  for (auto [offset, stride] : llvm::zip_equal(offsets, strides)) {
+    auto offsetValue = getConstantIntValue(offset);
+    if (!offsetValue)
+      return std::nullopt;
+    if (*offsetValue != 0)
+      sawNonZero = true;
+    stepElems += *offsetValue * stride;
+  }
+  if (!sawNonZero || stepElems <= 0)
+    return std::nullopt;
+
+  auto loopStep = getConstantIntValue(forOp.getStep());
+  if (!loopStep || *loopStep <= 0 || stepElems % *loopStep != 0)
+    return std::nullopt;
+
+  unsigned elemBytes = memRefTy.getElementType().getIntOrFloatBitWidth() / 8;
+  return (stepElems / *loopStep) * elemBytes;
+}
+
 static std::optional<int64_t> getLoopStepBytes(vector::TransferReadOp readOp,
                                                scf::ForOp forOp,
                                                bool requireLoopIv) {
@@ -496,12 +557,36 @@ static std::optional<int64_t> getLoopStepBytes(vector::TransferReadOp readOp,
   }
 
   if (isLoopBlockPtrTransfer(readOp, forOp))
-    return (strides.empty() ? 1 : strides[0]) * elemBytes;
+    return getLoopBlockPtrStepBytes(readOp, forOp);
 
   if (requireLoopIv)
     return std::nullopt;
 
   return (strides.empty() ? 1 : strides[0]) * elemBytes;
+}
+
+static std::optional<unsigned>
+getProjectedVectorDimForMemrefDim(vector::TransferReadOp readOp,
+                                  unsigned memrefDim) {
+  AffineMap map = readOp.getPermutationMap();
+  if (!map.isProjectedPermutation() || map.getNumResults() == 0)
+    return std::nullopt;
+
+  auto resultPos = map.getResultPosition(getAffineDimExpr(memrefDim,
+                                                          map.getContext()));
+  if (!resultPos)
+    return std::nullopt;
+  return *resultPos;
+}
+
+static std::optional<unsigned>
+getLoopSteppedMemrefDim(vector::TransferReadOp readOp, scf::ForOp forOp) {
+  Value origIv = forOp.getInductionVar();
+  for (auto [idx, index] : llvm::enumerate(readOp.getIndices())) {
+    if (index == origIv)
+      return idx;
+  }
+  return std::nullopt;
 }
 
 /// Emit triton_cpu.dma_enqueue_2d for a 2D tile.
@@ -743,6 +828,65 @@ static bool valueFeedsDot(Value value, unsigned depth = 0) {
   return false;
 }
 
+static bool valueDerivedFromContraction(Value value, scf::ForOp forOp,
+                                        unsigned depth = 0) {
+  if (!value || depth > 6)
+    return false;
+
+  Operation *op = value.getDefiningOp();
+  if (!op || op->getParentOfType<scf::ForOp>() != forOp)
+    return false;
+  if (isa<vector::ContractionOp>(op) || isa<triton::cpu::DotOp>(op))
+    return true;
+
+  if (!isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+           arith::ExtFOp, arith::TruncFOp, vector::BroadcastOp,
+           vector::ShapeCastOp>(op) &&
+      !isShapePreservingCastLikeOp(op))
+    return false;
+
+  for (Value operand : op->getOperands())
+    if (valueDerivedFromContraction(operand, forOp, depth + 1))
+      return true;
+  return false;
+}
+
+static bool valueFeedsMathExp(Value value, scf::ForOp forOp,
+                              unsigned depth = 0) {
+  if (!value || depth > 8)
+    return false;
+  for (Operation *user : value.getUsers()) {
+    if (user->getParentOfType<scf::ForOp>() != forOp)
+      continue;
+    if (isa<math::ExpOp>(user))
+      return true;
+    if (user->getNumResults() != 1 || user->getNumRegions() != 0)
+      continue;
+    if (valueFeedsMathExp(user->getResult(0), forOp, depth + 1))
+      return true;
+  }
+  return false;
+}
+
+static bool loopHasMaskedContractionSoftmax(scf::ForOp forOp) {
+  WalkResult result = forOp.getBody()->walk([&](arith::SelectOp selectOp) {
+    if (selectOp->getParentOfType<scf::ForOp>() != forOp)
+      return WalkResult::advance();
+
+    bool selectsContraction =
+        valueDerivedFromContraction(selectOp.getTrueValue(), forOp) ||
+        valueDerivedFromContraction(selectOp.getFalseValue(), forOp);
+    if (!selectsContraction)
+      return WalkResult::advance();
+
+    if (!valueFeedsMathExp(selectOp.getResult(), forOp))
+      return WalkResult::advance();
+
+    return WalkResult::interrupt();
+  });
+  return result.wasInterrupted();
+}
+
 static vector::TransferReadOp
 getTransferReadThroughShapePreservingCasts(Value value, unsigned depth = 0) {
   if (!value || depth > 4)
@@ -768,6 +912,8 @@ static bool readFeedsDot(vector::TransferReadOp readOp) {
 static SmallVector<TiledLoadInfo> findTiledLoads(scf::ForOp forOp) {
   SmallVector<TiledLoadInfo> results;
   forOp.getBody()->walk([&](vector::TransferReadOp readOp) {
+    if (readOp->getParentOfType<scf::ForOp>() != forOp)
+      return;
     auto vecTy = dyn_cast<VectorType>(readOp.getType());
     if (!vecTy || vecTy.getRank() < 1)
       return;
@@ -1117,6 +1263,7 @@ struct SPMPromotionRecord {
   std::string status = "accepted";
   std::string source;
   std::string scope;
+  std::string footprintClass = "unsupported";
   SmallVector<int64_t> shape;
   int64_t uses = 0;
   std::string copyIn;
@@ -1137,6 +1284,7 @@ struct SPMPromotionRejection {
   std::string pattern;
   std::string source;
   std::string scope;
+  std::string footprintClass = "unsupported";
   SmallVector<int64_t> shape;
   int64_t uses = 0;
   std::string copyIn = "none";
@@ -1170,6 +1318,38 @@ struct SPMContractionReport {
   std::string scheduleStatus;
   std::string reasonCode;
   std::string reason;
+};
+
+struct AffineTileCandidate {
+  std::string candidateId;
+  int64_t loopOrdinal = 0;
+  int64_t opOrdinal = 0;
+  std::string op;
+  std::string scheduleClass = "unsupported";
+  std::string status = "rejected";
+  std::string reasonCode = "unsupported_pattern";
+  std::string reason;
+  SmallVector<int64_t> shape;
+  int64_t tileBytes = 0;
+  int64_t uses = 0;
+  std::string accessKind = "read";
+  std::string footprintKind = "read_only";
+  std::string base = "unknown";
+  std::string transferMap = "unknown";
+  bool permutationMapIdentity = false;
+  bool inBounds = false;
+  bool hasMask = false;
+  bool hasPadding = false;
+  bool fullTile = false;
+  bool staticTripCount = false;
+  int64_t tripCount = 0;
+  bool staticStride = false;
+  bool rowMajorInnerContiguous = false;
+  bool dmaFilledLayoutSupported = false;
+  bool dmaRepresentable = false;
+  bool mayAliasStore = false;
+  bool postWritePrefetchSafe = false;
+  bool feedsDot = false;
 };
 
 static constexpr int64_t kDmaMmioStoresPerDescriptor = 4;
@@ -1230,6 +1410,7 @@ struct SPMPromotionReport {
   SmallVector<SPMPromotionRecord, 4> records;
   SmallVector<SPMPromotionRejection, 4> rejections;
   SmallVector<SPMContractionReport, 4> contractions;
+  SmallVector<AffineTileCandidate, 8> affineTileCandidates;
 };
 
 static void appendShape(SmallVectorImpl<int64_t> &shape, VectorType vecTy) {
@@ -1443,6 +1624,436 @@ static void collectVectorContractionReports(FunctionOpInterface funcOp,
   });
 }
 
+static int64_t getOperationOrdinalInLoop(Operation *target, scf::ForOp forOp) {
+  int64_t ordinal = 0;
+  bool found = false;
+  forOp.getBody()->walk([&](Operation *op) {
+    if (found)
+      return WalkResult::interrupt();
+    if (isa<vector::TransferReadOp, vector::TransferWriteOp>(op)) {
+      if (op == target) {
+        found = true;
+        return WalkResult::interrupt();
+      }
+      ++ordinal;
+    }
+    return WalkResult::advance();
+  });
+  return ordinal;
+}
+
+static std::string getStableBaseName(Value base) {
+  if (!base)
+    return "unknown";
+  if (auto arg = dyn_cast<BlockArgument>(base)) {
+    Operation *owner = arg.getOwner()->getParentOp();
+    if (auto funcOp = dyn_cast_or_null<FunctionOpInterface>(owner))
+      return ("func_arg_" + Twine(arg.getArgNumber())).str();
+    if (isa<scf::ForOp>(owner))
+      return ("loop_arg_" + Twine(arg.getArgNumber())).str();
+    return ("block_arg_" + Twine(arg.getArgNumber())).str();
+  }
+  Operation *defOp = base.getDefiningOp();
+  if (!defOp)
+    return "unknown_memref_base";
+  return defOp->getName().getStringRef().str();
+}
+
+static bool hasConstantPadding(vector::TransferReadOp readOp) {
+  Value padding = readOp.getPadding();
+  return padding && static_cast<bool>(padding.getDefiningOp<arith::ConstantOp>());
+}
+
+static bool allTransferInBounds(ArrayRef<bool> inBounds, int64_t rank) {
+  if (static_cast<int64_t>(inBounds.size()) != rank)
+    return false;
+  return llvm::all_of(inBounds, [](bool value) { return value; });
+}
+
+static bool hasLoopCarriedPointerBase(Value base, scf::ForOp forOp) {
+  if (auto blockArg = dyn_cast<BlockArgument>(base))
+    return blockArg.getOwner() == forOp.getBody() && blockArg.getArgNumber() > 0;
+  Operation *defOp = base.getDefiningOp();
+  if (!defOp)
+    return false;
+  if (auto extract = dyn_cast<triton::cpu::ExtractMemRefOp>(defOp))
+    return hasLoopCarriedPointerBase(extract.getSrc(), forOp);
+  return false;
+}
+
+static bool sameMemrefBase(Value lhs, Value rhs) {
+  if (lhs == rhs)
+    return true;
+  auto lhsArg = dyn_cast<BlockArgument>(lhs);
+  auto rhsArg = dyn_cast<BlockArgument>(rhs);
+  if (lhsArg && rhsArg && lhsArg == rhsArg)
+    return true;
+  return false;
+}
+
+enum class TransferWriteAliasKind { None, SameBase, Unknown };
+
+static bool loopHasAnyTransferWrite(scf::ForOp forOp) {
+  bool hasWrite = false;
+  forOp.getBody()->walk([&](vector::TransferWriteOp) {
+    hasWrite = true;
+    return WalkResult::interrupt();
+  });
+  return hasWrite;
+}
+
+static bool allTransferWritesAfterRead(scf::ForOp forOp,
+                                       vector::TransferReadOp readOp) {
+  bool safe = true;
+  forOp.getBody()->walk([&](vector::TransferWriteOp writeOp) {
+    if (writeOp->getBlock() != forOp.getBody() ||
+        readOp->getBlock() != forOp.getBody() ||
+        !readOp->isBeforeInBlock(writeOp.getOperation())) {
+      safe = false;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return safe;
+}
+
+static TransferWriteAliasKind
+getLoopTransferWriteAliasKind(scf::ForOp forOp, Value base) {
+  TransferWriteAliasKind kind = TransferWriteAliasKind::None;
+  forOp.getBody()->walk([&](vector::TransferWriteOp writeOp) {
+    if (sameMemrefBase(writeOp.getBase(), base)) {
+      kind = TransferWriteAliasKind::SameBase;
+      return WalkResult::interrupt();
+    }
+    kind = TransferWriteAliasKind::Unknown;
+    return WalkResult::advance();
+  });
+  return kind;
+}
+
+static int64_t countNonWriteUses(Value value) {
+  int64_t uses = 0;
+  for (Operation *user : value.getUsers()) {
+    if (isa<vector::TransferWriteOp>(user))
+      continue;
+    ++uses;
+  }
+  return uses;
+}
+
+static bool isGeneratedAffineTileValue(Value value) {
+  if (!value)
+    return false;
+  if (getTransferReadThroughShapePreservingCasts(value))
+    return false;
+  if (isa<BlockArgument>(value))
+    return false;
+  return value.getDefiningOp() != nullptr;
+}
+
+static bool hasGenericRowMajorInnerContiguousLayout(VectorType vecTy,
+                                                    MemRefType memRefTy) {
+  if (!vecTy || !memRefTy || vecTy.getRank() < 1 || vecTy.getRank() > 2 ||
+      memRefTy.getRank() != vecTy.getRank())
+    return false;
+
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides))
+    return false;
+
+  auto shape = vecTy.getShape();
+  if (vecTy.getRank() == 1)
+    return strides.size() == 1 && strides[0] == 1;
+
+  return strides.size() == 2 && strides[1] == 1 &&
+         strides[0] >= shape[1];
+}
+
+static bool hasProjectedContiguousSliceLayout(vector::TransferReadOp readOp,
+                                              scf::ForOp forOp) {
+  auto vecTy = dyn_cast<VectorType>(readOp.getType());
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!vecTy || !memRefTy || vecTy.getRank() != 1)
+    return false;
+
+  auto steppedMemrefDim = getLoopSteppedMemrefDim(readOp, forOp);
+  if (!steppedMemrefDim)
+    return false;
+
+  auto vectorDim = getProjectedVectorDimForMemrefDim(readOp, *steppedMemrefDim);
+  if (!vectorDim || *vectorDim != 0)
+    return false;
+
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides) || *steppedMemrefDim >= strides.size())
+    return false;
+  return strides[*steppedMemrefDim] == 1;
+}
+
+static bool hasSupportedGenericTransferMap(vector::TransferReadOp readOp,
+                                           scf::ForOp forOp) {
+  return readOp.getPermutationMap().isIdentity() ||
+         hasProjectedContiguousSliceLayout(readOp, forOp);
+}
+
+static bool hasGenericDmaFilledLayout(VectorType vecTy, MemRefType memRefTy) {
+  return hasGenericRowMajorInnerContiguousLayout(vecTy, memRefTy) ||
+         hasColMajorRowBlockDmaLayout(vecTy, memRefTy);
+}
+
+static bool hasGenericDmaFilledLayout(vector::TransferReadOp readOp,
+                                      scf::ForOp forOp) {
+  auto vecTy = dyn_cast<VectorType>(readOp.getType());
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!vecTy || !memRefTy)
+    return false;
+  return hasGenericDmaFilledLayout(vecTy, memRefTy) ||
+         hasProjectedContiguousSliceLayout(readOp, forOp);
+}
+
+static void rejectAffineTileCandidate(AffineTileCandidate &candidate,
+                                      StringRef reasonCode,
+                                      StringRef reason) {
+  candidate.status = "rejected";
+  candidate.scheduleClass = "unsupported";
+  candidate.reasonCode = reasonCode.str();
+  candidate.reason = reason.str();
+}
+
+static void reportOnlyAffineTileCandidate(AffineTileCandidate &candidate,
+                                          StringRef scheduleClass,
+                                          StringRef reasonCode,
+                                          StringRef reason) {
+  candidate.status = "report_only";
+  candidate.scheduleClass = scheduleClass.str();
+  candidate.reasonCode = reasonCode.str();
+  candidate.reason = reason.str();
+}
+
+static void markAffineTileLoweringCandidate(AffineTileCandidate &candidate,
+                                            StringRef scheduleClass,
+                                            StringRef reasonCode,
+                                            StringRef reason) {
+  candidate.status = "candidate";
+  candidate.scheduleClass = scheduleClass.str();
+  candidate.reasonCode = reasonCode.str();
+  candidate.reason = reason.str();
+}
+
+static void classifyAffineTileCandidate(AffineTileCandidate &candidate) {
+  if (candidate.base == "unknown" || candidate.base == "unknown_memref_base") {
+    rejectAffineTileCandidate(
+        candidate, "unknown_memref_base",
+        "transfer base could not be traced to a stable memref");
+    return;
+  }
+  if (!candidate.permutationMapIdentity &&
+      candidate.transferMap != "contiguous_projected_slice") {
+    rejectAffineTileCandidate(
+        candidate, "unsupported_transfer_map",
+        "v1 generic affine tile report/lowering requires an identity or "
+        "contiguous projected-permutation transfer map");
+    return;
+  }
+  if (!candidate.fullTile) {
+    rejectAffineTileCandidate(
+        candidate, "non_full_tile_transfer",
+        "transfer has masking, missing in_bounds, or padding-dependent edge "
+        "semantics");
+    return;
+  }
+  if (!candidate.staticStride || !candidate.dmaRepresentable) {
+    rejectAffineTileCandidate(
+        candidate, "dynamic_shape_or_stride",
+        "transfer does not have static strides and a computable DMA address");
+    return;
+  }
+  if (candidate.mayAliasStore && !candidate.postWritePrefetchSafe) {
+    if (candidate.reasonCode == "unknown_transfer_write_may_alias")
+      rejectAffineTileCandidate(candidate, "unknown_transfer_write_may_alias",
+                                "loop contains a transfer_write whose base "
+                                "cannot be proven non-aliasing");
+    else
+      rejectAffineTileCandidate(
+          candidate, "same_base_transfer_write_may_alias",
+          "loop contains a transfer_write to the same memref base");
+    return;
+  }
+  if (!candidate.dmaFilledLayoutSupported) {
+    rejectAffineTileCandidate(
+        candidate, "unsupported_non_row_major_tile",
+        "v1 generic streaming lowering requires a DMA-filled rank-1 contiguous, "
+        "rank-2 row-major, or rank-2 col-major row-block tile");
+    return;
+  }
+  if (candidate.mayAliasStore) {
+    markAffineTileLoweringCandidate(
+        candidate, "streaming_ping_pong",
+        "candidate_streaming_ping_pong_post_write_prefetch",
+        "static tile can use generic fallback ping-pong lowering with the next "
+        "DMA scheduled after loop-body writes");
+  } else {
+    markAffineTileLoweringCandidate(
+        candidate, "streaming_ping_pong",
+        candidate.feedsDot ? "candidate_streaming_ping_pong_contraction_fallback"
+                           : "candidate_streaming_ping_pong",
+        candidate.feedsDot
+            ? "read-only contraction tile is legal for post-specialized "
+              "generic fallback streaming ping-pong lowering"
+            : "read-only tile is legal for generic fallback streaming "
+              "ping-pong lowering");
+  }
+}
+
+static void collectAffineTileCandidates(FunctionOpInterface funcOp,
+                                        SPMPromotionReport &report) {
+  int64_t nextCandidate = 0;
+  int64_t loopOrdinal = 0;
+  funcOp->walk([&](scf::ForOp forOp) {
+    int64_t thisLoopOrdinal = loopOrdinal++;
+    auto trips = getExactStaticTripCount(forOp);
+
+    forOp.getBody()->walk([&](vector::TransferReadOp readOp) {
+      if (readOp->getParentOfType<scf::ForOp>() != forOp)
+        return;
+      AffineTileCandidate candidate;
+      candidate.candidateId = ("affine_tile_" + Twine(nextCandidate++)).str();
+      candidate.loopOrdinal = thisLoopOrdinal;
+      candidate.opOrdinal = getOperationOrdinalInLoop(readOp.getOperation(), forOp);
+      candidate.op = readOp->getName().getStringRef().str();
+      candidate.accessKind = "read";
+      candidate.base = getStableBaseName(readOp.getBase());
+      AffineMap readMap = readOp.getPermutationMap();
+      bool supportedProjectedSlice =
+          !readMap.isIdentity() && hasProjectedContiguousSliceLayout(readOp, forOp);
+      candidate.transferMap =
+          readMap.isIdentity()       ? "identity"
+          : supportedProjectedSlice  ? "contiguous_projected_slice"
+                                     : "non_identity";
+      candidate.permutationMapIdentity = readOp.getPermutationMap().isIdentity();
+      candidate.hasMask = static_cast<bool>(readOp.getMask());
+      candidate.hasPadding = static_cast<bool>(readOp.getPadding());
+      candidate.staticTripCount = trips.has_value();
+      candidate.tripCount = trips.value_or(0);
+      candidate.feedsDot = readFeedsDot(readOp);
+
+      if (auto vecTy = dyn_cast<VectorType>(readOp.getType())) {
+        appendShape(candidate.shape, vecTy);
+        candidate.tileBytes = getTileBytes(vecTy);
+        candidate.inBounds =
+            allTransferInBounds(readOp.getInBoundsValues(), vecTy.getRank());
+      }
+
+      auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+      SmallVector<int64_t> strides;
+      candidate.staticStride = memRefTy && getStaticStrides(memRefTy, strides);
+      if (memRefTy) {
+        candidate.rowMajorInnerContiguous =
+            hasGenericRowMajorInnerContiguousLayout(
+                dyn_cast<VectorType>(readOp.getType()), memRefTy);
+        candidate.dmaFilledLayoutSupported =
+            hasGenericDmaFilledLayout(readOp, forOp);
+      }
+      candidate.dmaRepresentable =
+          memRefTy && canComputePrologueDramAddr(readOp, forOp) &&
+          getLoopStepBytes(readOp, forOp, /*requireLoopIv=*/true).has_value();
+      TransferWriteAliasKind aliasKind =
+          getLoopTransferWriteAliasKind(forOp, readOp.getBase());
+      candidate.mayAliasStore = aliasKind != TransferWriteAliasKind::None;
+      candidate.postWritePrefetchSafe =
+          candidate.mayAliasStore && allTransferWritesAfterRead(forOp, readOp);
+      if (candidate.mayAliasStore)
+        candidate.reasonCode =
+            aliasKind == TransferWriteAliasKind::SameBase
+                ? "same_base_transfer_write_may_alias"
+                : "unknown_transfer_write_may_alias";
+      if (hasLoopCarriedPointerBase(readOp.getBase(), forOp) &&
+          !isLoopBlockPtrTransfer(readOp, forOp)) {
+        rejectAffineTileCandidate(
+            candidate, "loop_carried_pointer_update",
+            "transfer base is derived from a loop-carried pointer");
+      }
+
+      candidate.uses = countNonWriteUses(readOp.getResult());
+      candidate.footprintKind =
+          candidate.mayAliasStore ? "read_modify_write" : "read_only";
+      candidate.fullTile = !candidate.hasMask && candidate.inBounds &&
+                           (!candidate.hasPadding || hasConstantPadding(readOp));
+      if (candidate.reasonCode == "loop_carried_pointer_update") {
+        // Keep the more specific loop-carried pointer reason.
+      } else {
+        classifyAffineTileCandidate(candidate);
+      }
+      report.affineTileCandidates.push_back(std::move(candidate));
+    });
+
+    forOp.getBody()->walk([&](vector::TransferWriteOp writeOp) {
+      if (writeOp->getParentOfType<scf::ForOp>() != forOp)
+        return;
+      AffineTileCandidate candidate;
+      candidate.candidateId = ("affine_tile_" + Twine(nextCandidate++)).str();
+      candidate.loopOrdinal = thisLoopOrdinal;
+      candidate.opOrdinal = getOperationOrdinalInLoop(writeOp.getOperation(), forOp);
+      candidate.op = writeOp->getName().getStringRef().str();
+      candidate.accessKind = "write";
+      candidate.footprintKind = "read_modify_write";
+      candidate.base = getStableBaseName(writeOp.getBase());
+      candidate.transferMap = writeOp.getPermutationMap().isIdentity()
+                                  ? "identity"
+                                  : "non_identity";
+      candidate.permutationMapIdentity =
+          writeOp.getPermutationMap().isIdentity();
+      candidate.hasMask = static_cast<bool>(writeOp.getMask());
+      candidate.staticTripCount = trips.has_value();
+      candidate.tripCount = trips.value_or(0);
+      if (auto vecTy = dyn_cast<VectorType>(writeOp.getVector().getType())) {
+        appendShape(candidate.shape, vecTy);
+        candidate.tileBytes = getTileBytes(vecTy);
+        candidate.inBounds =
+            allTransferInBounds(writeOp.getInBoundsValues(), vecTy.getRank());
+      }
+      auto memRefTy = dyn_cast<MemRefType>(writeOp.getBase().getType());
+      SmallVector<int64_t> strides;
+      candidate.staticStride = memRefTy && getStaticStrides(memRefTy, strides);
+      candidate.fullTile = !candidate.hasMask && candidate.inBounds;
+      bool generatedValue = isGeneratedAffineTileValue(writeOp.getVector());
+      candidate.footprintKind =
+          generatedValue ? "generated_value" : "read_modify_write";
+      if (!candidate.staticTripCount) {
+        rejectAffineTileCandidate(
+            candidate, "dynamic_affine_bounds",
+            "loop bounds/step do not have an exact static trip count");
+      } else if (candidate.base == "unknown" ||
+                 candidate.base == "unknown_memref_base") {
+        rejectAffineTileCandidate(
+            candidate, "unknown_memref_base",
+            "transfer base could not be traced to a stable memref");
+      } else if (!candidate.permutationMapIdentity) {
+        rejectAffineTileCandidate(
+            candidate, "unsupported_transfer_map",
+            "v1 generic affine tile report/lowering requires an identity "
+            "transfer map");
+      } else if (!candidate.fullTile) {
+        rejectAffineTileCandidate(
+            candidate, "non_full_tile_transfer",
+            "transfer_write has masking or missing in_bounds semantics");
+      } else if (generatedValue) {
+        reportOnlyAffineTileCandidate(
+            candidate, "generated_value_residency",
+            "report_only_generated_value_residency",
+            "generated vector value is reported as a derived-value residency "
+            "candidate; v1 lowering is disabled");
+      } else {
+        reportOnlyAffineTileCandidate(
+            candidate, "resident_multi_use", "report_only_read_modify_write",
+            "transfer_write footprint is reported as a read-modify/write "
+            "residency candidate; v1 lowering is disabled");
+      }
+      report.affineTileCandidates.push_back(std::move(candidate));
+    });
+  });
+}
+
 static void writeJsonString(llvm::raw_ostream &os, StringRef value) {
   os << "\"";
   for (char c : value) {
@@ -1489,6 +2100,102 @@ static void writeJsonStringArray(llvm::raw_ostream &os,
     writeJsonString(os, value);
   }
   os << "]";
+}
+
+static void writeJsonBool(llvm::raw_ostream &os, bool value) {
+  os << (value ? "true" : "false");
+}
+
+static void writeAffineTileCandidates(
+    llvm::raw_ostream &os, ArrayRef<AffineTileCandidate> candidates,
+    StringRef indent) {
+  os << indent << "\"affine_tile_candidates\": [\n";
+  for (auto [index, candidate] : llvm::enumerate(candidates)) {
+    os << indent << "  {\n";
+    os << indent << "    \"candidate_id\": ";
+    writeJsonString(os, candidate.candidateId);
+    os << ",\n";
+    os << indent << "    \"loop_ordinal\": " << candidate.loopOrdinal
+       << ",\n";
+    os << indent << "    \"op_ordinal\": " << candidate.opOrdinal << ",\n";
+    os << indent << "    \"op\": ";
+    writeJsonString(os, candidate.op);
+    os << ",\n";
+    os << indent << "    \"status\": ";
+    writeJsonString(os, candidate.status);
+    os << ",\n";
+    os << indent << "    \"schedule_class\": ";
+    writeJsonString(os, candidate.scheduleClass);
+    os << ",\n";
+    os << indent << "    \"reason_code\": ";
+    writeJsonString(os, candidate.reasonCode);
+    os << ",\n";
+    os << indent << "    \"reason\": ";
+    writeJsonString(os, candidate.reason);
+    os << ",\n";
+    os << indent << "    \"access_kind\": ";
+    writeJsonString(os, candidate.accessKind);
+    os << ",\n";
+    os << indent << "    \"footprint_kind\": ";
+    writeJsonString(os, candidate.footprintKind);
+    os << ",\n";
+    os << indent << "    \"base\": ";
+    writeJsonString(os, candidate.base);
+    os << ",\n";
+    os << indent << "    \"shape\": ";
+    writeJsonShape(os, candidate.shape);
+    os << ",\n";
+    os << indent << "    \"tile_bytes\": " << candidate.tileBytes << ",\n";
+    os << indent << "    \"uses\": " << candidate.uses << ",\n";
+    os << indent << "    \"transfer_map\": ";
+    writeJsonString(os, candidate.transferMap);
+    os << ",\n";
+    os << indent << "    \"permutation_map_identity\": ";
+    writeJsonBool(os, candidate.permutationMapIdentity);
+    os << ",\n";
+    os << indent << "    \"in_bounds\": ";
+    writeJsonBool(os, candidate.inBounds);
+    os << ",\n";
+    os << indent << "    \"has_mask\": ";
+    writeJsonBool(os, candidate.hasMask);
+    os << ",\n";
+    os << indent << "    \"has_padding\": ";
+    writeJsonBool(os, candidate.hasPadding);
+    os << ",\n";
+    os << indent << "    \"full_tile\": ";
+    writeJsonBool(os, candidate.fullTile);
+    os << ",\n";
+    os << indent << "    \"static_trip_count\": ";
+    writeJsonBool(os, candidate.staticTripCount);
+    os << ",\n";
+    os << indent << "    \"trip_count\": " << candidate.tripCount << ",\n";
+    os << indent << "    \"static_stride\": ";
+    writeJsonBool(os, candidate.staticStride);
+    os << ",\n";
+    os << indent << "    \"row_major_inner_contiguous\": ";
+    writeJsonBool(os, candidate.rowMajorInnerContiguous);
+    os << ",\n";
+    os << indent << "    \"dma_filled_layout_supported\": ";
+    writeJsonBool(os, candidate.dmaFilledLayoutSupported);
+    os << ",\n";
+    os << indent << "    \"dma_representable\": ";
+    writeJsonBool(os, candidate.dmaRepresentable);
+    os << ",\n";
+    os << indent << "    \"may_alias_store\": ";
+    writeJsonBool(os, candidate.mayAliasStore);
+    os << ",\n";
+    os << indent << "    \"post_write_prefetch_safe\": ";
+    writeJsonBool(os, candidate.postWritePrefetchSafe);
+    os << ",\n";
+    os << indent << "    \"feeds_dot\": ";
+    writeJsonBool(os, candidate.feedsDot);
+    os << "\n";
+    os << indent << "  }";
+    if (index + 1 != candidates.size())
+      os << ",";
+    os << "\n";
+  }
+  os << indent << "]";
 }
 
 static void
@@ -1569,6 +2276,7 @@ static void writePromotionFieldKinds(llvm::raw_ostream &os, StringRef indent) {
   os << indent << "\"field_kinds\": {\n";
   os << indent << "  \"source\": \"exact\",\n";
   os << indent << "  \"scope\": \"exact\",\n";
+  os << indent << "  \"footprint_class\": \"exact\",\n";
   os << indent << "  \"shape\": \"exact\",\n";
   os << indent << "  \"uses\": \"exact-static\",\n";
   os << indent << "  \"bytes\": \"exact-static\",\n";
@@ -1652,9 +2360,30 @@ static SPMPromotionRejection makePromotionRejection(StringRef pattern,
   rejection.pattern = pattern.str();
   rejection.source = pattern.str();
   rejection.scope = "candidate";
+  if (pattern.contains("gemm") || pattern.contains("contraction"))
+    rejection.footprintClass = "contraction_reuse_window";
+  else if (pattern.contains("reduction") || pattern.contains("resident") ||
+           pattern.contains("attention_v2_q"))
+    rejection.footprintClass = "resident_multi_use";
+  else if (pattern.contains("generated"))
+    rejection.footprintClass = "generated_value_residency";
+  else if (pattern.contains("stream") || pattern.contains("tile") ||
+           pattern.contains("gather") || pattern.contains("paged"))
+    rejection.footprintClass = "streaming_ping_pong";
   rejection.reasonCode = reasonCode.str();
   rejection.reason = reason.str();
   return rejection;
+}
+
+static const char *getReductionFootprintClass(const ReductionResidencyPlan &plan) {
+  if (plan.producerPass == ReductionProducerPass::DerivedValueCache)
+    return "generated_value_residency";
+  if (plan.bufferRole == ReductionBufferRole::ResidentRow ||
+      plan.bufferRole == ReductionBufferRole::ResidentRowBlock)
+    return "resident_multi_use";
+  if (plan.bufferRole == ReductionBufferRole::PingPongChunk)
+    return "streaming_ping_pong";
+  return "resident_multi_use";
 }
 
 static SPMPromotionRecord
@@ -1663,6 +2392,7 @@ makeReductionResidencyRecord(const ReductionResidencyPlan &plan,
   SPMPromotionRecord record;
   record.source = plan.source;
   record.scope = plan.scope;
+  record.footprintClass = getReductionFootprintClass(plan);
   record.shape.append(plan.shape.begin(), plan.shape.end());
   record.uses = plan.uses;
   record.copyIn = plan.copyIn;
@@ -1685,12 +2415,8 @@ makeReductionResidencyRecord(const ReductionResidencyPlan &plan,
     if (plan.bufferRole == ReductionBufferRole::ResidentRowBlock) {
       record.reasonCode = "accepted_block_resident_fill_first";
       if (plan.autoSelected) {
-        record.reason =
-            plan.source == "Softmax x row block"
-                ? "accepted by the matched Softmax row-block resident "
-                  "reduction policy"
-                : "accepted by the matched LayerNorm row-block resident "
-                  "reduction policy";
+        record.reason = std::string("accepted by the matched ") +
+                        plan.source + " resident reduction policy";
       } else {
         record.reason = "accepted by the opt-in row-block resident reduction "
                         "policy";
@@ -1718,6 +2444,7 @@ makeRowResidentRejection(StringRef reasonCode, StringRef reason,
       makePromotionRejection("row_resident_reduction", reasonCode, reason);
   rejection.source = "LayerNorm x row";
   rejection.scope = "program-row candidate";
+  rejection.footprintClass = "resident_multi_use";
   rejection.uses = uses;
   rejection.copyIn = "CPU/vector store";
   rejection.copyOut = "none";
@@ -1733,6 +2460,7 @@ makeReductionResidencyRejection(const ReductionResidencyPlan &plan,
       makePromotionRejection(plan.pattern, reasonCode, reason);
   rejection.source = plan.source;
   rejection.scope = plan.scope + " candidate";
+  rejection.footprintClass = getReductionFootprintClass(plan);
   rejection.uses = plan.uses;
   rejection.copyIn = plan.copyIn;
   rejection.copyOut = plan.copyOut;
@@ -1778,6 +2506,9 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
     os << ",\n";
     os << "      \"scope\": ";
     writeJsonString(os, record.scope);
+    os << ",\n";
+    os << "      \"footprint_class\": ";
+    writeJsonString(os, record.footprintClass);
     os << ",\n";
     os << "      \"shape\": ";
     writeJsonShape(os, record.shape);
@@ -1835,6 +2566,9 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
     os << "      \"scope\": ";
     writeJsonString(os, rejection.scope);
     os << ",\n";
+    os << "      \"footprint_class\": ";
+    writeJsonString(os, rejection.footprintClass);
+    os << ",\n";
     os << "      \"shape\": ";
     writeJsonShape(os, rejection.shape);
     os << ",\n";
@@ -1857,6 +2591,7 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
     os << "        \"reason\": \"exact\",\n";
     os << "        \"source\": \"exact\",\n";
     os << "        \"scope\": \"exact\",\n";
+    os << "        \"footprint_class\": \"exact\",\n";
     os << "        \"shape\": \"exact-if-known\",\n";
     os << "        \"uses\": \"exact-if-known\",\n";
     os << "        \"bytes\": \"exact-if-known\"\n";
@@ -1879,6 +2614,8 @@ static LogicalResult writePromotionReport(FunctionOpInterface funcOp,
   }
   os << "  ],\n";
   writeContractionReports(os, report.contractions, "  ");
+  os << ",\n";
+  writeAffineTileCandidates(os, report.affineTileCandidates, "  ");
   os << "\n";
   os << "}\n";
 
@@ -2209,6 +2946,128 @@ static std::optional<ReductionResidencyPlan> matchSoftmaxResidencyPlan(
     return plan;
   applyConfiguredProducerPass(*plan, producerPassMode);
   return plan;
+}
+
+static std::optional<ReductionResidencyPlan> matchRMSNormResidencyPlan(
+    ArrayRef<scf::ForOp> loops, FunctionOpInterface funcOp,
+    std::string &rejectReasonCode, std::string &rejectReason,
+    StringRef producerPassMode) {
+  if (loops.size() < 2) {
+    rejectReasonCode = "unsupported_pattern";
+    rejectReason = "expected two top-level RMSNorm row loops";
+    return std::nullopt;
+  }
+
+  for (size_t i = 0; i + 1 < loops.size(); ++i) {
+    scf::ForOp statsLoop = loops[i];
+    scf::ForOp normLoop = loops[i + 1];
+    if (!sameStaticLoopShape(statsLoop, normLoop))
+      continue;
+
+    SmallVector<TiledLoadInfo> statsLoads = findTiledLoads(statsLoop);
+    SmallVector<TiledLoadInfo> normLoads = findTiledLoads(normLoop);
+    if (statsLoads.size() != 1 || normLoads.size() < 2)
+      continue;
+    if (!loopContainsTransferWrite(normLoop))
+      continue;
+
+    BlockArgument statsArg =
+        traceFunctionArgument(statsLoads[0].readOp.getBase(), funcOp);
+    if (!statsArg)
+      continue;
+
+    std::optional<TiledLoadInfo> normXLoad;
+    for (TiledLoadInfo load : normLoads) {
+      if (traceFunctionArgument(load.readOp.getBase(), funcOp) == statsArg) {
+        normXLoad = load;
+        break;
+      }
+    }
+    if (!normXLoad)
+      continue;
+
+    bool rowBlockPlan = isRowBlockDmaProducerPassMode(producerPassMode);
+    unsigned elemBytes = 0;
+    unsigned elemBytes1 = 0;
+    auto checkLoad = [&](TiledLoadInfo load, scf::ForOp forOp, unsigned &eb) {
+      return rowBlockPlan ? isSupportedRowBlockXLoad(load, forOp, eb)
+                          : isSupportedRowResidentXLoad(load, forOp, eb);
+    };
+    bool supportedLoads = checkLoad(statsLoads[0], statsLoop, elemBytes) &&
+                          checkLoad(*normXLoad, normLoop, elemBytes1);
+    if (!supportedLoads || elemBytes != elemBytes1) {
+      rejectReasonCode = "unsupported_pattern";
+      rejectReason = rowBlockPlan
+                         ? "row-block DMA candidate requires rank-2 "
+                           "col-major fp32 x tiles with static "
+                           "BLOCK_N-sized column steps"
+                         : "candidate requires rank-1 contiguous fp32 x "
+                           "loads with static BLOCK_N-sized loop steps";
+      return std::nullopt;
+    }
+
+    auto lbCst = getConstantIntValue(statsLoop.getLowerBound());
+    auto ubCst = getConstantIntValue(statsLoop.getUpperBound());
+    auto stepCst = getConstantIntValue(statsLoop.getStep());
+    if (!lbCst || !ubCst || !stepCst || *stepCst <= 0 ||
+        (*ubCst - *lbCst) % *stepCst != 0) {
+      rejectReasonCode = "dynamic_shape_or_stride";
+      rejectReason = "loop bounds/step are not static with exact trip count";
+      return std::nullopt;
+    }
+
+    int64_t trips = (*ubCst - *lbCst) / *stepCst;
+    if (trips <= 0) {
+      rejectReasonCode = "unsupported_pattern";
+      rejectReason = "loop trip count must be positive";
+      return std::nullopt;
+    }
+
+    int64_t rowBytes = trips * statsLoads[0].tileBytes;
+    int64_t rowElements = trips * statsLoads[0].vecTy.getNumElements();
+    ReductionResidencyPlan plan;
+    plan.source = (StringRef("RMSNorm") +
+                   (rowBlockPlan ? " x row block" : " x row")).str();
+    plan.sourceArg = statsArg;
+    plan.producer =
+        ReductionLoopResidencyUse{"sum_squares", statsLoop, statsLoads[0]};
+    plan.consumers.push_back(
+        ReductionLoopResidencyUse{"normalize", normLoop, *normXLoad});
+    plan.loops.push_back(statsLoop);
+    plan.loops.push_back(normLoop);
+    if (rowBlockPlan) {
+      plan.scope = "program-row-block";
+      plan.shape.push_back(trips * statsLoads[0].vecTy.getShape()[0]);
+      plan.shape.push_back(statsLoads[0].vecTy.getShape()[1]);
+    } else {
+      plan.shape.push_back(rowElements);
+    }
+    plan.trips = trips;
+    plan.bytes = rowBytes;
+    plan.elemBytes = elemBytes;
+    plan.uses = 2;
+    plan.requiredSpmSlots = 1;
+    plan.producerPass = ReductionProducerPass::FillOnFirstPass;
+    plan.bufferRole = ReductionBufferRole::ResidentRow;
+    plan.rotationPolicy = ReductionRotationPolicy::None;
+    plan.copyInMode = ReductionCopyInMode::CpuDirect;
+    plan.copyIn = "CPU/vector store";
+    plan.copyOut = "none";
+    plan.overhead =
+        "first RMSNorm stats pass writes each loaded x chunk into SPM; no DMA wait";
+    plan.benefit =
+        "x[row, :] is materialized once and reused by normalize/store";
+    plan.expectedMarkers.push_back("addrspace(3)");
+    plan.expectedMarkers.push_back("no_dma_descriptors");
+    plan.expectedMarkers.push_back("no_fence_iorw");
+    plan.hasLowering = true;
+    applyConfiguredProducerPass(plan, producerPassMode);
+    return plan;
+  }
+
+  rejectReasonCode = "unsupported_pattern";
+  rejectReason = "no RMSNorm-style row-resident candidate matched";
+  return std::nullopt;
 }
 
 static SmallVector<scf::ForOp, 3> collectDirectChildLoops(scf::ForOp outer) {
@@ -2860,6 +3719,213 @@ static bool lowerCanonicalLayerNormToRowBlockGroup(
   return true;
 }
 
+static bool lowerCanonicalRMSNormToRowBlockGroup(
+    ArrayRef<scf::ForOp> topLevelLoops, FunctionOpInterface funcOp,
+    int64_t rowBlock, int64_t rowGroupBlocks) {
+  if (rowBlock <= 1 || rowGroupBlocks <= 0 || topLevelLoops.size() < 2)
+    return false;
+
+  std::string rejectCode;
+  std::string rejectReason;
+  auto plan = matchRMSNormResidencyPlan(topLevelLoops, funcOp, rejectCode,
+                                        rejectReason,
+                                        /*producerPassMode=*/"");
+  if (!plan || plan->producer.xLoad.vecTy.getRank() != 1 ||
+      plan->consumers.empty())
+    return false;
+
+  scf::ForOp statsLoop = plan->producer.forOp;
+  scf::ForOp normLoop = plan->consumers.front().forOp;
+  if (statsLoop->getBlock() != normLoop->getBlock())
+    return false;
+
+  auto xMakeTensorPtr = findLoopInitMakeTensorPtr(statsLoop);
+  if (!xMakeTensorPtr)
+    return false;
+  auto gammaMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 2
+          ? normLoop.getInitArgs()[1].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  auto outMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 3
+          ? normLoop.getInitArgs()[2].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  if (!gammaMakeTensorPtr || !outMakeTensorPtr)
+    return false;
+
+  auto flatXShape = firstStaticDim(xMakeTensorPtr.getShape());
+  auto flatXStride = firstStaticDim(xMakeTensorPtr.getStrides());
+  auto gammaShape = firstStaticDim(gammaMakeTensorPtr.getShape());
+  auto gammaStride = firstStaticDim(gammaMakeTensorPtr.getStrides());
+  auto flatOutShape = firstStaticDim(outMakeTensorPtr.getShape());
+  auto flatOutStride = firstStaticDim(outMakeTensorPtr.getStrides());
+  if (!flatXShape || !flatOutShape || flatXShape != flatOutShape ||
+      !flatXStride || !flatOutStride || *flatXStride != 1 ||
+      *flatOutStride != 1 || !gammaShape || !gammaStride ||
+      *gammaStride != 1)
+    return false;
+  if (*flatXShape % plan->shape.front() != 0 ||
+      *gammaShape != plan->shape.front())
+    return false;
+
+  int64_t cols = plan->shape.front();
+  int64_t rows = *flatXShape / cols;
+  if (rows % (rowBlock * rowGroupBlocks) != 0)
+    return false;
+
+  Location loc = statsLoop.getLoc();
+  InsertedBeforeGuard guard(statsLoop.getOperation());
+  OpBuilder b(statsLoop);
+
+  Value c0I32 = i32Cst(b, loc, 0);
+  Value c1I32 = i32Cst(b, loc, 1);
+  Value c0RowStepI32 = i32Cst(b, loc, 0);
+  Value cRowBlockI32 = i32Cst(b, loc, rowBlock);
+  Value cRowGroupBlocksI32 = i32Cst(b, loc, rowGroupBlocks);
+  Value cRowsI64 = i64Cst(b, loc, rows);
+  Value cColsI64 = i64Cst(b, loc, cols);
+  Value c1I64 = i64Cst(b, loc, 1);
+  Value pid = triton::GetProgramIdOp::create(b, loc, triton::ProgramIDDim::X)
+                  .getResult();
+  Value rowsPerProgram = i32Cst(b, loc, rowBlock * rowGroupBlocks);
+  Value groupRowBase = arith::MulIOp::create(b, loc, pid, rowsPerProgram);
+
+  auto outer = scf::ForOp::create(b, loc, c0I32, cRowGroupBlocksI32, c1I32);
+  Block *outerBody = outer.getBody();
+  Operation *outerTerminator = setInsertionPointBeforeTerminator(b, outerBody);
+
+  Value rbOffset =
+      arith::MulIOp::create(b, loc, outer.getInductionVar(), cRowBlockI32);
+  Value rowBase = arith::AddIOp::create(b, loc, groupRowBase, rbOffset);
+  auto oldVecTy = plan->producer.xLoad.vecTy;
+  auto elemTy = oldVecTy.getElementType();
+  auto rowBlockVecTy =
+      VectorType::get({oldVecTy.getShape()[0], rowBlock}, elemTy);
+  auto rowVecTy = VectorType::get({rowBlock}, elemTy);
+  auto rowBlockMemRefTy =
+      MemRefType::get({cols, rows}, elemTy,
+                      StridedLayoutAttr::get(b.getContext(), 0, {1, cols}));
+  auto paramMemRefTy = MemRefType::get(
+      {cols}, elemTy, StridedLayoutAttr::get(b.getContext(), 0, {1}));
+
+  SmallVector<Value> rowBlockShapeVals{cColsI64, cRowsI64};
+  SmallVector<Value> rowBlockStrideVals{c1I64, cColsI64};
+  SmallVector<Value> paramShapeVals{cColsI64};
+  SmallVector<Value> paramStrideVals{c1I64};
+  SmallVector<Value> rowBlockOffsets{c0I32, rowBase};
+  SmallVector<Value> paramOffsets{c0I32};
+  SmallVector<int32_t> rowBlockTensorShape{
+      static_cast<int32_t>(oldVecTy.getShape()[0]),
+      static_cast<int32_t>(rowBlock)};
+  SmallVector<int32_t> paramTensorShape{
+      static_cast<int32_t>(oldVecTy.getShape()[0])};
+  SmallVector<int32_t> rowBlockOrder{0, 1};
+  SmallVector<int32_t> paramOrder{0};
+  Value xPtr = triton::MakeTensorPtrOp::create(
+      b, loc, xMakeTensorPtr.getBase(), rowBlockShapeVals, rowBlockStrideVals,
+      rowBlockOffsets, rowBlockTensorShape, rowBlockOrder);
+  Value gammaPtr = triton::MakeTensorPtrOp::create(
+      b, loc, gammaMakeTensorPtr.getBase(), paramShapeVals, paramStrideVals,
+      paramOffsets, paramTensorShape, paramOrder);
+  Value outPtr = triton::MakeTensorPtrOp::create(
+      b, loc, outMakeTensorPtr.getBase(), rowBlockShapeVals,
+      rowBlockStrideVals, rowBlockOffsets, rowBlockTensorShape,
+      rowBlockOrder);
+  Value sumInit = constantVector(b, loc, rowVecTy, 0.0);
+
+  auto statsNew = scf::ForOp::create(
+      b, loc, statsLoop.getLowerBound(), statsLoop.getUpperBound(),
+      statsLoop.getStep(), ValueRange{xPtr, sumInit});
+  Operation *statsTerminator =
+      setInsertionPointBeforeTerminator(b, statsNew.getBody());
+  Value statsTile = emitTensorPtrTransferRead(
+      b, loc, statsNew.getRegionIterArgs()[0], rowBlockMemRefTy,
+      rowBlockVecTy);
+  if (!statsTile) {
+    guard.cleanup();
+    return false;
+  }
+  Value squared = arith::MulFOp::create(b, loc, statsTile, statsTile);
+  Value tileSumSq =
+      emitLeadingDimReduction(b, loc, squared, vector::CombiningKind::ADD);
+  if (!tileSumSq) {
+    guard.cleanup();
+    return false;
+  }
+  Value sumSqAcc =
+      arith::AddFOp::create(b, loc, statsNew.getRegionIterArgs()[1],
+                            tileSumSq);
+  Value statsPtr = emitTensorPtrAdvance(
+      b, loc, statsNew.getRegionIterArgs()[0], statsLoop.getStep(),
+      c0RowStepI32);
+  scf::YieldOp::create(b, loc, ValueRange{statsPtr, sumSqAcc});
+  if (statsTerminator)
+    statsTerminator->erase();
+  b.setInsertionPointAfter(statsNew);
+
+  Value denom = constantVector(b, loc, rowVecTy, static_cast<double>(cols));
+  Value meanSquares = arith::DivFOp::create(b, loc, statsNew.getResult(1),
+                                            denom);
+  Value eps = constantVector(b, loc, rowVecTy, 1e-5);
+  Value meanSquaresPlusEps = arith::AddFOp::create(b, loc, meanSquares, eps);
+  Value rms = math::SqrtOp::create(b, loc, meanSquaresPlusEps);
+  Value one = constantVector(b, loc, rowVecTy, 1.0);
+  Value invRms = arith::DivFOp::create(b, loc, one, rms);
+  Value invRmsBroadcast =
+      vector::BroadcastOp::create(b, loc, rowBlockVecTy, invRms);
+
+  auto normNew = scf::ForOp::create(
+      b, loc, normLoop.getLowerBound(), normLoop.getUpperBound(),
+      normLoop.getStep(), ValueRange{xPtr, gammaPtr, outPtr});
+  Operation *normTerminator =
+      setInsertionPointBeforeTerminator(b, normNew.getBody());
+  Value normTile = emitTensorPtrTransferRead(
+      b, loc, normNew.getRegionIterArgs()[0], rowBlockMemRefTy,
+      rowBlockVecTy);
+  Value gammaTile = emitTensorPtrTransferRead(
+      b, loc, normNew.getRegionIterArgs()[1], paramMemRefTy, oldVecTy);
+  if (!normTile || !gammaTile) {
+    guard.cleanup();
+    return false;
+  }
+  Value gammaBroadcast =
+      splatVectorAcrossTrailingDim(b, loc, gammaTile, rowBlockVecTy);
+  if (!gammaBroadcast) {
+    guard.cleanup();
+    return false;
+  }
+  Value normalized = arith::MulFOp::create(b, loc, normTile, invRmsBroadcast);
+  Value scaled = arith::MulFOp::create(b, loc, normalized, gammaBroadcast);
+  if (!emitTensorPtrTransferWrite(b, loc, normNew.getRegionIterArgs()[2],
+                                  rowBlockMemRefTy, scaled)) {
+    guard.cleanup();
+    return false;
+  }
+  Value normXPtr = emitTensorPtrAdvance(b, loc, normNew.getRegionIterArgs()[0],
+                                        normLoop.getStep(), c0RowStepI32);
+  Value gammaNext = emitTensorPtrAdvance1D(
+      b, loc, normNew.getRegionIterArgs()[1], normLoop.getStep());
+  Value normOutPtr = emitTensorPtrAdvance(
+      b, loc, normNew.getRegionIterArgs()[2], normLoop.getStep(),
+      c0RowStepI32);
+  scf::YieldOp::create(b, loc,
+                       ValueRange{normXPtr, gammaNext, normOutPtr});
+  if (normTerminator)
+    normTerminator->erase();
+  b.setInsertionPointAfter(normNew);
+  if (!outerTerminator)
+    scf::YieldOp::create(b, loc);
+
+  if (!eraseAdjacentOpsInOrder({statsLoop.getOperation(),
+                                normLoop.getOperation()})) {
+    guard.cleanup();
+    return false;
+  }
+
+  guard.commit();
+  return true;
+}
+
 // Shared row-block-group matcher. `childMatcher` runs the kernel-specific
 // inner-loop matcher (softmax or layernorm). `kindName` names the kernel in
 // the overhead/benefit strings; `consumerStagesLabel` is the prose listing of
@@ -2883,7 +3949,7 @@ matchRowBlockGroupReductionPlan(ArrayRef<scf::ForOp> topLevelLoops,
 
   for (scf::ForOp outerLoop : topLevelLoops) {
     SmallVector<scf::ForOp, 3> childLoops = collectDirectChildLoops(outerLoop);
-    if (childLoops.size() < 3)
+    if (childLoops.empty())
       continue;
 
     std::string childRejectCode;
@@ -2953,6 +4019,18 @@ matchLayerNormRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
   return matchRowBlockGroupReductionPlan(
       topLevelLoops, funcOp, matchLayerNormResidencyPlan, "LayerNorm",
       "mean/variance/normalize", rejectReasonCode, rejectReason,
+      producerPassMode);
+}
+
+static std::optional<ReductionResidencyPlan>
+matchRMSNormRowBlockGroupResidencyPlan(ArrayRef<scf::ForOp> topLevelLoops,
+                                       FunctionOpInterface funcOp,
+                                       std::string &rejectReasonCode,
+                                       std::string &rejectReason,
+                                       StringRef producerPassMode) {
+  return matchRowBlockGroupReductionPlan(
+      topLevelLoops, funcOp, matchRMSNormResidencyPlan, "RMSNorm",
+      "sum_squares/normalize", rejectReasonCode, rejectReason,
       producerPassMode);
 }
 
@@ -3053,56 +4131,12 @@ evaluateD3RowResidentProfitability(const ReductionResidencyPlan &plan,
       measuredBankConflicts, plan.uses);
 }
 
-static SPMProfitabilityEvidence evaluateD3StreamingReductionProfitability(
-    scf::ForOp forOp, ArrayRef<TiledLoadInfo> loads, int64_t spmSize) {
-  auto lbCst = getConstantIntValue(forOp.getLowerBound());
-  auto ubCst = getConstantIntValue(forOp.getUpperBound());
-  auto stepCst = getConstantIntValue(forOp.getStep());
-
-  int64_t trips = 0;
-  if (lbCst && ubCst && stepCst && *stepCst > 0 &&
-      (*ubCst - *lbCst) % *stepCst == 0)
-    trips = (*ubCst - *lbCst) / *stepCst;
-  int64_t descriptors = std::max<int64_t>(0, trips) * loads.size();
-  int64_t copyBytes = 0;
-  for (const TiledLoadInfo &load : loads)
-    copyBytes += std::max<int64_t>(0, trips) * load.tileBytes;
-
-  return makeD3ProfitabilityEvidence(
-      "reject", "streaming_reduction_no_residency",
-      "P3 static model rejects streaming reductions by default because each "
-      "chunk has one compute use and no bounded SPM residency; keep the cache "
-      "path unless an explicit row/block-resident schedule is selected",
-      descriptors, descriptors, copyBytes,
-      /*spmWriteBytes=*/copyBytes, /*spmReadBytes=*/copyBytes,
-      /*avoidedRepeatedReadBytes=*/0, std::min(copyBytes, spmSize),
-      /*estimatedExtraOps=*/descriptors,
-      /*measuredBankConflicts=*/0, /*uses=*/1);
-}
-
 static SPMPromotionRejection
 makeD3RowResidentProfitabilityRejection(const ReductionResidencyPlan &plan,
                                         SPMProfitabilityEvidence evidence) {
   SPMPromotionRejection rejection = makeReductionResidencyRejection(
       plan, evidence.reasonCode, evidence.reason);
   attachD3Profitability(rejection, std::move(evidence));
-  return rejection;
-}
-
-static SPMPromotionRejection
-makeD3StreamingReductionRejection(scf::ForOp forOp,
-                                  ArrayRef<TiledLoadInfo> loads,
-                                  SPMProfitabilityEvidence evidence) {
-  SPMPromotionRejection rejection = makePromotionRejection(
-      "reduction_streaming", evidence.reasonCode, evidence.reason);
-  rejection.uses = 1;
-  rejection.copyIn = "DMA";
-  rejection.copyOut = "none";
-  rejection.bytes = evidence.copyBytes;
-  if (!loads.empty())
-    appendShape(rejection.shape, loads.front().vecTy);
-  attachD3Profitability(rejection, std::move(evidence));
-  (void)forOp;
   return rejection;
 }
 
@@ -3836,6 +4870,41 @@ static bool emitLayerNormNormalizeLoopFromSpm(
   return true;
 }
 
+static bool emitRMSNormNormalizeLoopFromSpm(
+    OpBuilder &b, Location loc, scf::ForOp oldLoop, Value rowSpmBase,
+    VectorType rowVecTy, unsigned elemBytes, Value gammaPtr, Value outPtr,
+    MemRefType paramMemRefTy, MemRefType outMemRefTy, Value invRms) {
+  auto normLoop = scf::ForOp::create(b, loc, oldLoop.getLowerBound(),
+                                     oldLoop.getUpperBound(), oldLoop.getStep(),
+                                     ValueRange{gammaPtr, outPtr});
+  Operation *terminator =
+      setInsertionPointBeforeTerminator(b, normLoop.getBody());
+
+  Value xVal =
+      emitSpmRowLoopRead(b, loc, normLoop, rowSpmBase, rowVecTy, elemBytes);
+  Value gammaTile = emitTensorPtrTransferRead(
+      b, loc, normLoop.getRegionIterArgs()[0], paramMemRefTy, rowVecTy);
+  if (!gammaTile)
+    return false;
+
+  Value invRmsVec = vector::BroadcastOp::create(b, loc, rowVecTy, invRms);
+  Value normalized = arith::MulFOp::create(b, loc, xVal, invRmsVec);
+  Value scaled = arith::MulFOp::create(b, loc, normalized, gammaTile);
+  if (!emitTensorPtrTransferWrite(b, loc, normLoop.getRegionIterArgs()[1],
+                                  outMemRefTy, scaled))
+    return false;
+
+  Value gammaNext = emitTensorPtrAdvance1D(
+      b, loc, normLoop.getRegionIterArgs()[0], normLoop.getStep());
+  Value outNext = emitTensorPtrAdvance1D(
+      b, loc, normLoop.getRegionIterArgs()[1], normLoop.getStep());
+  scf::YieldOp::create(b, loc, ValueRange{gammaNext, outNext});
+  if (terminator)
+    terminator->erase();
+  b.setInsertionPointAfter(normLoop);
+  return true;
+}
+
 static Operation *cloneBlockPrefixThrough(OpBuilder &b, Operation *target,
                                           IRMapping &mapping) {
   Block *block = target->getBlock();
@@ -4418,6 +5487,281 @@ static bool lowerLayerNormRowBlockGroupDma(
   return true;
 }
 
+static bool lowerRMSNormRowBlockGroupDma(
+    ReductionResidencyPlan &plan, int64_t rowSpmAddress0, int64_t rowSpmAddress1,
+    llvm::DenseSet<Operation *> &rowResidentHandledLoops,
+    std::string &rejectReason) {
+  auto bail = [&](StringRef reason) {
+    rejectReason = reason.str();
+    return false;
+  };
+
+  scf::ForOp outerLoop = plan.rowBlockGroupLoop;
+  if (!outerLoop || plan.consumers.empty())
+    return bail("RMSNorm row-block plan missing outer loop or normalize loop");
+  if (!outerLoop.getInitArgs().empty())
+    return bail("outer row-block loop must not carry iter args");
+  auto oldOuterYield =
+      dyn_cast<scf::YieldOp>(outerLoop.getBody()->getTerminator());
+  if (!oldOuterYield || oldOuterYield.getNumOperands() != 0)
+    return bail("outer row-block loop must yield no values");
+
+  vector::TransferReadOp xRead = plan.producer.xLoad.readOp;
+  auto xMemRefTy = dyn_cast<MemRefType>(xRead.getBase().getType());
+  VectorType rowBlockVecTy = plan.producer.xLoad.vecTy;
+  if (!xMemRefTy)
+    return bail("x transfer_read base is not a memref");
+  if (rowBlockVecTy.getRank() != 2)
+    return bail("x tile must be rank-2 for row-block DMA");
+  if (!hasColMajorRowBlockDmaLayout(rowBlockVecTy, xMemRefTy))
+    return bail("x tile layout is not col-major row-block-DMA compatible");
+
+  auto xMakeTensorPtr =
+      plan.producer.forOp
+          .getTiedLoopInit(plan.producer.forOp.getRegionIterArgs().front())
+          ->get()
+          .template getDefiningOp<triton::MakeTensorPtrOp>();
+  if (!xMakeTensorPtr)
+    return bail("producer loop's x pointer is not a make_tensor_ptr");
+
+  scf::ForOp statsLoop = plan.producer.forOp;
+  scf::ForOp normLoop = plan.consumers.front().forOp;
+  auto gammaMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 2
+          ? normLoop.getInitArgs()[1].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  auto outMakeTensorPtr =
+      normLoop.getInitArgs().size() >= 3
+          ? normLoop.getInitArgs()[2].getDefiningOp<triton::MakeTensorPtrOp>()
+          : triton::MakeTensorPtrOp();
+  if (!gammaMakeTensorPtr)
+    return bail("normalize loop is missing a gamma make_tensor_ptr operand");
+  if (!outMakeTensorPtr)
+    return bail("normalize loop is missing an output make_tensor_ptr operand");
+
+  auto xColsShape = staticDim(xMakeTensorPtr.getShape(), 0);
+  auto xRowsShape = staticDim(xMakeTensorPtr.getShape(), 1);
+  auto xColStride = staticDim(xMakeTensorPtr.getStrides(), 0);
+  auto xRowStride = staticDim(xMakeTensorPtr.getStrides(), 1);
+  auto gammaShape = firstStaticDim(gammaMakeTensorPtr.getShape());
+  auto gammaStride = firstStaticDim(gammaMakeTensorPtr.getStrides());
+  auto outColsShape = staticDim(outMakeTensorPtr.getShape(), 0);
+  auto outRowsShape = staticDim(outMakeTensorPtr.getShape(), 1);
+  auto outColStride = staticDim(outMakeTensorPtr.getStrides(), 0);
+  auto outRowStride = staticDim(outMakeTensorPtr.getStrides(), 1);
+
+  if (!xColsShape || !xRowsShape)
+    return bail("x make_tensor_ptr shape dims must be static");
+  if (!xColStride || !xRowStride || *xColStride != 1)
+    return bail("x make_tensor_ptr must be col-major with col-stride 1");
+  if (!outColsShape || !outRowsShape)
+    return bail("output make_tensor_ptr shape dims must be static");
+  if (!outColStride || !outRowStride || *outColStride != 1)
+    return bail("output make_tensor_ptr must be col-major with col-stride 1");
+  if (xColsShape != outColsShape || xRowsShape != outRowsShape)
+    return bail("x and output tensor shapes must match");
+  if (xRowStride != xColsShape || outRowStride != outColsShape)
+    return bail("x/output row-stride must equal column count");
+  if (!gammaShape || !gammaStride || *gammaStride != 1)
+    return bail("gamma must be a contiguous rank-1 tensor with static shape");
+
+  int64_t rowElems = plan.trips * rowBlockVecTy.getShape()[0];
+  if (*gammaShape != rowElems)
+    return bail("gamma length must equal the per-row element count");
+  if (*xColsShape != rowElems)
+    return bail("x column count must equal the per-row element count");
+  int64_t totalRows = *xRowsShape;
+  int64_t rowBlock = rowBlockVecTy.getShape()[1];
+  int64_t rowsPerGroup = rowBlock * plan.rowBlockGroupTrips;
+  if (totalRows <= 0 || rowBlock <= 0 || rowsPerGroup <= 0)
+    return bail("totalRows / rowBlock / rowsPerGroup must be positive");
+  if (totalRows % rowsPerGroup != 0)
+    return bail("total rows are not divisible by rowBlock * rowGroupBlocks");
+
+  Location loc = outerLoop.getLoc();
+  InsertedBeforeGuard guard(outerLoop.getOperation());
+  OpBuilder b(outerLoop);
+
+  IRMapping firstPtrMapping;
+  firstPtrMapping.map(outerLoop.getInductionVar(), outerLoop.getLowerBound());
+  for (auto [iterArg, initArg] :
+       llvm::zip_equal(outerLoop.getRegionIterArgs(), outerLoop.getInitArgs()))
+    firstPtrMapping.map(iterArg, initArg);
+  Operation *firstTensorPtrOp =
+      cloneBlockPrefixThrough(b, xMakeTensorPtr.getOperation(), firstPtrMapping);
+  if (!firstTensorPtrOp) {
+    guard.cleanup();
+    return bail("failed to clone first-iteration x make_tensor_ptr prefix");
+  }
+  Value firstDramAddr = computeTensorPtrDramAddr(
+      b, loc, firstTensorPtrOp->getResult(0), xMemRefTy);
+  if (!firstDramAddr) {
+    guard.cleanup();
+    return bail("could not compute first-iteration DRAM address");
+  }
+  if (!emitFullRowBlockDma(b, loc, i64Cst(b, loc, rowSpmAddress0),
+                           firstDramAddr, rowBlockVecTy, xMemRefTy,
+                           plan.trips)) {
+    guard.cleanup();
+    return bail("first-iteration row-block DMA emission failed");
+  }
+
+  SmallVector<Value> outerInitArgs(outerLoop.getInitArgs());
+  outerInitArgs.push_back(i64Cst(b, loc, 0));
+  auto newOuter = scf::ForOp::create(b, loc, outerLoop.getLowerBound(),
+                                     outerLoop.getUpperBound(),
+                                     outerLoop.getStep(), outerInitArgs);
+
+  Block *newOuterBody = newOuter.getBody();
+  IRMapping outerMapping;
+  outerMapping.map(outerLoop.getInductionVar(), newOuter.getInductionVar());
+  unsigned oldOuterArgs = outerLoop.getRegionIterArgs().size();
+  for (unsigned i = 0; i < oldOuterArgs; ++i)
+    outerMapping.map(outerLoop.getRegionIterArgs()[i],
+                     newOuter.getRegionIterArgs()[i]);
+  Value bufIdx = newOuter.getRegionIterArgs()[oldOuterArgs];
+
+  b.setInsertionPointToStart(newOuterBody);
+  if (!newOuterBody->empty() && newOuterBody->mightHaveTerminator())
+    newOuterBody->getTerminator()->erase();
+
+  triton::cpu::DmaWaitOp::create(b, loc);
+
+  Value zero = i64Cst(b, loc, 0);
+  Value isZero =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
+  Value spmBuf0 = i64Cst(b, loc, rowSpmAddress0);
+  Value spmBuf1 = i64Cst(b, loc, rowSpmAddress1);
+  Value currentSpm = arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
+  Value nextSpm = arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
+
+  Value iv = newOuter.getInductionVar();
+  Value step = newOuter.getStep();
+  Value ub = newOuter.getUpperBound();
+  Value nextIv = arith::AddIOp::create(b, loc, iv, step);
+  Value hasNext =
+      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+
+  auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
+  b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  IRMapping nextPtrMapping;
+  nextPtrMapping.map(outerLoop.getInductionVar(), nextIv);
+  for (auto [iterArg, newIterArg] :
+       llvm::zip_equal(outerLoop.getRegionIterArgs(),
+                       newOuter.getRegionIterArgs().take_front(oldOuterArgs)))
+    nextPtrMapping.map(iterArg, newIterArg);
+  Operation *nextTensorPtrOp =
+      cloneBlockPrefixThrough(b, xMakeTensorPtr.getOperation(), nextPtrMapping);
+  if (!nextTensorPtrOp) {
+    guard.cleanup();
+    return bail("failed to clone next-iteration x make_tensor_ptr prefix");
+  }
+  Value nextDramAddr =
+      computeTensorPtrDramAddr(b, loc, nextTensorPtrOp->getResult(0), xMemRefTy);
+  if (!nextDramAddr) {
+    guard.cleanup();
+    return bail("could not compute next-iteration DRAM address");
+  }
+  if (!emitFullRowBlockDma(b, loc, nextSpm, nextDramAddr, rowBlockVecTy,
+                           xMemRefTy, plan.trips)) {
+    guard.cleanup();
+    return bail("next-iteration row-block DMA emission failed");
+  }
+  b.setInsertionPointAfter(ifOp);
+
+  Value c0I32 = i32Cst(b, loc, 0);
+  Value c1I32 = i32Cst(b, loc, 1);
+  Value cRowBlockI32 = i32Cst(b, loc, rowBlock);
+  Operation *currentTensorPtrOp =
+      cloneBlockPrefixThrough(b, xMakeTensorPtr.getOperation(), outerMapping);
+  if (!currentTensorPtrOp) {
+    guard.cleanup();
+    return bail("failed to clone current-iteration x make_tensor_ptr prefix");
+  }
+  Value currentRowBaseIdx =
+      extractTensorPtrIndex(b, loc, currentTensorPtrOp->getResult(0), 1);
+  if (!currentRowBaseIdx) {
+    guard.cleanup();
+    return bail("could not extract current row-block start index");
+  }
+  Value rowBlockStart = toI32(b, loc, currentRowBaseIdx);
+  if (!rowBlockStart) {
+    guard.cleanup();
+    return bail("failed to truncate row-block start index to i32");
+  }
+
+  auto rowLoop =
+      scf::ForOp::create(b, loc, c0I32, cRowBlockI32, c1I32, ValueRange{});
+  setInsertionPointBeforeTerminator(b, rowLoop.getBody());
+
+  Value rowInBlock = rowLoop.getInductionVar();
+  Value rowOffsetBytes =
+      arith::MulIOp::create(b, loc, toI64(b, loc, rowInBlock),
+                            i64Cst(b, loc, rowElems * plan.elemBytes));
+  Value rowSpmBase = arith::AddIOp::create(b, loc, currentSpm, rowOffsetBytes);
+  Value globalRow = arith::AddIOp::create(b, loc, rowBlockStart, rowInBlock);
+  Value rowBaseElem = arith::MulIOp::create(
+      b, loc, globalRow, i32Cst(b, loc, static_cast<int32_t>(rowElems)));
+
+  auto elemTy = rowBlockVecTy.getElementType();
+  auto rowVecTy = VectorType::get({rowBlockVecTy.getShape()[0]}, elemTy);
+  auto paramMemRefTy = MemRefType::get(
+      {rowElems}, elemTy, StridedLayoutAttr::get(b.getContext(), 0, {1}));
+  int64_t flatOutElements = (*outColsShape) * (*outRowsShape);
+  auto outMemRefTy =
+      MemRefType::get({flatOutElements}, elemTy,
+                      StridedLayoutAttr::get(b.getContext(), 0, {1}));
+
+  Value gammaPtr =
+      makeRank1TensorPtr(b, loc, gammaMakeTensorPtr.getBase(), rowElems, c0I32,
+                         rowVecTy.getShape()[0]);
+  Value outPtr =
+      makeRank1TensorPtr(b, loc, outMakeTensorPtr.getBase(), flatOutElements,
+                         rowBaseElem, rowVecTy.getShape()[0]);
+
+  Value denom =
+      constantScalarFloat(b, loc, elemTy, static_cast<double>(rowElems));
+  Value one = constantScalarFloat(b, loc, elemTy, 1.0);
+  Value eps = constantScalarFloat(b, loc, elemTy, 1e-5);
+  if (!denom || !one || !eps) {
+    guard.cleanup();
+    return bail("element type must be a float type for RMSNorm constants");
+  }
+
+  std::optional<LayerNormStatsValues> stats =
+      emitLayerNormSumAndSquareLoopFromSpm(b, loc, statsLoop, rowSpmBase,
+                                           rowVecTy, plan.elemBytes);
+  if (!stats) {
+    guard.cleanup();
+    return bail("sum-of-squares loop emission failed");
+  }
+  Value meanSquares = arith::DivFOp::create(b, loc, stats->sumSquares, denom);
+  Value meanSquaresPlusEps = arith::AddFOp::create(b, loc, meanSquares, eps);
+  Value rms = math::SqrtOp::create(b, loc, meanSquaresPlusEps);
+  Value invRms = arith::DivFOp::create(b, loc, one, rms);
+
+  if (!emitRMSNormNormalizeLoopFromSpm(b, loc, normLoop, rowSpmBase, rowVecTy,
+                                       plan.elemBytes, gammaPtr, outPtr,
+                                       paramMemRefTy, outMemRefTy, invRms)) {
+    guard.cleanup();
+    return bail("normalize loop emission failed");
+  }
+
+  b.setInsertionPointAfter(rowLoop);
+  Value oneI64 = i64Cst(b, loc, 1);
+  Value flipped = arith::SubIOp::create(b, loc, oneI64, bufIdx);
+  scf::YieldOp::create(b, loc, ValueRange{flipped});
+
+  rowResidentHandledLoops.insert(newOuter.getOperation());
+  rowResidentHandledLoops.insert(outerLoop.getOperation());
+  for (scf::ForOp loop : plan.loops)
+    rowResidentHandledLoops.insert(loop.getOperation());
+
+  guard.commit();
+  outerLoop.erase();
+  return true;
+}
+
 static void markResidencyPlanLoopsHandled(
     const ReductionResidencyPlan &plan,
     llvm::DenseSet<Operation *> &rowResidentHandledLoops) {
@@ -4491,6 +5835,7 @@ static SPMPromotionRecord makeAttentionQKTileRecord(StringRef source,
   SPMPromotionRecord record;
   record.source = source.str();
   record.scope = "function-scope QK tile";
+  record.footprintClass = "streaming_ping_pong";
   appendShape(record.shape, shapeTy);
   record.uses = 1;
   record.copyIn = "DMA";
@@ -4688,6 +6033,7 @@ static SPMPromotionRecord makeAttentionPVGeneratedRecord(VectorType shapeTy,
   SPMPromotionRecord record;
   record.source = "attention PV generated tile";
   record.scope = "function-scope PV generated operand";
+  record.footprintClass = "generated_value_residency";
   appendShape(record.shape, shapeTy);
   record.uses = 1;
   record.copyIn = "CPU/vector store";
@@ -5073,6 +6419,7 @@ makeIndirectTileGatherRecord(const IndirectTileGatherInfo &info,
   SPMPromotionRecord record;
   record.source = "indirect table tile";
   record.scope = "function-scope embedding-bag stage";
+  record.footprintClass = "resident_multi_use";
   record.shape.push_back(info.trips);
   record.shape.push_back(info.rowElems);
   record.uses = info.trips;
@@ -5390,6 +6737,7 @@ static bool tryTransformDoubleBufferedIndirectTile(
     SPMPromotionRecord record;
     record.source = "indirect table tile (double-buffered)";
     record.scope = "function-scope embedding-bag stage (BAG_GROUP)";
+    record.footprintClass = "streaming_ping_pong";
     record.shape.push_back(info.trips);
     record.shape.push_back(info.rowElems);
     record.uses = info.trips * (*outerTrip);
@@ -6022,6 +7370,7 @@ makePagedKvGatherRecord(const PagedKvGatherInfo &info, int64_t spmAddress) {
   SPMPromotionRecord record;
   record.source = "paged KV-cache page tiles";
   record.scope = "function-scope paged_kv_decode page-gather stage";
+  record.footprintClass = "resident_multi_use";
   record.shape.push_back(info.trips);
   record.shape.push_back(info.pageSize);
   record.shape.push_back(info.headDim);
@@ -6123,9 +7472,17 @@ static bool tryTransformDoubleBufferedPagedKv(
                                          info.vExtractMemRef, info.vCacheBase);
 
   // Prologue: prefetch page 0 into ping-pong buffer 0 before entering the
-  // consume loop.  The first in-loop dma_wait drains this prologue prefetch.
+  // consume loop.  Also prefetch page 1 into buffer 1 so the loop can use a
+  // DMA watermark wait: wait only until the current page is ready while the
+  // next page may remain in flight.
   emitPagedKvPagePrefetch(b, loc, info, oldLoop.getLowerBound(), kSpmBaseI64,
                           vSpmBaseI64, kBaseI64, vBaseI64, pageBytesI64);
+  Value secondPage = arith::AddIOp::create(b, loc, oldLoop.getLowerBound(),
+                                           i32Cst(b, loc, 1));
+  Value kSpmBuf1 = arith::AddIOp::create(b, loc, kSpmBaseI64, pageBytesI64);
+  Value vSpmBuf1 = arith::AddIOp::create(b, loc, vSpmBaseI64, pageBytesI64);
+  emitPagedKvPagePrefetch(b, loc, info, secondPage, kSpmBuf1, vSpmBuf1,
+                          kBaseI64, vBaseI64, pageBytesI64);
 
   SmallVector<Value> initArgs(oldLoop.getInitArgs().begin(),
                               oldLoop.getInitArgs().end());
@@ -6141,25 +7498,20 @@ static bool tryTransformDoubleBufferedPagedKv(
   Value newIv = newLoop.getInductionVar();
 
   OpBuilder nb(newBody, newBody->begin());
-  triton::cpu::DmaWaitOp::create(nb, loc);
-
   Value oneI32 = i32Cst(nb, loc, 1);
+  Value twoI32 = i32Cst(nb, loc, 2);
+  Value nextIv = arith::AddIOp::create(nb, loc, newIv, oneI32);
+  Value hasLookahead =
+      arith::CmpIOp::create(nb, loc, arith::CmpIPredicate::slt, nextIv,
+                            newLoop.getUpperBound());
+  Value maxPending = arith::SelectOp::create(nb, loc, hasLookahead,
+                                             i64Cst(nb, loc, 2),
+                                             i64Cst(nb, loc, 0));
+  triton::cpu::DmaWaitCountOp::create(nb, loc, maxPending);
+
   Value curBuf = arith::AndIOp::create(nb, loc, newIv, oneI32);
   Value curBufI64 = arith::ExtSIOp::create(nb, loc, nb.getI64Type(), curBuf);
   Value curBufOff = arith::MulIOp::create(nb, loc, curBufI64, pageBytesI64);
-  Value nextIv = arith::AddIOp::create(nb, loc, newIv, oneI32);
-  Value hasNext = arith::CmpIOp::create(nb, loc, arith::CmpIPredicate::slt,
-                                       nextIv, newLoop.getUpperBound());
-  auto ifOp = scf::IfOp::create(nb, loc, /*resultTypes=*/TypeRange{}, hasNext,
-                                /*withElseRegion=*/false);
-  {
-    OpBuilder ib(ifOp.thenBlock(), ifOp.thenBlock()->begin());
-    Value nextBufOff = arith::SubIOp::create(ib, loc, pageBytesI64, curBufOff);
-    Value nextKAddr = arith::AddIOp::create(ib, loc, kSpmBaseI64, nextBufOff);
-    Value nextVAddr = arith::AddIOp::create(ib, loc, vSpmBaseI64, nextBufOff);
-    emitPagedKvPagePrefetch(ib, loc, info, nextIv, nextKAddr, nextVAddr,
-                            kBaseI64, vBaseI64, pageBytesI64);
-  }
 
   Value curKAddr = arith::AddIOp::create(nb, loc, kSpmBaseI64, curBufOff);
   Value curVAddr = arith::AddIOp::create(nb, loc, vSpmBaseI64, curBufOff);
@@ -6175,6 +7527,20 @@ static bool tryTransformDoubleBufferedPagedKv(
     if (isa<scf::YieldOp>(op))
       continue;
     nb.clone(op, migrate);
+  }
+
+  Value nextNextIv = arith::AddIOp::create(nb, loc, newIv, twoI32);
+  Value hasNextNext =
+      arith::CmpIOp::create(nb, loc, arith::CmpIPredicate::slt, nextNextIv,
+                            newLoop.getUpperBound());
+  auto prefetchAfterCompute =
+      scf::IfOp::create(nb, loc, /*resultTypes=*/TypeRange{}, hasNextNext,
+                        /*withElseRegion=*/false);
+  {
+    OpBuilder ib(prefetchAfterCompute.thenBlock(),
+                 prefetchAfterCompute.thenBlock()->begin());
+    emitPagedKvPagePrefetch(ib, loc, info, nextNextIv, curKAddr, curVAddr,
+                            kBaseI64, vBaseI64, pageBytesI64);
   }
 
   auto getClonedRead = [&](vector::TransferReadOp oldRead)
@@ -6242,6 +7608,7 @@ static bool tryTransformDoubleBufferedPagedKv(
     SPMPromotionRecord record;
     record.source = "paged KV-cache page tiles (double-buffered)";
     record.scope = "function-scope paged_kv_decode page-gather ping-pong";
+    record.footprintClass = "streaming_ping_pong";
     record.shape.push_back(info.trips);
     record.shape.push_back(info.pageSize);
     record.shape.push_back(info.headDim);
@@ -6251,11 +7618,11 @@ static bool tryTransformDoubleBufferedPagedKv(
     record.bytes = 2 * info.trips * info.pageBytes;
     record.spmAddress = kSpmAddress;
     record.overhead =
-        "4 SPM page buffers; per-page dma_wait plus conditional next-page "
-        "prefetch into the inactive K/V buffers selected from page parity";
+        "4 SPM page buffers; watermark dma_wait_count keeps one lookahead "
+        "page in flight, with p+2 prefetch issued after current-page compute";
     record.benefit =
         "overlaps page-table selected K/V DMA for page p+1 with compute on "
-        "page p by ping-ponging two K/V page slots";
+        "page p without draining the whole DMA queue at each page boundary";
     record.reasonCode = "accepted_paged_kv_gather_double_buffered";
     record.reason =
         "accepted by the paged-kv-decode page ping-pong path";
@@ -6532,6 +7899,10 @@ static bool transformReductionResidencyPlan(
     std::string loweringReason;
     if (plan.source == "LayerNorm x row block")
       lowered = lowerLayerNormRowBlockGroupDma(
+          plan, allocRow->address, allocRow1->address, rowResidentHandledLoops,
+          loweringReason);
+    else if (plan.source == "RMSNorm x row block")
+      lowered = lowerRMSNormRowBlockGroupDma(
           plan, allocRow->address, allocRow1->address, rowResidentHandledLoops,
           loweringReason);
     else
@@ -6945,6 +8316,9 @@ static void appendAttentionV2QRecord(SPMPromotionReport *report,
   SPMPromotionRecord record;
   record.source = source.str();
   record.scope = scope.str();
+  record.footprintClass =
+      StringRef(bufferRole).contains("resident") ? "resident_multi_use"
+                                                 : "streaming_ping_pong";
   appendShape(record.shape, shapeTy);
   record.uses = uses;
   record.copyIn = "DMA";
@@ -7037,7 +8411,7 @@ static bool transformAttentionV2QResidentLoop(scf::ForOp forOp,
       getEnvInt64("TRITON_SPM_ATTENTION_Q_RESIDENT_MAX_BYTES", 2048);
   if (maxQTileBytes >= 0 && qPlan->tileBytes > maxQTileBytes)
     return reject("large_q_tile_not_safe",
-                  "large attention Q tiles are kept cacheable because wide "
+                  "large attention Q tiles stay on ordinary DRAM because wide "
                   "addrspace(3) vector loads are not correctness-stable");
   auto nextTop = state.nextPersistentTop(qPlan->tileBytes);
   if (!nextTop)
@@ -7056,7 +8430,7 @@ static bool transformAttentionV2QResidentLoop(scf::ForOp forOp,
       /*dmaDescriptors=*/1, /*waits=*/1, "resident_q_tile", "none",
       "accepted_attention_v2_q_resident",
       "Q is staged once and reused by attention QK loops while K/V remain "
-      "cacheable");
+      "ordinary_dram");
 
   return true;
 }
@@ -7101,7 +8475,7 @@ static bool transformAttentionV2KVStreamingLoop(
         getEnvInt64("TRITON_SPM_ATTENTION_Q_RESIDENT_MAX_BYTES", 2048);
     if (maxQTileBytes >= 0 && qPlan->tileBytes > maxQTileBytes)
       return reject("large_q_tile_not_safe",
-                    "large attention Q tiles are kept cacheable because wide "
+                    "large attention Q tiles stay on ordinary DRAM because wide "
                     "addrspace(3) vector loads are not correctness-stable");
     if (!state.nextPersistentTop(qPlan->tileBytes))
       return reject("spm_capacity_overflow",
@@ -7284,7 +8658,7 @@ static bool transformAttentionV2KVStreamingLoop(
 }
 
 //===----------------------------------------------------------------------===//
-// GEMM double-buffering transformation.
+// GEMM transformation.
 //
 // Input pattern (K-loop):
 //   scf.for %k = 0 to K step BK iter_args(%acc, ...) {
@@ -7354,6 +8728,7 @@ static bool transformFusedMicroGemmLoop(
     SPMPromotionRecord record;
     record.source = source.str();
     record.scope = scope.str();
+    record.footprintClass = "streaming_ping_pong";
     appendShape(record.shape, shapeTy);
     record.uses = uses;
     record.copyIn = copyIn.str();
@@ -7370,6 +8745,7 @@ static bool transformFusedMicroGemmLoop(
     SPMPromotionRecord record;
     record.source = "B tile window";
     record.scope = "loop-window";
+    record.footprintClass = "contraction_reuse_window";
     appendShape(record.shape, shapeTy);
     record.shape.push_back(window);
     record.uses = uses;
@@ -7400,6 +8776,7 @@ static bool transformFusedMicroGemmLoop(
     SPMPromotionRecord record;
     record.source = "accumulator tile";
     record.scope = "loop-window temporary";
+    record.footprintClass = "contraction_reuse_window";
     appendShape(record.shape, shapeTy);
     record.uses = uses;
     record.copyIn = "CPU/vector store";
@@ -7682,241 +9059,12 @@ static bool transformFusedMicroGemmLoop(
   return true;
 }
 
-/// Transform a GEMM K-loop with double-buffered SPM.
-/// `dotLoads` must have exactly 2 entries (A and B tile loads).
-/// Returns true on success.
-static bool transformGemmLoop(scf::ForOp forOp,
-                              ArrayRef<TiledLoadInfo> dotLoads, int64_t spmBase,
-                              int64_t spmSize) {
-  if (dotLoads.size() != 2)
-    return false;
-
-  TiledLoadInfo loadA = dotLoads[0];
-  TiledLoadInfo loadB = dotLoads[1];
-  auto contractInfo = analyzeGemmContract(forOp, loadA.readOp, loadB.readOp);
-  if (!contractInfo) {
-    contractInfo = analyzeGemmContract(forOp, loadB.readOp, loadA.readOp);
-    if (!contractInfo)
-      return false;
-    std::swap(loadA, loadB);
-  }
-
-  int64_t tileA = loadA.tileBytes;
-  int64_t tileB = loadB.tileBytes;
-
-  // Loop boundary guard: trip count must be a known multiple of the step.
-  // If not provable at compile time, bail out to the cache path.
-  auto lbCst = getConstantIntValue(forOp.getLowerBound());
-  auto ubCst = getConstantIntValue(forOp.getUpperBound());
-  auto stepCst = getConstantIntValue(forOp.getStep());
-  if (!lbCst || !ubCst || !stepCst || (*ubCst - *lbCst) % *stepCst != 0)
-    return false;
-
-  SPMSpaceManager spmLayout(spmBase, spmSize);
-  auto allocA0 =
-      spmLayout.alloc(tileA, /*alignment=*/1, SPMSpaceManager::Lifetime::Loop);
-  auto allocA1 =
-      spmLayout.alloc(tileA, /*alignment=*/1, SPMSpaceManager::Lifetime::Loop);
-  auto allocB0 =
-      spmLayout.alloc(tileB, /*alignment=*/1, SPMSpaceManager::Lifetime::Loop);
-  auto allocB1 =
-      spmLayout.alloc(tileB, /*alignment=*/1, SPMSpaceManager::Lifetime::Loop);
-  if (!allocA0 || !allocA1 || !allocB0 || !allocB1)
-    return false;
-
-  int64_t addrA0 = allocA0->address;
-  int64_t addrA1 = allocA1->address;
-  int64_t addrB0 = allocB0->address;
-  int64_t addrB1 = allocB1->address;
-
-  Location loc = forOp.getLoc();
-  InsertedBeforeGuard guard(forOp.getOperation());
-  OpBuilder b(forOp);
-
-  auto readA = loadA.readOp;
-  auto readB = loadB.readOp;
-  auto memRefTyA = cast<MemRefType>(readA.getBase().getType());
-  auto memRefTyB = cast<MemRefType>(readB.getBase().getType());
-
-  // --- Prologue: DMA first tiles into buffer 0 ---
-  Value dramAddrA = computePrologueDramAddr(b, loc, readA, forOp);
-  Value dramAddrB = computePrologueDramAddr(b, loc, readB, forOp);
-  if (!dramAddrA || !dramAddrB) {
-    guard.cleanup();
-    return false;
-  }
-
-  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrA0), dramAddrA, loadA.vecTy,
-                 memRefTyA);
-  emitDmaEnqueue(b, loc, i64Cst(b, loc, addrB0), dramAddrB, loadB.vecTy,
-                 memRefTyB);
-  // No explicit prologue wait: the DmaWait emitted at the top of the
-  // body block (before any SPM read of buffer 0) already polls until
-  // the prologue DMAs complete.  Issuing another wait here just adds a
-  // redundant volatile-load BB and bookkeeping for ~zero stall (the
-  // body-top wait then sees status=0 immediately on iter 0).
-
-  // --- Add buf_idx iter_arg to the loop ---
-  // We need to add a new i64 iter_arg for the buffer index (0 or 1).
-  // Also need to thread the DRAM addresses for next-iteration prefetch.
-  //
-  // For simplicity in the MVP, we recompute DRAM addresses inside the loop
-  // rather than threading them as iter_args.  The K-loop's induction variable
-  // already encodes the iteration, and the original transfer_read indices
-  // are recomputed each iteration.
-
-  // Insert buf_idx as a new iter_arg.
-  Value initBufIdx = i64Cst(b, loc, 0);
-
-  // We'll rebuild the loop with the extra iter_arg.
-  // Collect existing init args.
-  SmallVector<Value> newInitArgs(forOp.getInitArgs());
-  newInitArgs.push_back(initBufIdx);
-
-  // Create new for loop.
-  auto newForOp =
-      scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
-                         forOp.getStep(), newInitArgs);
-
-  // The new loop's body block has: iv, then one block arg per init arg.
-  Block *newBody = newForOp.getBody();
-  Block *oldBody = forOp.getBody();
-
-  // Map old block args to new block args.
-  IRMapping mapping;
-  mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
-  unsigned numOldArgs = forOp.getRegionIterArgs().size();
-  for (unsigned i = 0; i < numOldArgs; ++i)
-    mapping.map(forOp.getRegionIterArgs()[i], newForOp.getRegionIterArgs()[i]);
-
-  Value bufIdx = newForOp.getRegionIterArgs()[numOldArgs]; // new buf_idx arg
-
-  // Clone old body into new body (before the terminator).
-  b.setInsertionPointToStart(newBody);
-  // Remove the auto-generated yield in the new loop (if present).
-  if (!newBody->empty() && newBody->mightHaveTerminator())
-    newBody->getTerminator()->erase();
-
-  // DMA wait at TOP of body — wait for the prefetch that filled CURRENT buffer
-  // (issued in the previous iteration, or in the prologue for iter 0).
-  //
-  // Why at top, not at end: the wait lowers to a volatile-poll spin loop,
-  // i.e. its own basic block.  Placed at the end, LLVM schedules it between
-  // the SPM loads and the contract-derived fmuladds — which splits load+
-  // shufflevector(splat) across BBs and defeats the RISC-V backend's
-  // load+splat -> vfmacc.vf folding (the cache path's main matmul codegen).
-  // At the top, the prefetch scf.if joins back into a single block that
-  // contains loads -> FMAs -> yield, which the backend folds correctly.
-  triton::cpu::DmaWaitOp::create(b, loc);
-
-  // Build buffer selection BEFORE cloning the body so these ops dominate
-  // the SPM reads that will replace the cloned transfer_reads.
-  Value zero = i64Cst(b, loc, 0);
-  Value isZero =
-      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
-
-  // SPM addresses for A
-  Value spmA0 = i64Cst(b, loc, addrA0);
-  Value spmA1 = i64Cst(b, loc, addrA1);
-  Value spmACur = arith::SelectOp::create(b, loc, isZero, spmA0, spmA1);
-
-  // SPM addresses for B
-  Value spmB0 = i64Cst(b, loc, addrB0);
-  Value spmB1 = i64Cst(b, loc, addrB1);
-  Value spmBCur = arith::SelectOp::create(b, loc, isZero, spmB0, spmB1);
-
-  // --- Prefetch next tiles FIRST (async, overlaps with compute below) ---
-  Value iv = newForOp.getInductionVar();
-  Value step = newForOp.getStep();
-  Value ub = newForOp.getUpperBound();
-  Value nextIv = arith::AddIOp::create(b, loc, iv, step);
-  Value hasNext =
-      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, nextIv, ub);
-
-  Value spmANxt = arith::SelectOp::create(b, loc, isZero, spmA1, spmA0);
-  Value spmBNxt = arith::SelectOp::create(b, loc, isZero, spmB1, spmB0);
-
-  auto shapeA = loadA.vecTy.getShape();
-  auto shapeB = loadB.vecTy.getShape();
-  unsigned elemBytesA = memRefTyA.getElementType().getIntOrFloatBitWidth() / 8;
-  unsigned elemBytesB = memRefTyB.getElementType().getIntOrFloatBitWidth() / 8;
-
-  SmallVector<int64_t> stridesA, stridesB;
-  int64_t offA, offB;
-  (void)memRefTyA.getStridesAndOffset(stridesA, offA);
-  (void)memRefTyB.getStridesAndOffset(stridesB, offB);
-
-  int64_t kDimA = (shapeA.size() >= 2) ? 1 : 0;
-  int64_t stepBytesA = shapeA[kDimA] * stridesA[kDimA] * elemBytesA;
-  int64_t kDimB = 0;
-  int64_t stepBytesB = shapeB[kDimB] * stridesB[kDimB] * elemBytesB;
-
-  Value newLb = newForOp.getLowerBound();
-  Value kOffset = arith::SubIOp::create(b, loc, iv, newLb);
-  Value kOffI64 = toI64(b, loc, kOffset);
-  Value stepI64 = toI64(b, loc, step);
-
-  Value iterNum = arith::DivSIOp::create(b, loc, kOffI64, stepI64);
-  Value one = i64Cst(b, loc, 1);
-  Value nextIterNum = arith::AddIOp::create(b, loc, iterNum, one);
-
-  Value nextDramA = arith::AddIOp::create(
-      b, loc, dramAddrA,
-      arith::MulIOp::create(b, loc, nextIterNum, i64Cst(b, loc, stepBytesA)));
-  Value nextDramB = arith::AddIOp::create(
-      b, loc, dramAddrB,
-      arith::MulIOp::create(b, loc, nextIterNum, i64Cst(b, loc, stepBytesB)));
-
-  auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
-  b.setInsertionPointToStart(&ifOp.getThenRegion().front());
-  emitDmaEnqueue(b, loc, spmANxt, nextDramA, loadA.vecTy, memRefTyA);
-  emitDmaEnqueue(b, loc, spmBNxt, nextDramB, loadB.vecTy, memRefTyB);
-  b.setInsertionPointAfter(ifOp);
-
-  // --- SPM read + compute (from CURRENT buffer, while prefetch runs) ---
-  for (auto &op : oldBody->getOperations()) {
-    if (isa<scf::YieldOp>(op))
-      continue;
-    if (&op == readA.getOperation()) {
-      Value spmValA = emitSpmRead(b, loc, spmACur, loadA.vecTy);
-      mapping.map(readA.getResult(), spmValA);
-      continue;
-    }
-    if (&op == readB.getOperation()) {
-      Value spmValB = emitSpmRead(b, loc, spmBCur, loadB.vecTy);
-      mapping.map(readB.getResult(), spmValB);
-      continue;
-    }
-    b.clone(op, mapping);
-  }
-
-  // (DMA wait is at TOP of body, not here — see comment above.)
-  b.setInsertionPointToEnd(newBody);
-
-  // --- Yield with flipped buf_idx ---
-  Value flipped = arith::SubIOp::create(b, loc, one, bufIdx);
-  auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
-  SmallVector<Value> yieldVals;
-  for (auto val : oldYield.getOperands())
-    yieldVals.push_back(mapping.lookupOrDefault(val));
-  yieldVals.push_back(flipped);
-  scf::YieldOp::create(b, loc, yieldVals);
-
-  // Replace uses of old loop results with new loop results.
-  for (unsigned i = 0; i < forOp.getNumResults(); ++i)
-    forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
-  guard.commit();
-  forOp.erase();
-
-  return true;
-}
-
 //===----------------------------------------------------------------------===//
-// Reduction double-buffering transformation.
+// Generic affine tile ping-pong transformation.
 //
-// For loops with a single tiled load (not feeding a dot), insert a
-// double-buffered DMA prefetch: DMA the next chunk into the alternate
-// SPM buffer while reducing the current chunk.
+// For affine loops with one or more tiled loads, insert a double-buffered DMA
+// prefetch: DMA the next tile into the alternate SPM buffer while the current
+// tile is consumed.  Specialized paths run before this fallback.
 //
 // Input:
 //   scf.for %i = 0 to N step BS {
@@ -7943,7 +9091,7 @@ static bool transformGemmLoop(scf::ForOp forOp,
 //   }
 //===----------------------------------------------------------------------===//
 
-struct ReductionLoadPlan {
+struct GenericAffineStreamPlan {
   TiledLoadInfo load;
   MemRefType memRefTy;
   int64_t addrBuf0;
@@ -7954,24 +9102,228 @@ struct ReductionLoadPlan {
   Value spmNxt;
 };
 
-static bool transformReductionLoop(scf::ForOp forOp,
-                                   ArrayRef<TiledLoadInfo> loads,
-                                   int64_t spmBase, int64_t spmSize) {
-  // Historical streaming-reduction coverage path. It double-buffers chunks,
-  // but each chunk has too little residency/reuse for current LayerNorm-like
-  // kernels and is rejected by the P3 profitability model. Do not use this as
-  // a recommended reduction schedule; prefer row/block-resident plans or cache.
+static bool lowerGenericAffinePingPongLoop(scf::ForOp forOp,
+                                           ArrayRef<TiledLoadInfo> loads,
+                                           int64_t spmBase, int64_t spmSize,
+                                           bool prefetchBeforeBody);
+
+static bool isLegalGenericStreamingLoad(TiledLoadInfo load, scf::ForOp forOp,
+                                        int64_t minTileBytes,
+                                        StringRef &reasonCode,
+                                        StringRef &reason) {
+  vector::TransferReadOp readOp = load.readOp;
+  auto memRefTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!memRefTy) {
+    reasonCode = "unknown_memref_base";
+    reason = "generic affine tile lowering requires a memref base";
+    return false;
+  }
+  if (load.vecTy.getRank() < 1 || load.vecTy.getRank() > 2 ||
+      memRefTy.getRank() < load.vecTy.getRank()) {
+    reasonCode = "unsupported_pattern";
+    reason = "v1 generic affine tile lowering supports rank-1/rank-2 transfer reads";
+    return false;
+  }
+  if (!hasPositiveConstantStep(forOp)) {
+    reasonCode = "dynamic_affine_bounds";
+    reason = "generic affine tile lowering requires a positive constant loop step";
+    return false;
+  }
+  if (hasLoopCarriedPointerBase(readOp.getBase(), forOp) &&
+      !isLoopBlockPtrTransfer(readOp, forOp)) {
+    reasonCode = "loop_carried_pointer_update";
+    reason = "generic affine tile lowering rejects loop-carried pointer bases";
+    return false;
+  }
+  if (!hasSupportedGenericTransferMap(readOp, forOp)) {
+    reasonCode = "unsupported_transfer_map";
+    reason =
+        "generic affine tile lowering requires an identity or "
+        "contiguous projected-slice transfer map";
+    return false;
+  }
+  if (readOp.getMask()) {
+    reasonCode = "non_full_tile_transfer";
+    reason = "generic affine tile lowering rejects masked transfers";
+    return false;
+  }
+  if (!allTransferInBounds(readOp.getInBoundsValues(), load.vecTy.getRank())) {
+    reasonCode = "non_full_tile_transfer";
+    reason = "generic affine tile lowering requires all vector lanes in-bounds";
+    return false;
+  }
+  if (readOp.getPadding() && !hasConstantPadding(readOp)) {
+    reasonCode = "non_full_tile_transfer";
+    reason = "generic affine tile lowering rejects padding-dependent transfers";
+    return false;
+  }
+  SmallVector<int64_t> strides;
+  if (!getStaticStrides(memRefTy, strides)) {
+    reasonCode = "dynamic_shape_or_stride";
+    reason = "generic affine tile lowering requires static memref strides";
+    return false;
+  }
+  if (!hasGenericDmaFilledLayout(readOp, forOp)) {
+    reasonCode = "unsupported_non_row_major_tile";
+    reason = "generic affine tile lowering v1 only supports DMA-filled rank-1 "
+             "contiguous, rank-1 contiguous projected slices, rank-2 "
+             "row-major, or rank-2 col-major row-block tiles";
+    return false;
+  }
+  if (!canComputePrologueDramAddr(readOp, forOp) ||
+      !getLoopStepBytes(readOp, forOp, /*requireLoopIv=*/true)) {
+    reasonCode = "dynamic_shape_or_stride";
+    reason = "generic affine tile lowering requires a DMA-computable loop stride";
+    return false;
+  }
+  TransferWriteAliasKind aliasKind =
+      getLoopTransferWriteAliasKind(forOp, readOp.getBase());
+  if (aliasKind != TransferWriteAliasKind::None &&
+      !allTransferWritesAfterRead(forOp, readOp)) {
+    if (aliasKind == TransferWriteAliasKind::SameBase) {
+      reasonCode = "same_base_transfer_write_may_alias";
+      reason =
+          "generic affine tile lowering rejects same-base transfer_write aliases";
+    } else {
+      reasonCode = "unknown_transfer_write_may_alias";
+      reason = "generic affine tile lowering rejects transfer_write operations "
+               "whose bases cannot be proven non-aliasing";
+    }
+    return false;
+  }
+  if (minTileBytes > 0 && load.tileBytes < minTileBytes) {
+    reasonCode = "small_tile_spm_overhead";
+    reason = "generic affine tile lowering requires tile bytes above the configured threshold";
+    return false;
+  }
+  if (aliasKind != TransferWriteAliasKind::None) {
+    reasonCode = "candidate_streaming_ping_pong_post_write_prefetch";
+    reason = "static tile is legal for generic fallback ping-pong lowering when "
+             "the next DMA is scheduled after loop-body writes";
+  } else {
+    reasonCode = "candidate_streaming_ping_pong";
+    reason = "read-only tile is legal for generic fallback streaming "
+             "ping-pong lowering";
+  }
+  return true;
+}
+
+static bool transformGenericAffineStreamingLoop(scf::ForOp forOp,
+                                                ArrayRef<TiledLoadInfo> loads,
+                                                int64_t spmBase,
+                                                int64_t spmSize,
+                                                int64_t minTileBytes,
+                                                SPMPromotionReport *report) {
+  auto reject = [&](StringRef reasonCode, StringRef reason) {
+    if (report) {
+      SPMPromotionRejection rejection =
+          makePromotionRejection("generic_affine_tile", reasonCode, reason);
+      rejection.footprintClass = "streaming_ping_pong";
+      if (!loads.empty()) {
+        rejection.uses = loads.size();
+        rejection.copyIn = "DMA";
+        rejection.bytes = 0;
+        for (const TiledLoadInfo &load : loads)
+          rejection.bytes += load.tileBytes;
+        appendShape(rejection.shape, loads.front().vecTy);
+      }
+      report->rejections.push_back(std::move(rejection));
+    }
+    return false;
+  };
+
+  if (loads.empty())
+    return reject("unsupported_pattern",
+                  "generic affine tile lowering requires at least one tiled read");
+
+  StringRef reasonCode;
+  StringRef reason;
+  for (const TiledLoadInfo &load : loads) {
+    if (!isLegalGenericStreamingLoad(load, forOp, minTileBytes, reasonCode,
+                                     reason))
+      return reject(reasonCode, reason);
+  }
+
+  bool prefetchBeforeBody = !loopHasAnyTransferWrite(forOp);
+  bool hasDotLoad = llvm::any_of(
+      loads, [](const TiledLoadInfo &load) { return load.feedsDot; });
+  if (hasDotLoad && !getExactStaticTripCount(forOp))
+    return reject("dynamic_contraction_streaming_not_supported",
+                  "generic affine contraction fallback requires a static trip "
+                  "count; dynamic attention-style contraction loops are left "
+                  "on the cache path");
+  if (hasDotLoad && loopHasMaskedContractionSoftmax(forOp))
+    return reject("masked_contraction_softmax",
+                  "generic affine contraction fallback rejects masked "
+                  "online-softmax loops; use the attention-specific schedule "
+                  "or leave the loop on the cache path");
+
+  if (!lowerGenericAffinePingPongLoop(forOp, loads, spmBase, spmSize,
+                                      prefetchBeforeBody))
+    return reject("unsupported_pattern",
+                  "generic affine tile ping-pong lowering failed after legality checks");
+
+  if (report) {
+    SPMPromotionRecord record;
+    record.source =
+        hasDotLoad ? "generic affine contraction tile" : "generic affine tile";
+    record.scope = "loop-local streaming tile";
+    record.footprintClass = "streaming_ping_pong";
+    appendShape(record.shape, loads.front().vecTy);
+    record.uses = loads.size();
+    record.copyIn = "DMA";
+    record.copyOut = "none";
+    int64_t liveBytes = 0;
+    for (const TiledLoadInfo &load : loads)
+      liveBytes += load.tileBytes * 2;
+    record.bytes = liveBytes;
+    record.overhead = prefetchBeforeBody
+                          ? "two SPM buffers per stream, one DMA descriptor "
+                            "per stream per loop iteration, and one wait-at-top "
+                            "per iteration"
+                          : "two SPM buffers per stream, one DMA descriptor "
+                            "per stream per loop iteration, wait-at-top, and "
+                            "post-body next-tile enqueue to preserve write order";
+    record.benefit =
+        "generic fallback ping-pong schedule overlaps next affine tile DMA with current tile compute across one or more streams";
+    if (hasDotLoad) {
+      record.reasonCode =
+          "accepted_generic_affine_tile_contraction_fallback";
+      record.reason =
+          "accepted by post-specialized generic affine-tile streaming fallback "
+          "for contraction inputs";
+    } else {
+      record.reasonCode =
+          prefetchBeforeBody
+              ? "accepted_generic_affine_tile_streaming"
+              : "accepted_generic_affine_tile_post_write_streaming";
+      record.reason =
+          prefetchBeforeBody
+              ? "accepted by the generic affine-tile streaming fallback "
+                "ping-pong lowering"
+              : "accepted by the generic affine-tile streaming fallback with "
+                "next DMA scheduled after loop-body writes";
+    }
+    report->records.push_back(std::move(record));
+  }
+
+  return true;
+}
+
+static bool lowerGenericAffinePingPongLoop(scf::ForOp forOp,
+                                           ArrayRef<TiledLoadInfo> loads,
+                                           int64_t spmBase, int64_t spmSize,
+                                           bool prefetchBeforeBody) {
   if (loads.empty())
     return false;
 
-  auto lbCst = getConstantIntValue(forOp.getLowerBound());
-  auto ubCst = getConstantIntValue(forOp.getUpperBound());
-  auto stepCst = getConstantIntValue(forOp.getStep());
-  if (!lbCst || !ubCst || !stepCst || (*ubCst - *lbCst) % *stepCst != 0)
+  auto trips = getExactStaticTripCount(forOp);
+  if (!hasPositiveConstantStep(forOp))
     return false;
+  bool needsRuntimeGuard = !trips || *trips <= 0;
 
   SPMSpaceManager spmLayout(spmBase, spmSize);
-  SmallVector<ReductionLoadPlan> plans;
+  SmallVector<GenericAffineStreamPlan> plans;
   plans.reserve(loads.size());
 
   for (const TiledLoadInfo &load : loads) {
@@ -7992,119 +9344,172 @@ static bool transformReductionLoop(scf::ForOp forOp,
     if (!allocBuf0 || !allocBuf1)
       return false;
 
-    plans.push_back(ReductionLoadPlan{load, memRefTy, allocBuf0->address,
-                                      allocBuf1->address, *stepBytes, Value(),
-                                      Value(), Value()});
+    plans.push_back(GenericAffineStreamPlan{
+        load, memRefTy, allocBuf0->address, allocBuf1->address, *stepBytes,
+        Value(), Value(), Value()});
   }
 
   Location loc = forOp.getLoc();
   InsertedBeforeGuard guard(forOp.getOperation());
   OpBuilder b(forOp);
 
-  // Prologue: DMA first chunk for every stream.
-  for (ReductionLoadPlan &plan : plans) {
-    plan.dramAddr = computePrologueDramAddr(b, loc, plan.load.readOp, forOp);
-    if (!plan.dramAddr) {
+  auto eraseTerminator = [](Block *block) {
+    if (!block->empty() && block->mightHaveTerminator())
+      block->getTerminator()->erase();
+  };
+
+  auto emitTransformedLoop = [&]() -> std::optional<scf::ForOp> {
+    // Prologue: DMA first chunk for every stream.
+    for (GenericAffineStreamPlan &plan : plans) {
+      plan.dramAddr = computePrologueDramAddr(b, loc, plan.load.readOp, forOp);
+      if (!plan.dramAddr)
+        return std::nullopt;
+      emitDmaFilledEnqueue(b, loc, i64Cst(b, loc, plan.addrBuf0),
+                           plan.dramAddr, plan.load.vecTy, plan.memRefTy);
+    }
+
+    // Rebuild loop with one extra iter_arg: the current buffer index.
+    SmallVector<Value> initArgs(forOp.getInitArgs());
+    initArgs.push_back(i64Cst(b, loc, 0));
+    auto newForOp =
+        scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                           forOp.getStep(), initArgs);
+
+    Block *newBody = newForOp.getBody();
+    Block *oldBody = forOp.getBody();
+
+    IRMapping mapping;
+    mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+    unsigned numOldArgs = forOp.getRegionIterArgs().size();
+    for (unsigned i = 0; i < numOldArgs; ++i)
+      mapping.map(forOp.getRegionIterArgs()[i],
+                  newForOp.getRegionIterArgs()[i]);
+    Value bufIdx = newForOp.getRegionIterArgs()[numOldArgs];
+
+    b.setInsertionPointToStart(newBody);
+    eraseTerminator(newBody);
+
+    // Wait for the DMA that filled the current buffer.  Iteration 0 waits for
+    // the prologue; later iterations wait for the prior iteration's prefetch.
+    triton::cpu::DmaWaitOp::create(b, loc);
+
+    Value zero = i64Cst(b, loc, 0);
+    Value isZero =
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
+    for (GenericAffineStreamPlan &plan : plans) {
+      Value spmBuf0 = i64Cst(b, loc, plan.addrBuf0);
+      Value spmBuf1 = i64Cst(b, loc, plan.addrBuf1);
+      plan.spmCur = arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
+      plan.spmNxt = arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
+    }
+
+    // --- Prepare next chunk address for the alternate buffer. ---
+    Value iv = newForOp.getInductionVar();
+    Value step = newForOp.getStep();
+    Value ub = newForOp.getUpperBound();
+    Value nextIv = arith::AddIOp::create(b, loc, iv, step);
+    Value hasNext =
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, nextIv, ub);
+
+    Value lbInLoop = newForOp.getLowerBound();
+    Value nextOff = arith::SubIOp::create(b, loc, nextIv, lbInLoop);
+    Value nextOffI64 = toI64(b, loc, nextOff);
+
+    auto emitNextPrefetch = [&]() {
+      auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
+      b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      for (GenericAffineStreamPlan &plan : plans) {
+        Value nextByteOff = arith::MulIOp::create(
+            b, loc, nextOffI64, i64Cst(b, loc, plan.stepBytes));
+        Value nextDram =
+            arith::AddIOp::create(b, loc, plan.dramAddr, nextByteOff);
+        emitDmaFilledEnqueue(b, loc, plan.spmNxt, nextDram, plan.load.vecTy,
+                             plan.memRefTy);
+      }
+      b.setInsertionPointAfter(ifOp);
+    };
+
+    if (prefetchBeforeBody)
+      emitNextPrefetch();
+
+    // Clone the original body, replacing the transfer_read with the current
+    // SPM buffer reads.  The prefetch above targets the alternate buffers, so
+    // DMA can overlap with reduction/streaming compute without racing reads.
+    for (auto &op : oldBody->getOperations()) {
+      if (isa<scf::YieldOp>(op))
+        continue;
+
+      bool replacedRead = false;
+      for (const GenericAffineStreamPlan &plan : plans) {
+        auto readOp = plan.load.readOp;
+        if (&op == readOp.getOperation()) {
+          Value spmVal = emitSpmReadWithStrides(
+              b, loc, plan.spmCur, plan.load.vecTy,
+              getDmaFilledSpmMemStrides(plan.load.vecTy, plan.memRefTy));
+          mapping.map(readOp.getResult(), spmVal);
+          replacedRead = true;
+          break;
+        }
+      }
+      if (replacedRead)
+        continue;
+
+      b.clone(op, mapping);
+    }
+
+    if (!prefetchBeforeBody)
+      emitNextPrefetch();
+
+    // Yield.
+    auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
+    SmallVector<Value> yieldVals;
+    for (auto val : oldYield.getOperands())
+      yieldVals.push_back(mapping.lookupOrDefault(val));
+    Value one = i64Cst(b, loc, 1);
+    Value flipped = arith::SubIOp::create(b, loc, one, bufIdx);
+    yieldVals.push_back(flipped);
+    scf::YieldOp::create(b, loc, yieldVals);
+    b.setInsertionPointAfter(newForOp);
+    return newForOp;
+  };
+
+  if (needsRuntimeGuard) {
+    Value hasIterations =
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt,
+                              forOp.getLowerBound(), forOp.getUpperBound());
+    auto ifOp = scf::IfOp::create(b, loc, forOp.getResultTypes(),
+                                  hasIterations, /*withElseRegion=*/true);
+
+    Block *thenBlock = ifOp.thenBlock();
+    eraseTerminator(thenBlock);
+    b.setInsertionPointToStart(thenBlock);
+    std::optional<scf::ForOp> newForOp = emitTransformedLoop();
+    if (!newForOp) {
       guard.cleanup();
       return false;
     }
-    emitDmaEnqueue(b, loc, i64Cst(b, loc, plan.addrBuf0), plan.dramAddr,
-                   plan.load.vecTy, plan.memRefTy);
-  }
+    SmallVector<Value> thenYieldVals;
+    for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+      thenYieldVals.push_back(newForOp->getResult(i));
+    scf::YieldOp::create(b, loc, thenYieldVals);
 
-  // Rebuild loop with one extra iter_arg: the current buffer index.
-  SmallVector<Value> initArgs(forOp.getInitArgs());
-  initArgs.push_back(i64Cst(b, loc, 0));
-  auto newForOp =
-      scf::ForOp::create(b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
-                         forOp.getStep(), initArgs);
+    Block *elseBlock = ifOp.elseBlock();
+    eraseTerminator(elseBlock);
+    b.setInsertionPointToStart(elseBlock);
+    scf::YieldOp::create(b, loc, forOp.getInitArgs());
 
-  Block *newBody = newForOp.getBody();
-  Block *oldBody = forOp.getBody();
-
-  IRMapping mapping;
-  mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
-  unsigned numOldArgs = forOp.getRegionIterArgs().size();
-  for (unsigned i = 0; i < numOldArgs; ++i)
-    mapping.map(forOp.getRegionIterArgs()[i], newForOp.getRegionIterArgs()[i]);
-  Value bufIdx = newForOp.getRegionIterArgs()[numOldArgs];
-
-  b.setInsertionPointToStart(newBody);
-  if (!newBody->empty() && newBody->mightHaveTerminator())
-    newBody->getTerminator()->erase();
-
-  // Wait for the DMA that filled the current buffer.  Iteration 0 waits for
-  // the prologue; later iterations wait for the prior iteration's prefetch.
-  triton::cpu::DmaWaitOp::create(b, loc);
-
-  Value zero = i64Cst(b, loc, 0);
-  Value isZero =
-      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, bufIdx, zero);
-  for (ReductionLoadPlan &plan : plans) {
-    Value spmBuf0 = i64Cst(b, loc, plan.addrBuf0);
-    Value spmBuf1 = i64Cst(b, loc, plan.addrBuf1);
-    plan.spmCur = arith::SelectOp::create(b, loc, isZero, spmBuf0, spmBuf1);
-    plan.spmNxt = arith::SelectOp::create(b, loc, isZero, spmBuf1, spmBuf0);
-  }
-
-  // --- Prefetch next chunk into the alternate buffer. ---
-  Value iv = newForOp.getInductionVar();
-  Value step = newForOp.getStep();
-  Value ub = newForOp.getUpperBound();
-  Value nextIv = arith::AddIOp::create(b, loc, iv, step);
-  Value hasNext =
-      arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, nextIv, ub);
-
-  Value lbInLoop = newForOp.getLowerBound();
-  Value nextOff = arith::SubIOp::create(b, loc, nextIv, lbInLoop);
-  Value nextOffI64 = toI64(b, loc, nextOff);
-
-  auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, hasNext, false);
-  b.setInsertionPointToStart(&ifOp.getThenRegion().front());
-  for (ReductionLoadPlan &plan : plans) {
-    Value nextByteOff = arith::MulIOp::create(b, loc, nextOffI64,
-                                              i64Cst(b, loc, plan.stepBytes));
-    Value nextDram = arith::AddIOp::create(b, loc, plan.dramAddr, nextByteOff);
-    emitDmaEnqueue(b, loc, plan.spmNxt, nextDram, plan.load.vecTy,
-                   plan.memRefTy);
-  }
-  b.setInsertionPointAfter(ifOp);
-
-  // Clone the original body, replacing the transfer_read with the current
-  // SPM buffer reads.  The prefetch above targets the alternate buffers, so
-  // DMA can overlap with reduction/streaming compute without racing reads.
-  for (auto &op : oldBody->getOperations()) {
-    if (isa<scf::YieldOp>(op))
-      continue;
-
-    bool replacedRead = false;
-    for (const ReductionLoadPlan &plan : plans) {
-      auto readOp = plan.load.readOp;
-      if (&op == readOp.getOperation()) {
-        Value spmVal = emitSpmRead(b, loc, plan.spmCur, plan.load.vecTy);
-        mapping.map(readOp.getResult(), spmVal);
-        replacedRead = true;
-        break;
-      }
+    for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+      forOp.getResult(i).replaceAllUsesWith(ifOp.getResult(i));
+  } else {
+    std::optional<scf::ForOp> newForOp = emitTransformedLoop();
+    if (!newForOp) {
+      guard.cleanup();
+      return false;
     }
-    if (replacedRead)
-      continue;
-
-    b.clone(op, mapping);
+    for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+      forOp.getResult(i).replaceAllUsesWith(newForOp->getResult(i));
   }
 
-  // Yield.
-  auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
-  SmallVector<Value> yieldVals;
-  for (auto val : oldYield.getOperands())
-    yieldVals.push_back(mapping.lookupOrDefault(val));
-  Value one = i64Cst(b, loc, 1);
-  Value flipped = arith::SubIOp::create(b, loc, one, bufIdx);
-  yieldVals.push_back(flipped);
-  scf::YieldOp::create(b, loc, yieldVals);
-
-  for (unsigned i = 0; i < forOp.getNumResults(); ++i)
-    forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
   guard.commit();
   forOp.erase();
 
@@ -8130,26 +9535,7 @@ struct ConvertMemoryToSPM
     this->windowK = windowK_;
   }
   ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_, int64_t microM_,
-                     int64_t windowK_, bool enableReductions_) {
-    this->spmBase = spmBase_;
-    this->spmSize = spmSize_;
-    this->microM = microM_;
-    this->windowK = windowK_;
-    this->enableReductions = enableReductions_;
-  }
-  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_, int64_t microM_,
-                     int64_t windowK_, bool enableReductions_,
-                     bool promotionReport_) {
-    this->spmBase = spmBase_;
-    this->spmSize = spmSize_;
-    this->microM = microM_;
-    this->windowK = windowK_;
-    this->enableReductions = enableReductions_;
-    this->promotionReport = promotionReport_;
-  }
-  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_, int64_t microM_,
-                     int64_t windowK_, bool enableReductions_,
-                     bool enableRowResidentReductions_,
+                     int64_t windowK_, bool enableRowResidentReductions_,
                      int64_t rowResidentMaxBytes_,
                      StringRef rowResidentProducerPass_,
                      bool enablePromotionProfitability_,
@@ -8158,26 +9544,45 @@ struct ConvertMemoryToSPM
     this->spmSize = spmSize_;
     this->microM = microM_;
     this->windowK = windowK_;
-    this->enableReductions = enableReductions_;
     this->enableRowResidentReductions = enableRowResidentReductions_;
     this->rowResidentMaxBytes = rowResidentMaxBytes_;
     this->rowResidentProducerPass = rowResidentProducerPass_.str();
     this->enablePromotionProfitability = enablePromotionProfitability_;
     this->promotionReport = promotionReport_;
   }
+  ConvertMemoryToSPM(int64_t spmBase_, int64_t spmSize_, int64_t microM_,
+                     int64_t windowK_, bool enableRowResidentReductions_,
+                     int64_t rowResidentMaxBytes_,
+                     StringRef rowResidentProducerPass_,
+                     bool enablePromotionProfitability_,
+                     bool promotionReport_,
+                     int64_t genericAffineTileMinBytes_) {
+    this->spmBase = spmBase_;
+    this->spmSize = spmSize_;
+    this->microM = microM_;
+    this->windowK = windowK_;
+    this->enableRowResidentReductions = enableRowResidentReductions_;
+    this->rowResidentMaxBytes = rowResidentMaxBytes_;
+    this->rowResidentProducerPass = rowResidentProducerPass_.str();
+    this->enablePromotionProfitability = enablePromotionProfitability_;
+    this->promotionReport = promotionReport_;
+    this->genericAffineTileMinBytes = genericAffineTileMinBytes_;
+  }
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     DenseMap<Operation *, SPMPromotionReport> reports;
     DenseMap<Operation *, AttentionFunctionState> attentionStates;
-    llvm::DenseSet<Operation *> rowResidentHandledLoops;
+    llvm::DenseSet<Operation *> handledLoops;
 
     if (promotionReport) {
       mod.walk([&](FunctionOpInterface funcOp) {
         if (funcOp.getVisibility() != SymbolTable::Visibility::Public ||
             funcOp.getFunctionBody().empty())
           return;
-        collectVectorContractionReports(funcOp, reports[funcOp.getOperation()]);
+        SPMPromotionReport &report = reports[funcOp.getOperation()];
+        collectVectorContractionReports(funcOp, report);
+        collectAffineTileCandidates(funcOp, report);
       });
     }
 
@@ -8248,6 +9653,25 @@ struct ConvertMemoryToSPM
         }
 
         if (rowBlockProducerPass &&
+            getEnvBool("TRITON_SPM_RMSNORM_INTERNAL_ROW_BLOCK", true)) {
+          int64_t rowBlock = getEnvInt64(
+              "TRITON_SPM_RMSNORM_ROW_BLOCK",
+              getEnvInt64("SPM_ROW_BLOCK", getEnvInt64("RMSNORM_SPM_ROW_BLOCK", 2)));
+          int64_t rowGroupBlocks =
+              getEnvInt64("TRITON_SPM_RMSNORM_ROW_GROUP_BLOCKS",
+                          getEnvInt64("SPM_ROW_GROUP_BLOCKS",
+                                      getEnvInt64("RMSNORM_SPM_ROW_GROUP_BLOCKS", 8)));
+          if (lowerCanonicalRMSNormToRowBlockGroup(
+                  topLevelLoops, funcOp, rowBlock, rowGroupBlocks)) {
+            topLevelLoops.clear();
+            for (Operation &op : entryBlock) {
+              if (auto forOp = dyn_cast<scf::ForOp>(&op))
+                topLevelLoops.push_back(forOp);
+            }
+          }
+        }
+
+        if (rowBlockProducerPass &&
             getEnvBool("TRITON_SPM_SOFTMAX_INTERNAL_ROW_BLOCK", true)) {
           int64_t rowBlock =
               getEnvInt64("TRITON_SPM_SOFTMAX_ROW_BLOCK",
@@ -8276,6 +9700,13 @@ struct ConvertMemoryToSPM
             plan->autoSelected = true;
         }
         if (!plan && rowBlockProducerPass) {
+          plan = matchRMSNormRowBlockGroupResidencyPlan(
+              topLevelLoops, funcOp, rejectReasonCode, rejectReason,
+              "row_block_dma");
+          if (plan && autoProducerPass)
+            plan->autoSelected = true;
+        }
+        if (!plan && rowBlockProducerPass) {
           plan = matchSoftmaxRowBlockGroupResidencyPlan(
               topLevelLoops, funcOp, rejectReasonCode, rejectReason,
               "row_block_dma");
@@ -8286,6 +9717,11 @@ struct ConvertMemoryToSPM
           plan = matchLayerNormResidencyPlan(topLevelLoops, funcOp,
                                              rejectReasonCode, rejectReason,
                                              producerPassMode);
+        }
+        if (!plan) {
+          plan = matchRMSNormResidencyPlan(topLevelLoops, funcOp,
+                                           rejectReasonCode, rejectReason,
+                                           producerPassMode);
         }
         if (!plan) {
           plan =
@@ -8302,7 +9738,7 @@ struct ConvertMemoryToSPM
 
         transformReductionResidencyPlan(
             *plan, spmBase, spmSize, rowResidentMaxBytes,
-            enablePromotionProfitability, report, rowResidentHandledLoops);
+            enablePromotionProfitability, report, handledLoops);
       });
     }
 
@@ -8311,19 +9747,16 @@ struct ConvertMemoryToSPM
     mod.walk([&](scf::ForOp forOp) { forOps.push_back(forOp); });
 
     for (auto forOp : forOps) {
-      if (rowResidentHandledLoops.contains(forOp.getOperation()))
+      if (handledLoops.contains(forOp.getOperation()))
         continue;
       auto loads = findTiledLoads(forOp);
       if (loads.empty())
         continue;
 
-      // Classify: GEMM if exactly 2 loads feed a dot product.
-      SmallVector<TiledLoadInfo> dotLoads, nonDotLoads;
+      SmallVector<TiledLoadInfo> dotLoads;
       for (auto &l : loads) {
         if (l.feedsDot)
           dotLoads.push_back(l);
-        else
-          nonDotLoads.push_back(l);
       }
 
       if (dotLoads.size() == 2) {
@@ -8336,52 +9769,43 @@ struct ConvertMemoryToSPM
           attentionState = &attentionStates[parentFunc.getOperation()];
           attentionState->initialize(spmBase, spmSize);
         }
-        if (!(attentionState &&
-              (transformAttentionV2KVStreamingLoop(forOp, dotLoads,
-                                                   *attentionState, report) ||
-               transformAttentionV2QResidentLoop(forOp, dotLoads,
-                                                 *attentionState, report))) &&
-            !transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
-                                         microM, windowK,
-                                         enablePromotionProfitability, report))
-          transformGemmLoop(forOp, dotLoads, spmBase, spmSize);
-      } else if (dotLoads.empty() && enableReductions &&
-                 !enableRowResidentReductions) {
-        if (enablePromotionProfitability) {
-          if (promotionReport && !nonDotLoads.empty()) {
-            auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
-            if (funcOp) {
-              SPMProfitabilityEvidence evidence =
-                  evaluateD3StreamingReductionProfitability(forOp, nonDotLoads,
-                                                            spmSize);
-              reports[funcOp.getOperation()].rejections.push_back(
-                  makeD3StreamingReductionRejection(forOp, nonDotLoads,
-                                                    std::move(evidence)));
-            }
-          }
+        bool handledByAttention =
+            attentionState &&
+            (transformAttentionV2KVStreamingLoop(forOp, dotLoads,
+                                                 *attentionState, report) ||
+             transformAttentionV2QResidentLoop(forOp, dotLoads,
+                                               *attentionState, report));
+        if (handledByAttention) {
+          handledLoops.insert(forOp.getOperation());
           continue;
         }
-        bool transformed =
-            transformReductionLoop(forOp, nonDotLoads, spmBase, spmSize);
-        if (!transformed && promotionReport && !nonDotLoads.empty()) {
-          auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
-          if (funcOp)
-            reports[funcOp.getOperation()].rejections.push_back(
-                makePromotionRejection(
-                    "reduction_streaming", "unsupported_pattern",
-                    "reduction/streaming loop did not match the current SPM "
-                    "lowering guards"));
+        bool handledByFusedMicroGemm =
+            transformFusedMicroGemmLoop(forOp, dotLoads, spmBase, spmSize,
+                                        microM, windowK,
+                                        enablePromotionProfitability, report);
+        if (handledByFusedMicroGemm) {
+          continue;
         }
-      } else if (promotionReport && dotLoads.empty() && !nonDotLoads.empty()) {
-        auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
-        if (funcOp)
-          reports[funcOp.getOperation()].rejections.push_back(
-              makePromotionRejection(
-                  "reduction_streaming", "policy_disabled",
-                  "reduction/streaming SPM promotion is disabled by default; "
-                  "leave the candidate on the cache path"));
       }
       // Otherwise: leave unchanged (cache path).
+    }
+
+    SmallVector<scf::ForOp> genericForOps;
+    mod.walk([&](scf::ForOp forOp) { genericForOps.push_back(forOp); });
+    for (scf::ForOp forOp : genericForOps) {
+      if (handledLoops.contains(forOp.getOperation()))
+        continue;
+      SmallVector<TiledLoadInfo> loads = findTiledLoads(forOp);
+      if (loads.empty())
+        continue;
+      SPMPromotionReport *report = nullptr;
+      auto parentFunc = forOp->getParentOfType<FunctionOpInterface>();
+      if (promotionReport && parentFunc)
+        report = &reports[parentFunc.getOperation()];
+      if (transformGenericAffineStreamingLoop(
+              forOp, loads, spmBase, spmSize, genericAffineTileMinBytes,
+              report))
+        continue;
     }
 
     if (promotionReport) {
@@ -8429,28 +9853,26 @@ createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize, int64_t microM,
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize, int64_t microM,
-                         int64_t windowK, bool enableReductions) {
-  return std::make_unique<ConvertMemoryToSPM>(spmBase, spmSize, microM, windowK,
-                                              enableReductions);
-}
-
-std::unique_ptr<OperationPass<ModuleOp>>
-createConvertMemoryToSPM(int64_t spmBase, int64_t spmSize, int64_t microM,
-                         int64_t windowK, bool enableReductions,
+                         int64_t windowK, bool enableRowResidentReductions,
+                         int64_t rowResidentMaxBytes,
+                         StringRef rowResidentProducerPass,
+                         bool enablePromotionProfitability,
                          bool promotionReport) {
   return std::make_unique<ConvertMemoryToSPM>(
-      spmBase, spmSize, microM, windowK, enableReductions, promotionReport);
+      spmBase, spmSize, microM, windowK, enableRowResidentReductions,
+      rowResidentMaxBytes, rowResidentProducerPass, enablePromotionProfitability,
+      promotionReport);
 }
 
 std::unique_ptr<OperationPass<ModuleOp>> createConvertMemoryToSPM(
     int64_t spmBase, int64_t spmSize, int64_t microM, int64_t windowK,
-    bool enableReductions, bool enableRowResidentReductions,
-    int64_t rowResidentMaxBytes, StringRef rowResidentProducerPass,
-    bool enablePromotionProfitability, bool promotionReport) {
+    bool enableRowResidentReductions, int64_t rowResidentMaxBytes,
+    StringRef rowResidentProducerPass, bool enablePromotionProfitability,
+    bool promotionReport, int64_t genericAffineTileMinBytes) {
   return std::make_unique<ConvertMemoryToSPM>(
-      spmBase, spmSize, microM, windowK, enableReductions,
-      enableRowResidentReductions, rowResidentMaxBytes, rowResidentProducerPass,
-      enablePromotionProfitability, promotionReport);
+      spmBase, spmSize, microM, windowK, enableRowResidentReductions,
+      rowResidentMaxBytes, rowResidentProducerPass, enablePromotionProfitability,
+      promotionReport, genericAffineTileMinBytes);
 }
 
 } // namespace cpu
