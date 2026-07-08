@@ -237,7 +237,10 @@ class CPUBackend(BaseBackend):
                 spm_base = int(os.getenv("TRITON_SPM_BASE", "0x40000000"), 0)
                 spm_size = int(os.getenv("TRITON_SPM_SIZE", "262144"), 0)
                 micro_m = int(os.getenv("TRITON_MICRO_M", "8"), 0)
-                window_k = int(os.getenv("TRITON_SPM_WINDOW_K", "8"), 0)
+                window_k = env_int("TRITON_SPM_WINDOW_K", 8)
+                dma_max_descriptors = max(
+                    1, env_int("TRITON_SPM_DMA_MAX_DESCRIPTORS", 32))
+                window_k = min(window_k, dma_max_descriptors)
                 enable_row_resident_reductions = env_bool(
                     "TRITON_ENABLE_SPM_ROW_RESIDENT_REDUCTIONS",
                     True)

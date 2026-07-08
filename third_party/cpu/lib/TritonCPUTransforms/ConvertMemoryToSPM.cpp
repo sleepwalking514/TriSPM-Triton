@@ -8958,8 +8958,8 @@ static bool transformFusedMicroGemmLoop(
   b.setInsertionPointToStart(winBody);
   Value winIter = winFor.getInductionVar();
 
-  // Stage the resident B window once.  windowK is capped to the DMA queue
-  // depth default (4) by the caller/env setting.
+  // Stage the resident B window once.  The frontend caps windowK against the
+  // DMA descriptor queue depth.
   auto bStageFor = scf::ForOp::create(
       b, loc, i64Cst(b, loc, 0), i64Cst(b, loc, windowK), i64Cst(b, loc, 1));
   Block *bStageBody = bStageFor.getBody();
